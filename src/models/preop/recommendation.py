@@ -39,6 +39,31 @@ class DecisionStep(BaseModel):
     note: str | None = Field(default=None, description="补充说明。")
 
 
+class ToolFinding(BaseModel):
+    """一个工具产物在最终结论中的**呈现条目**。
+
+    为什么需要这一层，而不是把 ``tool_outputs`` 原样塞进结论：
+        ``tool_outputs`` 的值是各工具的产物模型（``VascMeasurement`` /
+        ``AnatomyScore`` …），属于**内部数据结构**。直接暴露会带来三个问题：
+        ① 结论产物与工具实现耦合，换一个工具版本就改一次结论结构；
+        ② 原始数值被抄进结论 —— 与 ``tool_outputs`` 形成**两处真相**，日后对不上；
+        ③ 序列化白名单与哈希边界被外部类型的形状拖动。
+
+    因此本条目只承载**呈现所需的最小信息**：谁产出的、叫什么、要点是什么。
+    要点由输出层**机械渲染**（不改数、不推断、不下临床结论），原始数值仍以
+    ``tool_outputs`` 为唯一真源，可随时回指。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool_key: str = Field(..., description="工具键（如 imaging_quantifier）。")
+    label: str = Field(..., description="工具中文名（如「工具B · 影像量化器」）。")
+    summary: str = Field(
+        ...,
+        description="产物要点摘要（机械渲染的「字段 = 值」串，不含临床主张）。",
+    )
+
+
 class FinalRecommendation(BaseModel):
     """术前决策最终输出。"""
 
@@ -60,6 +85,17 @@ class FinalRecommendation(BaseModel):
     decision_path: list[DecisionStep] = Field(
         default_factory=list, description="完整决策路径（含被否决分支）。"
     )
+
+    # ---- 工具产物（呈现用；与 evidence_chain 刻意分开） ----
+    tool_findings: list[ToolFinding] = Field(
+        default_factory=list,
+        description=(
+            "各工具产物的要点摘要，按工具键升序；未运行/未实现的工具不出现。"
+            "与 evidence_chain 分工：evidence_chain 是**判定依据**（为什么这样路由），"
+            "本字段是**测量产物**（影像/评分/检索各算出了什么）。"
+        ),
+    )
+
     ruleset_version: str = Field(
         ...,
         description="规则版本号（复合串，如 'table1@v1.0+table2@v1.3'）。审计必需。",
@@ -71,4 +107,4 @@ class FinalRecommendation(BaseModel):
     )
 
 
-__all__ = ["DecisionStep", "EvidenceItem", "FinalRecommendation"]
+__all__ = ["DecisionStep", "EvidenceItem", "FinalRecommendation", "ToolFinding"]

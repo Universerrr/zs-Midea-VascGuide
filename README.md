@@ -30,17 +30,49 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 ## 二、当前阶段
 
 > **确定性内核（数据模型 + 规则层 + 编排层）已落地并通过验证；LLM 接入与确定性工具均未开始。**
+> **术前路由的规格已升级为 V3.1（2），重写路线已定案，见下节。**
+
+### 📐 规格冻结与重写路线（2026-10-22）
+
+术前路由的规格真源为 **V3.1（2）**（`VascGuide_V3.1 (2).xlsx`，**169 字段 + 63 条规则**），
+全部裁定记录集中在一份《字段与规则映射表》里。两者分工必须分清：
+
+| 文件 | 角色 | 是否进运行路径 |
+|---|---|---|
+| `VascGuide_V3.1 (2).xlsx` | **规格真源**：字段定义、规则判据以它为准 | 否（只读不改） |
+| `VascGuide_V3.1_字段与规则映射表.xlsx` | 裁定记录 + 拆解底稿 + 现有代码差异分析（13 个 sheet） | 否（**不是运行时数据源**） |
+
+> 两个 Excel 都在**仓库之外**（本地规格文件），不是代码资产，不进 git；本仓库只承载实现。
+
+**重写路线**（进行中）：
+
+- **规则写进代码**，不采用「规则即数据」的数据表方案。理由：V3.1(2) 的判据是自然语言
+  （「允许值」列一列四义、AND/OR 混写、gate 只在自然语言里），无法机械转成数据行；
+  拆解成本与直接写代码相当，而代码有类型检查与调试优势。
+- **字段模型重建为 160 个字段 / 14 个按域子模型**（访问形式 `case.n.neck_len`），**手写**不用生成器。
+  口径：170 − 7 判定产物 − 3 物化派生 = 160。**落点就是现有的 `src/models/preop/case.py`，
+  就地扩写，不新建 `v31/` 子包**——导入路径 `from src.models.preop import VascCase` 全程不变。
+- **在现有 `router.py` 上就地重写**（不新建 `router_v31.py`），实现 **54 条判定规则**
+  （G03 21 + G04 18 + G08 11 + G09 4）。G00–G02 的 9 条属「读取资料/证据质量/事实抽取」，归 LLM 抽取层，不进路由。
+- **重写顺序**：`case.py`（字段名）→ `router.py`（规则）→ `tests/`（测试）。
+  先后只反映**依赖关系**（路由读字段、测试读两者），**不是为了保持测试全绿**。
+- **测试同批重写，施工期不追求全绿**：`test_preop`(41) 与 `test_model_contract`(67) 必然大改；
+  `test_preop_graph`(105) 的架构守卫多数可留（涉及字段数/枚举的断言要动）；
+  `test_router_note_contract`(17) 取决于 note 契约是否延续。因此**也不留过渡态**——
+  老的 51 个平铺字段直接删除，不标 `TODO` 暂留，不存在「两份真源临时例外」。
+- **验收标准**（269 项不再是施工期门槛）：54 条规则的**三态用例**（必须覆盖 UNKNOWN 分支）、
+  160 字段契约断言、架构守卫（判定层禁 LLM / 审计哈希链闭合 / 进哈希模型无时间戳）。
 
 ### ✅ 已完成
 
 | 模块 | 内容 |
 |---|---|
-| **术前数据模型（5 个）** | `VascCase`（51 字段）、`VascMeasurement`、`AnatomyScore`、`RiskAssessment`、`FinalRecommendation` |
+| **术前数据模型（5 个）** | `VascCase`（51 字段；🚧 将就地扩至 160 字段）、`VascMeasurement`、`AnatomyScore`、`RiskAssessment`、`FinalRecommendation` |
 | **共享枚举（19 个）** | `StrEnum` + 中文值，覆盖性别、病种、破裂状态、解剖分型、恶性肿瘤等 |
 | **审计留痕结构** | `FieldProvenance`（字段原文出处 / 写入者 / 置信度）、`UrgencyFlagAudit` |
 | **确定性规则层** | `router.py`（P0a~P8 路由流水线）+ `version.py`（规则版本注册表），详见「四」 |
 | **编排层（LangGraph）** | 四层节点 `input → router → execution → output` 串成 `StateGraph` 并接 SQLite Checkpoint；每节点自动留痕（节点名 / 起止时间 / 输入输出哈希），审计链可**逐环校验**，详见「五」 |
-| **测试与工具链** | 228 项测试全绿（41 路由基线 + 67 数据契约 + 64 编排层 + 39 规则分支 + 17 note 契约）、`ruff` 无告警、覆盖率 99% |
+| **测试与工具链** | 269 项测试全绿（41 路由基线 + 67 数据契约 + 105 编排层 + 39 规则分支 + 17 note 契约）、`ruff` 无告警、覆盖率 99% |
 
 ### ⏳ 尚未开始
 
@@ -49,11 +81,13 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 
 **① 等外部资源（技术缺口）**
 
-- **5 个确定性工具全部未实现**（`execution_layer/`）。每个工具都在
-  `TOOL_REGISTRY` 里写明了**具体缺什么**：指南引擎缺「接入哪部指南 + 条目结构化方式」、
+- **5 个确定性工具全部未实现**（实现位置 `src/tools/<tool>.py`，一工具一文件）。每个工具都在
+  自己的 `SPEC` 里写明了**具体缺什么**：指南引擎缺「接入哪部指南 + 条目结构化方式」、
   影像量化器缺「CTA 数据 + 分割与中心线算法」、解剖评分器与风险计算器缺「临床量表与模型系数」、
   记忆检索器缺「历史病例库与检索索引」。
   因此 `tool_outputs` 当前恒为空 —— **宁可空着，也不凭空造评分**。
+  执行层已按路由模式调度（`execution_layer/plan.py` 的 `MODE_PLANS`）：
+  **急诊 ∅ / 指南 A+B / 复杂全量**，三者是包含关系，不是并列关系。
 
 **② 等临床口径（内容缺口）**
 
@@ -90,24 +124,32 @@ zs-Midea VascGuide/
 │   │   ├── enums.py             # ✅ 19 个共享枚举（StrEnum，中文值）
 │   │   ├── audit.py             # ✅ 审计留痕结构（FieldProvenance / UrgencyFlagAudit）
 │   │   ├── preop/               # ✅ 术前模型包（含 __init__.py 聚合导出）
-│   │   │   ├── case.py          # ✅ VascCase（51 字段）+ derive() + apply_route_result()
+│   │   │   ├── case.py          # ✅ VascCase + derive() + apply_route_result()
+│   │   │   │                    #    🚧 就地扩写目标：51 字段 → 160 字段 / 14 个域子模型
 │   │   │   ├── measurement.py   # ✅ VascMeasurement + CenterlinePoint（仅模型，无计算）
 │   │   │   ├── assessment.py    # ✅ AnatomyScore + RiskAssessment（仅模型，无计算）
-│   │   │   └── recommendation.py# ✅ FinalRecommendation + EvidenceItem + DecisionStep
+│   │   │   └── recommendation.py   # ✅ FinalRecommendation + EvidenceItem + DecisionStep + ToolFinding
 │   │   ├── intraop.py           # IntraOpIntent（预留，空占位）
 │   │   └── postop.py            # PostOpCase / FollowUpPlan / FollowUpStatus（预留，空占位）
 │   ├── rules/                   # ✅ 确定性规则层（详见「四」；无 __init__.py）
-│   │   ├── router.py            # ✅ P0a~P8 路由判定流水线（纯函数）
-│   │   └── version.py           # ✅ 规则版本号注册表（审计必需）
-│   ├── tools/                   # 确定性工具集〔骨架〕—— 挂载点实际在 preop_agent/execution_layer/
+│   │   ├── router.py            # 🚧 路由判定流水线（V3.1(2) 就地重写中：54 条判定规则）
+│   │   ├── version.py           # ✅ 规则版本号注册表（将升级为 RULESET_VERSION，进哈希）
+│   │   └── RULESET.md           # 🚧 54 条规则 ↔ 函数名 ↔ V3.1(2) 源行 对照表（防规格漂移）
+│   ├── tools/                   # ✅ 5 个确定性工具（一工具一文件，全部未实现）
+│   │   ├── base.py              # ✅ ToolSpec / ToolRequest / MissingUpstreamError
+│   │   ├── guideline_engine.py  # 工具A · 指南引擎（阻塞：指南条目库）
+│   │   ├── imaging_quantifier.py # 工具B · 影像量化器（阻塞：CTA 数据 + 分割算法）
+│   │   ├── anatomy_scorer.py    # 工具C · 解剖评分器（阻塞：评分量表）
+│   │   ├── memory_retriever.py  # 工具D · 记忆检索器（阻塞：历史病例库）
+│   │   └── risk_calculator.py   # 工具E · 风险计算器（阻塞：风险模型系数）
 │   ├── utils/                   # 工具函数（LLM 调用封装、Checkpoint 管理）〔骨架〕
 │   ├── preop_agent/             # ✅ 术前决策 Agent（四层 + 编排，详见「五」）
 │   │   ├── state.py             # ✅ PreopState + NodeAudit + stable_hash() + audited()
 │   │   ├── graph.py             # ✅ StateGraph 装配 + SQLite Checkpoint + 序列化白名单
 │   │   ├── input_layer/node.py  # ✅ 归一化 + 输入快照哈希（LLM 抽取器留空并显式抛错）
 │   │   ├── router_layer/node.py # ✅ 对 src/rules/router.py 的薄封装（临床规则 0 行）
-│   │   ├── execution_layer/node.py # ✅ 5 个工具挂载点（全部未实现，各自写明阻塞原因）
-│   │   └── output_layer/node.py # ✅ 聚合为 FinalRecommendation（诊疗建议为显式占位）
+│   │   ├── execution_layer/     # ✅ 按模式调度（plan.py 计划表 / registry.py 登记表 / node.py 编排）
+│   │   └── output_layer/node.py # ✅ 聚合 FinalRecommendation + 承接 tool_outputs → tool_findings
 │   ├── intraop_agent/           # 术中导航 Agent〔骨架〕
 │   │   ├── localization/        # 术中定位
 │   │   ├── assessment/          # 术中评估
@@ -121,9 +163,11 @@ zs-Midea VascGuide/
 │       ├── status_manager/      # ⑤ 状态管理
 │       └── output_translate/    # ⑥ 输出转译
 ├── tests/                       # 测试（无 __init__.py，见「八、开发约定」）
-│   ├── test_preop.py            # ✅ 41 项路由行为基线（本轮断言零改动）
+│   ├── test_preop.py            # ✅ 41 项路由行为基线（V3.1 重写时需改造，含 E1/B5 连带）
 │   ├── test_model_contract.py   # ✅ 67 项数据契约
-│   └── test_preop_graph.py      # ✅ 50 项编排层 + Checkpoint 往返 + 白名单守卫 + 两条架构守卫
+│   ├── test_preop_graph.py      # ✅ 105 项编排层 + 调度表 + 依赖排序 + Checkpoint 往返 + 架构守卫
+│   ├── test_router_branches.py  # ✅ 39 项规则分支覆盖
+│   └── test_router_note_contract.py # ✅ 17 项 note 文本契约
 ├── pyproject.toml               # 依赖与项目元数据（唯一"真源"）
 ├── uv.lock                      # 全量精确锁定（含传递依赖，由 uv 生成）
 ├── main.py                      # 系统入口（占位）
@@ -133,7 +177,7 @@ zs-Midea VascGuide/
 └── README.md                    # 本文档 —— 全项目唯一说明入口
 ```
 
-**图例**：✅ = 已实现并通过测试；〔骨架〕= 只有目录结构，无业务逻辑；其余为预留文件。
+**图例**：✅ = 已实现并通过测试；🚧 = V3.1(2) 重写中（已定案待实现）；〔骨架〕= 只有目录结构，无业务逻辑；其余为预留文件。
 
 > **说明**
 > 1. 本仓库根目录即为项目根目录，**必须从仓库根运行**（`pyproject.toml` 中 `[tool.uv] package = false`，不是可安装包）。
@@ -161,10 +205,11 @@ zs-Midea VascGuide/
 
 ### 1. 文件
 
-| 文件 | 职责 |
-|---|---|
-| `router.py` | P0a~P8 路由判定流水线（纯函数，无副作用、无 IO、无全局状态） |
-| `version.py` | 规则版本号注册表（复合版本串，审计必需） |
+| 文件 | 职责 | 状态 |
+|---|---|---|
+| `router.py` | 路由判定流水线（纯函数，无副作用、无 IO、无全局状态） | 🚧 **就地重写中**：P0a~P8 → V3.1(2) 的 54 条判定规则 |
+| `version.py` | 规则版本号注册表（复合版本串，审计必需） | 保留，将升级为 `RULESET_VERSION`（进哈希） |
+| `RULESET.md` | 54 条规则 ↔ 函数名 ↔ V3.1(2) 源行 的对照表 | 🚧 待建（规格追溯，防第二真源） |
 
 ### 2. 路由做什么（以及不做什么）
 
@@ -186,7 +231,7 @@ zs-Midea VascGuide/
 
 1. **纯函数、无全局状态、无 IO** —— 相同输入必然得到相同输出（可复现）。
 2. **输出结构化中间结果**（含逐条判定轨迹），供审计落盘。
-3. **阈值 / 编号一律与 `.workbuddy/spec/VascCase字段设计表.xlsx` 对齐。**
+3. **阈值 / 编号一律与 `VascGuide_V3.1 (2).xlsx` 对齐**（规格真源，仓库外的本地文件；有疑问先写进映射表，不回改源表）。
 
 ### 4. 变更纪律（审计红线）
 
@@ -240,8 +285,11 @@ uv run python -c "from src.rules.version import RULESET_VERSION, RULESET_CHANGEL
 | `graph.py` | `build_preop_graph()` 装配、`sqlite_checkpointer()` 落盘、`run_preop()` 入口、序列化白名单 |
 | `input_layer/node.py` | 确定性归一化 + 输入快照哈希；LLM 抽取器留空 |
 | `router_layer/node.py` | 对 `src/rules/router.py` 的薄封装（**临床规则 0 行**） |
-| `execution_layer/node.py` | 5 个确定性工具的挂载点（当前全部未实现） |
-| `output_layer/node.py` | 聚合 `FinalRecommendation` |
+| `execution_layer/plan.py` | `MODE_PLANS`：三模式各跑哪些工具（**唯一真源**） |
+| `execution_layer/registry.py` | `TOOL_REGISTRY` / `SPEC_BY_KEY` / `run_tool()` 分派 |
+| `execution_layer/node.py` | `execution_order()` 拓扑排序 + `execution_node()` 按模式调度 |
+| `tools/<tool>.py` | 5 个确定性工具的实现位置（一工具一文件，当前全部未实现） |
+| `output_layer/node.py` | 聚合 `FinalRecommendation`，并把 `tool_outputs` 渲染为 `tool_findings` |
 
 ### 2. 图与状态
 
@@ -251,6 +299,11 @@ START ─▶ input_layer ─▶ router_layer ─▶ execution_layer ─▶ outpu
 
 状态字段按推进顺序增长：`case` →（归一化）→ `case_id` / `input_snapshot_hash`
 → `route_result` → `tool_outputs` → `final_recommendation`，而 `audit_trail` 全程追加。
+
+⚠️ **`tool_outputs` 不会自己走进结论**：输出层必须显式把它渲染成
+`FinalRecommendation.tool_findings`（每个工具一条：键 + 中文名 + 要点摘要），
+否则工具算了也「没有观众」。摘要只做机械渲染（枚举取中文值、`None` 不补占位、
+嵌套列表不进摘要），**原始数值仍以 `tool_outputs` 为唯一真源**，不抄第二份。
 
 两个刻意的设计：
 
@@ -276,6 +329,12 @@ audit_trail[i].output_hash == audit_trail[i+1].input_hash
 
 哈希**排除** `audit_trail` 本身（它含时间戳），因此「同输入 + 同规则版本 → 同哈希」，
 重复执行结果可复现（`test_hashes_are_reproducible_across_runs`）。
+
+**同理，进哈希的产物模型里不得有任何时间戳字段**（如「量化时间」）。`tool_outputs` 在
+哈希投影内，产物里带一个 `measured_at`，就会让同一份影像在两次不同时刻运行时得到不同哈希 ——
+这与排除 `audit_trail` 是同一个理由。量化时间属**运行期元信息**，由 `audit_trail` 的
+`NodeAudit` 记录；而 `method`（算法/版本）**必须保留**：算法变了，结论可信度就该变，
+哈希理应随之改变。守门测试：`test_hashed_product_models_carry_no_timestamp_fields`。
 
 ### 4. 落盘策略与运行身份
 
@@ -328,7 +387,7 @@ fail-open，与红线直接冲突。现在改成 fail-loud：想放弃落盘，�
 | 守卫 | 做法 |
 |---|---|
 | **薄封装不藏规则** | AST 扫描 `router_layer/node.py`：代码里不得出现任何**数值常量**（阈值）、病种 / 解剖 / 处置**关键词**、以及**规则编号** |
-| **判定层零 LLM** | AST 扫描 `src/rules/` 与 `router_layer/` `execution_layer/` `output_layer/` 的全部 `import`，出现任何 LLM 客户端 SDK 即失败 |
+| **判定层零 LLM** | AST 扫描 `src/rules/`、`src/tools/` 与 `router_layer/` `execution_layer/` `output_layer/` 的全部 `import`，出现任何 LLM 客户端 SDK 即失败 |
 | **序列化白名单完整** | 从真实 state 反推全部自定义类型，与 `build_checkpoint_serde()` 的白名单比对；漏注册即失败（详见本节第 6 小节） |
 
 `input_layer/` 是唯一豁免的层（它是被允许的 LLM 入口），且其抽取函数当前主动抛错。
@@ -368,7 +427,7 @@ LangGraph 用 msgpack 序列化状态。对本项目自定义类型（pydantic �
 |---|---|---|
 | 诊疗方式建议 | `output_layer` 的 `primary_recommendation` / `treatment_options` | 显式占位文本，**不含任何临床主张** |
 | LLM 输出转译 | `FinalRecommendation.translated_text` | 保持 `None` |
-| 5 个确定性工具 | `execution_layer` 的 `TOOL_REGISTRY` | `tool_outputs` 恒为空，每个工具写明阻塞原因 |
+| 5 个确定性工具 | `src/tools/<tool>.py` 的 `SPEC.blocked_reason` | `tool_outputs` 恒为空，每个工具写明阻塞原因 |
 
 **为什么宁可留白**：这三处一旦填上，就等于往代码里引入了一批**新的「规则内容」**
 （评分口径、建议文案）。按本项目的变更纪律，那必须新增一张版本表并注册进
@@ -445,12 +504,15 @@ with sqlite_checkpointer() as reopened:
     print(app.get_state(thread_config(state["thread_id"])).values["case"].case_id)  # DEMO-001
 ```
 
+> 上面是**当前 API**（`VascCase` 平铺 51 字段）。V3.1(2) 重写完成后字段改为按域子模型访问
+> （`case.p.age` / `case.n.neck_len`），**导入路径不变**，只是构造参数分组。
+
 > 脚本须**从仓库根**运行（`uv run python xxx.py` 或 `python -m`），否则 `import src` 会失败。
 
 ### 常用命令（测试 / 检查）
 
 ```bash
-# 跑全部测试（应为 228 passed）
+# 跑全部测试（应为 263 passed）
 uv run pytest tests/ -q
 
 # 静态检查（应为 All checks passed）
@@ -475,7 +537,7 @@ uv run pytest tests/ --cov --cov-report=term-missing
 - **覆盖了哪些代码**：`--cov-report=html` 生成 `htmlcov/index.html`，红色行即未被测试执行到的分支。
 
 > ⚠️ **覆盖率 ≠ 测试结果**：前者衡量「代码有多少行被执行到」，后者衡量「每个用例过没过」。
-> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 228 项全绿、覆盖率 99%。
+> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 269 项全绿、覆盖率 99%。
 
 ---
 
@@ -543,6 +605,10 @@ uv pip check         # 检查是否存在依赖冲突
 
 - **规则优先**：凡属确定性判定（路由 / 评分 / 分层 / 规划 / 预警 / 仲裁）一律以确定性代码实现，不交由 LLM。
 - **LLM 边界**：LLM 仅承担输入抽取与输出转译，且不得改写数值与结论。
+- **规格真源唯一**：判定口径以 `VascGuide_V3.1 (2).xlsx` 为准，**只读不改**；所有澄清、裁定、差异分析
+  一律写进《字段与规则映射表》，不回写规格。映射表**不是运行时数据源**——程序不读 Excel。
+- **代码亦是规格的第二真源**：规则写进代码后，每条规则函数必须标注其 V3.1(2) 来源（rule_id + 源行号），
+  并由 `RULES` 字典 + 数量断言（`len(RULES) == 54`）机械守住，防止「代码与规格漂移」。
 - **判定层禁 LLM**：`src/rules/**` 及全部判定层函数**禁止 import 任何 LLM 客户端** —— 硬性约束（见「四」）。
 - **规则变更纪律**：改动任何阈值 / 病种归属 / 覆盖规则后，**必须** bump `src/rules/version.py` 的版本号
   并在 `RULESET_CHANGELOG` 记录原因；否则历史结论无法追溯复现。
@@ -553,6 +619,8 @@ uv pip check         # 检查是否存在依赖冲突
 - **文档单一真源**：目录职责统一在本文档「三、目录结构」维护，**不在子目录下另建 `README.md`**，
   避免多处维护导致漂移。
 - **增量填充**：按「确定性内核优先」顺序推进，每阶段须保证测试全绿 + `ruff` 无告警。
+  **例外**：V3.1(2) 重写期间（见「二」）测试与被测代码**同批重写**，红灯是预期状态；
+  但 `ruff` 仍须无告警。
 - **`__init__.py` 非必需**：Python 3 命名空间包（PEP 420）无它也能导入。是否保留按实际需要判断 ——
   需要 **re-export / 显式包边界** 时保留；纯标记用途可省略。
   省略前须确认两点：①本包无 `from .pkg import X` 形式的 re-export 消费者（否则直接 ImportError）；

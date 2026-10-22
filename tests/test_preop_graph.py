@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import logging
 import os
 import sqlite3
@@ -44,16 +45,25 @@ from src.models.enums import (
     SymptomAAA,
     TemporalStatus,
 )
+from src.models.preop.assessment import AnatomyScore, RiskAssessment
 from src.models.preop.case import VascCase, derive
-from src.models.preop.recommendation import FinalRecommendation
+from src.models.preop.measurement import CenterlinePoint, VascMeasurement
+from src.models.preop.recommendation import FinalRecommendation, ToolFinding
 from src.preop_agent import graph as graph_module
+from src.preop_agent.execution_layer import node as exec_node_module
+from src.preop_agent.execution_layer import plan as plan_module
+from src.preop_agent.execution_layer import registry as registry_module
 from src.preop_agent.execution_layer.node import (
     IMPLEMENTED_TOOLS,
+    MODE_PLANS,
     TOOL_REGISTRY,
     execution_node,
+    execution_order,
     run_tool,
     unimplemented_tools,
 )
+from src.preop_agent.execution_layer.plan import plan_for
+from src.preop_agent.execution_layer.registry import SPEC_BY_KEY
 from src.preop_agent.graph import (
     build_checkpoint_serde,
     build_preop_graph,
@@ -68,19 +78,26 @@ from src.preop_agent.input_layer.node import (
     input_node,
 )
 from src.preop_agent.output_layer.node import (
+    MAX_FALLBACK_SUMMARY_CHARS,
+    MAX_SUMMARY_FIELDS,
     PRIMARY_RECOMMENDATION_PLACEHOLDER,
     TRANSLATION_IMPLEMENTED,
+    _render,
+    _render_scalar,
+    build_tool_findings,
     output_node,
 )
 from src.preop_agent.router_layer.node import router_node
 from src.preop_agent.state import HASHED_KEYS, _project, stable_hash
 from src.rules.router import route
+from src.tools.base import MissingUpstreamError, ToolRequest, ToolSpec
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: 判定层目录：这些目录下的代码**只允许是确定性实现**。
 JUDGMENT_LAYER_DIRS = (
     REPO_ROOT / "src" / "rules",
+    REPO_ROOT / "src" / "tools",
     REPO_ROOT / "src" / "preop_agent" / "router_layer",
     REPO_ROOT / "src" / "preop_agent" / "execution_layer",
     REPO_ROOT / "src" / "preop_agent" / "output_layer",
@@ -242,8 +259,6 @@ class TestStableHash:
 
     def test_hash_handles_pydantic_enum_dataclass(self) -> None:
         """pydantic 模型 / 枚举 / dataclass 都要能参与哈希且不抛异常。"""
-        from src.models.preop.assessment import AnatomyScore
-
         payload = {
             "case": make_case(),
             "enum": RouteMode.GUIDELINE,
@@ -255,6 +270,31 @@ class TestStableHash:
 
     def test_hashed_keys_exclude_audit_trail(self) -> None:
         assert "audit_trail" not in HASHED_KEYS
+
+    def test_product_content_is_reproducible_and_version_sensitive(self) -> None:
+        """D-16 回归：产物**同内容必同哈希**，但换算法版本**必须**换哈希。
+
+        ``tool_outputs`` 在哈希投影内，故产物模型里任何「何时跑的」都会破坏可复现性；
+        而算法版本改变理应改变哈希 —— 两者的区别正是本条要钉住的语义。
+        """
+        same_a = VascMeasurement(case_id="GRAPH-HASH", max_diameter_mm=61.2, method="vmtk v1.2")
+        same_b = VascMeasurement(case_id="GRAPH-HASH", max_diameter_mm=61.2, method="vmtk v1.2")
+        newer = VascMeasurement(case_id="GRAPH-HASH", max_diameter_mm=61.2, method="vmtk v1.3")
+
+        def digest(product: VascMeasurement) -> str:
+            return stable_hash({"tool_outputs": {"imaging_quantifier": product}})
+
+        assert digest(same_a) == digest(same_b)
+        assert digest(same_a) != digest(newer)
+
+    def test_hashed_product_models_carry_no_timestamp_fields(self) -> None:
+        """止血带：进哈希的模型里出现时间戳字段，就等于把可复现性交出去。"""
+        forbidden = {"measured_at", "created_at", "updated_at", "timestamp", "run_at"}
+        for model in (VascMeasurement, AnatomyScore, RiskAssessment, FinalRecommendation):
+            leaked = forbidden & set(model.model_fields)
+            assert not leaked, (
+                f"{model.__name__} 含时间戳字段 {sorted(leaked)}：它会破坏审计哈希可复现性"
+            )
 
 
 # ===========================================================================
@@ -379,7 +419,251 @@ class TestExecutionLayer:
 
     def test_node_returns_empty_outputs(self) -> None:
         """工具产物不存在，就必须返回空——绝不凭空造评分。"""
-        assert execution_node({"case": make_case()}) == {"tool_outputs": {}}  # type: ignore[arg-type]
+        case = make_case()
+        derive(case)  # 回填 route_mode：未经路由的 case 没有计划，见 plan_for()
+        assert execution_node({"case": case}) == {"tool_outputs": {}}  # type: ignore[arg-type]
+
+    def test_node_requires_routed_case(self) -> None:
+        """未经路由层就给执行层喂 case → 响亮失败，不猜模式。"""
+        with pytest.raises(RuntimeError, match="route_mode"):
+            execution_node({"case": make_case()})  # type: ignore[arg-type]
+
+    def test_run_tool_requires_routed_case(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """已实现工具被单独调用时，同样不允许在无模式的情况下开跑。"""
+        fake = ToolSpec(
+            key="guideline_engine",
+            label="工具A · 指南引擎",
+            consumes=(),
+            produces="",
+            blocked_reason=None,
+        )
+        monkeypatch.setattr(registry_module, "SPEC_BY_KEY", {"guideline_engine": fake})
+        with pytest.raises(RuntimeError, match="route_mode"):
+            run_tool("guideline_engine", {"case": make_case()})  # type: ignore[arg-type]
+
+    def test_node_dispatches_plan_subset_in_dependency_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """用假工具证明三件事：计划外的工具不跑、上游先于下游、产物按键落位。"""
+        calls: list[str] = []
+
+        def fake_runner(key: str) -> Any:
+            def _run(request: ToolRequest) -> dict[str, str]:
+                calls.append(key)
+                return {"by": key}
+
+            return _run
+
+        specs = {
+            "imaging_quantifier": ToolSpec(
+                key="imaging_quantifier",
+                label="B",
+                consumes=(),
+                produces="",
+                blocked_reason=None,
+            ),
+            "anatomy_scorer": ToolSpec(
+                key="anatomy_scorer",
+                label="C",
+                consumes=(),
+                produces="",
+                depends_on=("imaging_quantifier",),
+                blocked_reason=None,
+            ),
+            "memory_retriever": ToolSpec(
+                key="memory_retriever",
+                label="D",
+                consumes=(),
+                produces="",
+                blocked_reason=None,
+            ),
+        }
+        for module in (exec_node_module, registry_module):
+            monkeypatch.setattr(module, "SPEC_BY_KEY", specs)
+        monkeypatch.setattr(exec_node_module, "IMPLEMENTED_TOOLS", frozenset(specs))
+        monkeypatch.setattr(registry_module, "RUNNER_BY_KEY", {k: fake_runner(k) for k in specs})
+
+        case = make_case(neck_length_mm=10.0)  # 短颈 → 复杂模式
+        derive(case)
+        assert case.route_mode is RouteMode.COMPLEX
+
+        outputs = execution_node({"case": case})["tool_outputs"]  # type: ignore[arg-type]
+
+        assert calls == ["imaging_quantifier", "anatomy_scorer", "memory_retriever"]
+        assert set(outputs) == set(specs)
+
+
+# ===========================================================================
+# 执行层 · 三模式调度表
+# ===========================================================================
+class TestModePlans:
+    """「跑哪些工具」的唯一真源 —— 模式之间是包含关系，不是并列关系。"""
+
+    def test_every_mode_has_a_plan(self) -> None:
+        assert set(MODE_PLANS) == set(RouteMode)
+
+    def test_emergency_plan_is_empty(self) -> None:
+        """设计表 06：急诊「不预置择期工具」。"""
+        assert MODE_PLANS[RouteMode.EMERGENCY] == ()
+
+    def test_guideline_plan_is_strict_subset_of_complex(self) -> None:
+        """指南 ⊂ 复杂：指南只是「少跑几个」，不是另一套流程。"""
+        assert set(MODE_PLANS[RouteMode.GUIDELINE]) < set(MODE_PLANS[RouteMode.COMPLEX])
+
+    def test_guideline_plan_is_exactly_engine_and_imaging(self) -> None:
+        """设计表 06：指南模式只跑 A + B。多塞一个都算错，不只是「子集」就算对。"""
+        assert MODE_PLANS[RouteMode.GUIDELINE] == ("guideline_engine", "imaging_quantifier")
+
+    def test_complex_plan_covers_every_registered_tool(self) -> None:
+        """新增工具却忘了补计划 → 在这里失败（刻意设计的摩擦）。"""
+        assert set(MODE_PLANS[RouteMode.COMPLEX]) == {spec.key for spec in TOOL_REGISTRY}
+
+    def test_plans_only_reference_registered_tools(self) -> None:
+        registered = {spec.key for spec in TOOL_REGISTRY}
+        for mode, plan in MODE_PLANS.items():
+            assert set(plan) <= registered, f"{mode} 引用了未登记的工具"
+
+    def test_plans_are_dependency_closed(self) -> None:
+        """计划里每个工具的依赖必须也在同一计划内，否则它必然跑不起来。"""
+        for mode, plan in MODE_PLANS.items():
+            for key in plan:
+                for dep in SPEC_BY_KEY[key].depends_on:
+                    assert dep in plan, f"{mode} 的 {key} 依赖 {dep}，但计划里没有"
+
+    def test_declared_order_respects_dependencies(self) -> None:
+        """声明的书写顺序本身就是拓扑序，读代码时不必再算一遍。"""
+        for mode, plan in MODE_PLANS.items():
+            position = {key: index for index, key in enumerate(plan)}
+            for key in plan:
+                for dep in SPEC_BY_KEY[key].depends_on:
+                    assert position[dep] < position[key], f"{mode}: {dep} 应排在 {key} 之前"
+
+    def test_plan_for_rejects_unrouted_case(self) -> None:
+        with pytest.raises(RuntimeError, match="route_mode"):
+            plan_for(None)
+
+    def test_plan_for_unknown_mode_is_loud(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(plan_module, "MODE_PLANS", {})
+        with pytest.raises(ValueError, match="没有登记工具计划"):
+            plan_for(RouteMode.GUIDELINE)
+
+
+# ===========================================================================
+# 执行层 · 依赖排序
+# ===========================================================================
+class TestExecutionOrder:
+    """排序器只认 ``depends_on``；测试传全量集合即可验证，无需实现任何工具。"""
+
+    ALL_KEYS = frozenset(spec.key for spec in TOOL_REGISTRY)
+
+    def test_nothing_implemented_yields_empty_order(self) -> None:
+        assert execution_order(MODE_PLANS[RouteMode.COMPLEX], frozenset()) == ()
+
+    def test_upstream_runs_before_downstream(self) -> None:
+        order = execution_order(MODE_PLANS[RouteMode.COMPLEX], self.ALL_KEYS)
+        assert order.index("imaging_quantifier") < order.index("anatomy_scorer")
+        assert order.index("anatomy_scorer") < order.index("risk_calculator")
+
+    def test_order_covers_exactly_the_plan(self) -> None:
+        for plan in MODE_PLANS.values():
+            assert set(execution_order(plan, self.ALL_KEYS)) == set(plan)
+
+    def test_implemented_tool_with_blocked_upstream_is_loud(self) -> None:
+        """「C 已实现、B 未实现」不得静默跳过 B 去算 C。"""
+        with pytest.raises(RuntimeError, match="上游"):
+            execution_order(MODE_PLANS[RouteMode.COMPLEX], frozenset({"anatomy_scorer"}))
+
+    def test_dependency_outside_plan_is_loud(self) -> None:
+        with pytest.raises(RuntimeError, match="不在当前模式的计划内"):
+            execution_order(("anatomy_scorer",), frozenset({"anatomy_scorer"}))
+
+    def test_unregistered_tool_is_loud(self) -> None:
+        with pytest.raises(RuntimeError, match="未在 TOOL_REGISTRY 登记"):
+            execution_order(("no_such_tool",), frozenset({"no_such_tool"}))
+
+    def test_dependency_cycle_is_loud(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = {
+            "x": ToolSpec(key="x", label="X", consumes=(), produces="", depends_on=("y",)),
+            "y": ToolSpec(key="y", label="Y", consumes=(), produces="", depends_on=("x",)),
+        }
+        monkeypatch.setattr(exec_node_module, "SPEC_BY_KEY", fake)
+        with pytest.raises(RuntimeError, match="成环"):
+            execution_order(("x", "y"), frozenset({"x", "y"}))
+
+
+# ===========================================================================
+# 工具包契约
+# ===========================================================================
+class TestToolsPackage:
+    """一工具一文件、一份 SPEC、一条写明缺什么的阻塞说明。"""
+
+    TOOL_KEYS = (
+        "anatomy_scorer",
+        "guideline_engine",
+        "imaging_quantifier",
+        "memory_retriever",
+        "risk_calculator",
+    )
+
+    def _request(self) -> ToolRequest:
+        return ToolRequest(case=make_case(), route_mode=RouteMode.GUIDELINE)
+
+    def test_each_tool_module_exports_a_matching_spec(self) -> None:
+        for key in self.TOOL_KEYS:
+            module = importlib.import_module(f"src.tools.{key}")
+            assert module.SPEC is SPEC_BY_KEY[key]
+            assert module.SPEC.key == key
+            assert callable(module.run)
+
+    def test_tool_implementation_lives_in_its_own_file(self) -> None:
+        """5 个工具是 5 个文件，不是一个文件里的 5 个分支。"""
+        modules = sorted(
+            path.stem
+            for path in (REPO_ROOT / "src" / "tools").glob("*.py")
+            if path.stem not in {"__init__", "base"}
+        )
+        assert modules == list(self.TOOL_KEYS)
+
+    def test_blocked_tools_raise_their_own_reason(self) -> None:
+        """未实现的工具必须抛**自己的**阻塞原因，而不是一句通用占位。"""
+        for spec in unimplemented_tools():
+            module = importlib.import_module(f"src.tools.{spec.key}")
+            with pytest.raises(NotImplementedError, match="未实现"):
+                module.run(self._request())
+
+    def test_implemented_tool_has_a_real_runner(self) -> None:
+        """守住「只把 blocked_reason 置 None、却没写实现体」的不一致。"""
+        for key in IMPLEMENTED_TOOLS:
+            module = importlib.import_module(f"src.tools.{key}")
+            try:
+                module.run(self._request())
+            except NotImplementedError:
+                pytest.fail(f"{key} 标记为已实现，但 run() 仍抛 NotImplementedError")
+            except Exception as exc:  # noqa: BLE001 - 真实实现可能因输入不足失败，非本测试职责
+                logging.getLogger(__name__).debug("%s 在构造输入下抛错：%r", key, exc)
+
+    def test_dependency_chain_is_declared(self) -> None:
+        """B → C → E 的硬依赖必须写进 SPEC，而不是靠调用顺序约定。"""
+        assert SPEC_BY_KEY["anatomy_scorer"].depends_on == ("imaging_quantifier",)
+        assert SPEC_BY_KEY["risk_calculator"].depends_on == ("anatomy_scorer",)
+        assert SPEC_BY_KEY["guideline_engine"].depends_on == ()
+        assert SPEC_BY_KEY["memory_retriever"].depends_on == ()
+        assert SPEC_BY_KEY["imaging_quantifier"].depends_on == ()
+
+    def test_require_raises_when_upstream_missing(self) -> None:
+        """缺上游是错误，不是缺省——不得返回 None 让下游算出一个「正常」结果。"""
+        request = ToolRequest(case=make_case(), route_mode=RouteMode.COMPLEX)
+        with pytest.raises(MissingUpstreamError, match="缺少上游工具产物"):
+            request.require("imaging_quantifier")
+
+    def test_require_returns_upstream_output(self) -> None:
+        marker = object()
+        request = ToolRequest(
+            case=make_case(),
+            route_mode=RouteMode.COMPLEX,
+            upstream={"imaging_quantifier": marker},
+        )
+        assert request.require("imaging_quantifier") is marker
 
 
 # ===========================================================================
@@ -437,6 +721,115 @@ class TestOutputLayer:
         recommendation, _ = self._recommendation()
         assert TRANSLATION_IMPLEMENTED is False
         assert recommendation.translated_text is None
+
+    # ---- 工具产物承接（P0：让计算结果有观众） ----
+    def _recommendation_with_tools(self, tool_outputs: dict[str, Any]) -> FinalRecommendation:
+        """跑输入层 + 路由层，然后用**给定的** tool_outputs 覆盖执行层结果。"""
+        case = make_rich_case()
+        state: dict[str, Any] = {"case": case}
+        state.update(input_node(state))  # type: ignore[arg-type]
+        state.update(router_node(state))  # type: ignore[arg-type]
+        state["tool_outputs"] = tool_outputs
+        return output_node(state)["final_recommendation"]  # type: ignore[arg-type]
+
+    def test_tool_outputs_reach_the_recommendation(self) -> None:
+        """核心回归：工具产物必须出现在结论里，否则「算了等于没算」。"""
+        measurement = VascMeasurement(
+            case_id="GRAPH-TOOL-001", max_diameter_mm=61.2, method="vmtk v1.2"
+        )
+        recommendation = self._recommendation_with_tools({"imaging_quantifier": measurement})
+
+        assert len(recommendation.tool_findings) == 1
+        finding = recommendation.tool_findings[0]
+        assert finding.tool_key == "imaging_quantifier"
+        assert finding.label == SPEC_BY_KEY["imaging_quantifier"].label
+        assert "61.2" in finding.summary
+        assert "vmtk v1.2" in finding.summary
+
+    def test_no_tool_run_yields_no_findings(self) -> None:
+        """一个工具都没跑 → 空列表；不得伪造「跑了但没结果」的条目。"""
+        assert self._recommendation_with_tools({}).tool_findings == []
+
+    def test_findings_are_sorted_by_tool_key(self) -> None:
+        """结论参与审计哈希 → 呈现顺序必须与字典插入顺序无关。"""
+        product = VascMeasurement(case_id="GRAPH-TOOL-001", max_diameter_mm=61.2)
+        findings = build_tool_findings({"risk_calculator": product, "anatomy_scorer": product})
+        assert [f.tool_key for f in findings] == ["anatomy_scorer", "risk_calculator"]
+
+    def test_summary_omits_empty_nested_and_foreign_key_fields(self) -> None:
+        """摘要只呈现标量：None 不补占位、列表不灌入、外键不重复。"""
+        measurement = VascMeasurement(
+            case_id="GRAPH-TOOL-001",
+            max_diameter_mm=61.2,
+            centerline=[CenterlinePoint(distance_mm=0.0, diameter_mm=28.4)],
+        )
+        summary = build_tool_findings({"imaging_quantifier": measurement})[0].summary
+        assert "最大直径" in summary
+        assert "中心线" not in summary
+        assert "关联病例标识" not in summary
+        assert "未提及" not in summary
+
+    def test_unknown_tool_key_falls_back_to_key(self) -> None:
+        """登记表里没有的键不得静默丢弃——用键名兜底，宁可难看也不吞数据。"""
+        finding = build_tool_findings({"unregistered_tool": "raw"})[0]
+        assert finding.label == "unregistered_tool"
+        assert finding.summary == "'raw'"
+
+    def test_findings_do_not_become_clinical_advice(self) -> None:
+        """承接工具产物**不得**顺手把结论也写了：留白仍为留白。"""
+        measurement = VascMeasurement(case_id="GRAPH-TOOL-001", max_diameter_mm=61.2)
+        recommendation = self._recommendation_with_tools({"imaging_quantifier": measurement})
+        assert recommendation.primary_recommendation == PRIMARY_RECOMMENDATION_PLACEHOLDER
+        assert recommendation.treatment_options == []
+        assert isinstance(recommendation.tool_findings[0], ToolFinding)
+
+    def test_summary_reports_empty_product(self) -> None:
+        """工具「跑了但没产物」要如实写出来，不能渲染成空串。"""
+        assert build_tool_findings({"imaging_quantifier": None})[0].summary == "（无产出）"
+
+    def test_summary_reports_product_without_scalars(self) -> None:
+        product = VascMeasurement(case_id="GRAPH-TOOL-001")
+        summary = build_tool_findings({"imaging_quantifier": product})[0].summary
+        assert summary == "（无标量产出）"
+
+    def test_summary_truncates_overlong_fallback(self) -> None:
+        summary = build_tool_findings({"unregistered_tool": "y" * 500})[0].summary
+        assert summary.endswith("…")
+        assert len(summary) == MAX_FALLBACK_SUMMARY_CHARS + 1
+
+    def test_summary_caps_rendered_field_count(self) -> None:
+        """长产物不得把结论撑爆：超量只报总数，且总数必须真实。"""
+        measurement = VascMeasurement(
+            case_id="GRAPH-TOOL-001",
+            max_diameter_mm=61.2,
+            max_diameter_slice_mm=12.0,
+            aneurysm_length_mm=80.0,
+            volume_ml=120.5,
+            thrombus_volume_pct=35.0,
+            neck_length_mm=12.0,
+            neck_diameter_mm=24.0,
+            neck_angle_deg=58.0,
+            neck_calcification_pct=10.0,
+            neck_thrombus_pct=5.0,
+            access_min_diameter_mm=6.0,
+            access_calcification_pct=20.0,
+            iliac_tortuosity_deg=70.0,
+        )
+        summary = build_tool_findings({"imaging_quantifier": measurement})[0].summary
+        assert summary.count(" = ") == MAX_SUMMARY_FIELDS
+        assert "等共 13 项" in summary
+
+    def test_scalar_rendering_covers_enum_and_bool(self) -> None:
+        assert _render_scalar(RouteMode.GUIDELINE) == RouteMode.GUIDELINE.value
+        assert _render_scalar(True) == "是"
+        assert _render_scalar(False) == "否"
+        assert _render_scalar(61.2) == "61.2"
+
+    def test_evidence_rendering_covers_missing_enum_and_list(self) -> None:
+        """证据链的字段渲染：缺失写「未提及」、枚举取中文值、列表串接。"""
+        assert _render(None) == "（未提及）"
+        assert _render(RouteMode.COMPLEX) == RouteMode.COMPLEX.value
+        assert _render([RouteMode.COMPLEX, "x"]) == f"{RouteMode.COMPLEX.value}、x"
 
 
 # ===========================================================================

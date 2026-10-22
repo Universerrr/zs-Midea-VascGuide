@@ -1,12 +1,28 @@
 """输出层节点 —— 把判定结果聚合为 :class:`FinalRecommendation`（决策产物）。
 
-本层做四件事（全部**机械可验证**，无一处自由裁量）：
+本层做五件事（全部**机械可验证**，无一处自由裁量）：
     ① ``trace → decision_path``：``StepTrace`` 与 ``DecisionStep`` 字段 1:1 对应，
        逐条直转，**含被否决项**（审计要求：不得只留命中项）；
     ② ``ruleset_version``：直接取自 :class:`RouteResult` 的复合版本串；
     ③ ``input_snapshot_hash``：取自输入层算好的输入快照哈希；
     ④ ``evidence_chain``：路由结论的依据 + ``VascCase.field_evidence`` 里每个
-       带出处的字段（原告原文），使每条建议可回指到具体规则与原文。
+       带出处的字段（原告原文），使每条建议可回指到具体规则与原文；
+    ⑤ ``tool_findings``：各工具产物的要点摘要（见下节）。
+
+## 为什么必须读 ``tool_outputs``
+
+执行层把工具产物写进 ``state.tool_outputs``，但**工具产物不会自己走进结论**。
+本层若不读它，工具算出的东西就只存在于状态与 checkpoint 里 —— 医生看不到、
+证据链里也没有它，等于白算。故本层显式消费 ``tool_outputs``，转成
+:class:`ToolFinding`（呈现条目）。
+
+刻意**不把原始数值抄进结论**：``tool_outputs`` 是唯一真源，摘要只做渲染
+（枚举取中文值、数值原样、缺失不补），抄一份就成两处真相。
+
+与 ``evidence_chain`` 的分工：
+    ``evidence_chain`` = **判定依据**（为什么这样路由）；
+    ``tool_findings``  = **测量产物**（影像/评分/检索各算出了什么）。
+    两者不互相复制 —— 同一条内容出现在两处，日后改一处就会不一致。
 
 ## 明确的两个留白（等外部输入，非本层能自行决定）
 
@@ -28,21 +44,39 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from enum import Enum
-from typing import Any
+from typing import Any, Final
+
+from pydantic import BaseModel
 
 from ...models.preop.case import VascCase
-from ...models.preop.recommendation import DecisionStep, EvidenceItem, FinalRecommendation
+from ...models.preop.recommendation import (
+    DecisionStep,
+    EvidenceItem,
+    FinalRecommendation,
+    ToolFinding,
+)
 from ...rules.router import RouteResult, StepTrace
+from ..execution_layer.registry import SPEC_BY_KEY
 from ..state import PreopState
 
 __all__ = [
     "PRIMARY_RECOMMENDATION_PLACEHOLDER",
     "TRANSLATION_BLOCKED_REASON",
     "TRANSLATION_IMPLEMENTED",
+    "build_tool_findings",
     "output_node",
 ]
+
+#: 单条摘要最多呈现多少个字段（防长模型把结论撑爆；超出部分只报总数）。
+MAX_SUMMARY_FIELDS: Final[int] = 10
+
+#: 摘要中跳过的字段：外键对结论读者无信息量（``case_id`` 已在结论顶层）。
+SUMMARY_SKIPPED_FIELDS: Final[frozenset[str]] = frozenset({"case_id"})
+
+#: 非模型产物（不该发生，但兜底）的摘要截断长度。
+MAX_FALLBACK_SUMMARY_CHARS: Final[int] = 120
 
 #: 主建议占位（**不含任何临床主张**，等临床口径确认后替换）。
 PRIMARY_RECOMMENDATION_PLACEHOLDER: str = (
@@ -70,6 +104,71 @@ def _render(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return "、".join(_render(v) for v in value)
     return str(value)
+
+
+def _render_scalar(value: Any) -> str:
+    """标量渲染：枚举取中文值、布尔转「是/否」、其余原样输出。"""
+    if isinstance(value, Enum):
+        return str(value.value)
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    return str(value)
+
+
+def _field_label(name: str, description: str | None) -> str:
+    """字段展示名：优先用 ``Field(description=...)``，缺失时退回字段名。
+
+    复用 pydantic 的 description 而非另建一份中文标签表 —— 标签只存在一处，
+    改字段说明时摘要自动跟上，不会两处漂移。
+    """
+    return (description or "").strip().rstrip("。；;") or name
+
+
+def _summarize_product(product: Any) -> str:
+    """把一个工具产物机械渲染成「字段 = 值；…」摘要（不改数、不推断）。"""
+    if product is None:
+        return "（无产出）"
+    if not isinstance(product, BaseModel):
+        text = repr(product)
+        if len(text) <= MAX_FALLBACK_SUMMARY_CHARS:
+            return text
+        return text[:MAX_FALLBACK_SUMMARY_CHARS] + "…"
+
+    parts: list[str] = []
+    for name, info in type(product).model_fields.items():
+        if name in SUMMARY_SKIPPED_FIELDS:
+            continue
+        value = getattr(product, name, None)
+        # 只呈现标量：嵌套模型与列表（如中心线剖面）对结论读者是噪声。
+        if value is None or not isinstance(value, (str, bool, int, float, Enum)):
+            continue
+        parts.append(f"{_field_label(name, info.description)} = {_render_scalar(value)}")
+
+    if not parts:
+        return "（无标量产出）"
+    shown = parts[:MAX_SUMMARY_FIELDS]
+    if len(parts) > MAX_SUMMARY_FIELDS:
+        shown.append(f"等共 {len(parts)} 项")
+    return "；".join(shown)
+
+
+def build_tool_findings(tool_outputs: Mapping[str, Any]) -> list[ToolFinding]:
+    """``tool_outputs`` → 呈现条目列表。
+
+    按工具键**升序**呈现（而非执行顺序）：``final_recommendation`` 参与审计哈希，
+    顺序一旦依赖字典插入顺序，调度顺序变化就会改变哈希。排序把这一层不确定性挡在外面。
+    """
+    findings: list[ToolFinding] = []
+    for key in sorted(tool_outputs):
+        spec = SPEC_BY_KEY.get(key)
+        findings.append(
+            ToolFinding(
+                tool_key=key,
+                label=spec.label if spec is not None else key,
+                summary=_summarize_product(tool_outputs[key]),
+            )
+        )
+    return findings
 
 
 def _to_decision_steps(trace: Sequence[StepTrace]) -> list[DecisionStep]:
@@ -136,7 +235,8 @@ def output_node(state: PreopState) -> dict[str, Any]:
     """输出层节点：聚合出 :class:`FinalRecommendation`。
 
     参数：
-        state: 至少含 ``case``（已回填）、``route_result``、``input_snapshot_hash``。
+        state: 至少含 ``case``（已回填）、``route_result``、``input_snapshot_hash``；
+            ``tool_outputs`` 可缺省（缺省即「本次没有任何工具产出」，``tool_findings`` 为空）。
 
     返回：
         含 ``final_recommendation`` 的状态增量。
@@ -154,6 +254,8 @@ def output_node(state: PreopState) -> dict[str, Any]:
         manual_review_required=result.manual_review_required,
         evidence_chain=_build_evidence(case, result),
         decision_path=_to_decision_steps(result.trace),
+        # 工具产物 → 呈现条目；未跑的工具不出现在这里（不编造「跑了但没结果」）。
+        tool_findings=build_tool_findings(state.get("tool_outputs") or {}),
         ruleset_version=result.ruleset_version,
         input_snapshot_hash=state.get("input_snapshot_hash"),
         # 留白二：等留白一定稿后再接 LLM 转译。

@@ -6,6 +6,20 @@
 
 ⚠️ 本模型是**工具产物**，不回写 VascCase。
 ⚠️ 量化本身由确定性/半确定性影像算法完成，本模型只做数据承载与校验。
+
+## 为什么本模型里**不得出现时间戳**
+
+本模型会经 ``state.tool_outputs`` 进入审计哈希投影（``HASHED_KEYS`` 含 ``tool_outputs``）。
+一旦模型内存在「什么时候跑的」这类时间戳字段，则同一份影像、同一份病例、同一版算法，
+在两次不同时刻的运行中会得到**不同的审计哈希**，直接违反「同输入同规则必同哈希」的可复现红线
+—— 这正是 ``audit_trail`` 被刻意排除在哈希之外的原因（见 ``preop_agent/state.py``）。
+
+⇒ 量化时间不属于「病例的产物」，属**运行期元信息**：由 ``execution_layer`` 的
+``NodeAudit.started_at / finished_at`` 记录（``audit_trail`` 不进哈希），产物模型只存
+**确定性内容**。同理，新增字段前先问一句：「这条内容会随时间或机器变化吗？」
+会 —— 就不能放这里。
+
+``method``（算法/版本）**必须保留**：它随算法版本变化，而算法版本改变**理应**改变哈希。
 """
 
 from __future__ import annotations
@@ -78,7 +92,6 @@ class VascMeasurement(BaseModel):
 
     # ---- 量化元信息（审计用） ----
     method: str | None = Field(default=None, description="量化方法/软件（如 CTA 自动分割 vX）。")
-    measured_at: str | None = Field(default=None, description="量化时间（ISO 8601 字符串）。")
 
 
 __all__ = ["CenterlinePoint", "VascMeasurement"]

@@ -38,7 +38,7 @@ from .case import (
     derive,
 )
 from .measurement import CenterlinePoint, VascMeasurement
-from .recommendation import DecisionStep, EvidenceItem, FinalRecommendation
+from .recommendation import DecisionStep, EvidenceItem, FinalRecommendation, ToolFinding
 
 __all__ = [
     "AUDIT_FIELDS",
@@ -51,6 +51,7 @@ __all__ = [
     "EvidenceItem",
     "FinalRecommendation",
     "RiskAssessment",
+    "ToolFinding",
     "VascCase",
     "VascMeasurement",
     "apply_route_result",
