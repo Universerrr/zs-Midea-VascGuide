@@ -1,7 +1,7 @@
 """VascMeasurement —— 影像量化器（工具 B）的产物。
 
 定位：
-    VascCase 里的 `neck_length_mm` / `neck_angle_deg` 等只是 LLM 抽取的**粗值**，
+    VascCase 里的 `n.neck_len` / `n.neck_angle` 等只是 LLM 抽取的**粗值**，
     仅用于路由门控。本模型承载**影像量化器精密测量**的结果。
 
 ⚠️ 本模型是**工具产物**，不回写 VascCase。

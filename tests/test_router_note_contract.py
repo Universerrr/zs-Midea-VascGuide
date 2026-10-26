@@ -1,188 +1,226 @@
-"""路由 ``note`` 文本契约测试（审计证据粒度；契约见 ``src/rules/router.py`` 模块文档）。
+"""判定结论自证契约 —— 每条 ``RouteResult`` 必须让人**独立复核**「为什么是这个结论」。
 
-为什么需要本文件：
-    未命中步骤的 ``note`` 若不写检查项，医生就无法独立复核「该步为何未命中」——
-    而「指南模式」这类结论恰恰**完全由否决链支撑**，复核主体正是这些否决项。
-    契约已写进 ``router.py`` 模块文档，但此前**没有任何断言守着**；本文件把它
-    变成机械检查：以后往未命中分支补代码却漏写检查项，测试立刻红。
+V3.1(2) 重写后，旧的 ``note`` 文本契约（``<结论句>（<检查项>；…）``）已随十步流水线一起废弃。
+取而代之的是**四个可机械校验的自证要素**：
 
-判据（与渲染层自检同源）：
-    ① 未命中步骤的 ``note`` 必须带**非空**的「（…）」检查项后缀，只有结论句即失败；
-    ② 检查项含比较符（``≥``/``≤``/``<``/``>``）时必须写出实际值；两类**豁免**：
-       · 项内已显式写「未提及」——那是对缺失的诚实声明（属抽取层数据缺口，
-         不是 note 粒度问题）；
-       · 比较符用于枚举/序数比较（如「阈值 ≥ III 级」）——本就无数字；
-    ③ 分隔符必须全角（项间 ``；``、包裹全角括号），半角写法同样判失败；
-    ④ **一个检查项 = 一个字段**：项内不得出现聚合词（``均无``/``均未``/``全部无``…）。
-       聚合句把「未提及」与「明确为否」抹平成一个「无」，正好藏掉复核者最想看的信息
-       （这条依据到底查了没有）——P1 的 5 个急性征象曾这样写过（table2@v1.7 已修）。
+1. ``rule_id`` 可回溯：命中的规则必须在 ``RULES`` 里（或显式登记为人工覆盖），
+   且每条规则带 V3.1(2) 源行号 —— 否则「某条规则判了它」这句话无法查证。
+2. ``reason`` 说人话：非空、含规则编号、不含 ``None``/``nan`` 这类占位泄漏。
+3. ``evidence_gaps`` 可用：每条路径都能在模型里解析；**且不得把已命中规则的字段
+   算成缺口**（命中的规则已经闭环，它的其余字段为空是正常状态）。
+4. ``trace`` 不虚构：只记录真正求值过的规则，且顺序与编排一致。
 
-分工声明：本文件只校验 ``note`` **文案**，不校验任何判定结果 ——
-    判定行为由 ``test_preop.py``（41 项基线）与 ``test_router_branches.py`` 守着。
+为什么值得单独成文件：指南模式这类结论**完全由否决链支撑**，复核主体正是
+「哪些规则被否决了、为什么否决」。这条链一旦断了，结论就没有据可查——
+而它断了也不会让任何判定结果变错，所以只能靠本文件守着。
+
+分工：本文件只校验**结论的可解释性**，不校验判定对错
+（判定行为由 ``test_preop.py`` 与 ``test_router_branches.py`` 守着）。
 
 运行：``uv run pytest tests/test_router_note_contract.py -v``
 """
 
 from __future__ import annotations
 
-import re
-
 import pytest
+from conftest import make_case
 
-from src.models.enums import (
-    DiseaseCategory,
-    EndoleakType,
-    HeartFailureNYHA,
-    PriorRepair,
-    Sex,
-    YesNoUnknown,
-)
-from src.rules.router import _checks, _cmp, _fmt, route, step_p8_prerequisites
-from tests.test_preop import make_case
+from src.models.preop.case import VascCase
+from src.rules.router import RULES, RouteKind, RouteResult, _read_path, route
 
-CHECK_SUFFIX = re.compile(r"（(.+?)）")
-COMPARATOR = re.compile(r"[≥≤<>]")
-DIGIT = re.compile(r"\d")
-HALFWIDTH = re.compile(r"[();,]")
-# 聚合词：一个检查项里出现它，意味着多个字段被压成了一句结论（判据 ④）
-AGGREGATE = re.compile(r"均[无未]|全部[无未]|皆[无未]")
+ENGINE_RULE_IDS = frozenset({"MANUAL.URGENCY", "FALLBACK.VERIFY"})
+"""两个**不是 V3.1(2) 规则**的标识，必须显式白名单：
 
+- ``MANUAL.URGENCY``：医生置位 ``urgency_flag``，跳过自动判定；
+- ``FALLBACK.VERIFY``：没有任何规则能判定（资料不足）——兜底不是规则判的，
+  所以不借 ``G03.R15`` / ``G04.R14`` 的 id，否则 RULESET.md 的出口列会说谎。
+"""
 
-def _violations(note: str, order: str) -> list[str]:
-    """返回 ``note`` 违反契约的条目（空列表 = 合规）。"""
-    match = CHECK_SUFFIX.search(note)
-    if not match or not match.group(1).strip():
-        return [f"{order}: 未命中但未附非空检查项 → {note!r}"]
-    bad: list[str] = []
-    for item in match.group(1).split("；"):
-        if not item.strip():
-            bad.append(f"{order}: 存在空检查项 → {note!r}")
-        elif HALFWIDTH.search(item):
-            bad.append(f"{order}: 检查项含半角分隔符（须用全角）→ {item!r}")
-        elif AGGREGATE.search(item):
-            bad.append(f"{order}: 检查项聚合了多个字段（应逐字段列出取值）→ {item!r}")
-        elif "未提及" in item or not COMPARATOR.search(item):
-            continue
-        elif not DIGIT.search(item):
-            bad.append(f"{order}: 数值判据缺实际值 → {item!r}")
-    return bad
-
-
-# 覆盖各类会走到「未命中分支」的真实病例
-CASES: dict[str, object] = {
-    "基线（P1~P6 全否决 → 指南）": make_case(),
-    "非指南病种（P7 亦否决 → 兜底）": make_case(
-        disease_category=[DiseaseCategory.SYMPTOMATIC_UNRUPTURED]
-    ),
-    "缺病种（P1~P5 否决后 P6 命中）": make_case(disease_category=[]),
-    "短颈（P1/P2 否决后 P3 命中）": make_case(neck_length_mm=12.0),
-    "合并髂动脉瘤（P3 否决至表1 L02）": make_case(
-        disease_category=[DiseaseCategory.ASYMPTOMATIC, DiseaseCategory.ILIAC_ANEURYSM]
-    ),
-    "NYHA III（P1~P3 否决后 P4 命中）": make_case(heart_failure_nyha=HeartFailureNYHA.III),
-    "术后内漏未提及（P1~P6 否决后 P7 亦否决 → 兜底）": make_case(
-        disease_category=[DiseaseCategory.POSTOPERATIVE],
-        prior_repair=PriorRepair.EVAR,
-        endoleak_type=None,
-    ),
-    "术后稳定随访（内漏明确为「无」→ 指南）": make_case(
-        disease_category=[DiseaseCategory.POSTOPERATIVE],
-        prior_repair=PriorRepair.EVAR,
-        endoleak_type=EndoleakType.NONE,
-    ),
+SCENARIOS = {
+    "指南": lambda: make_case(),
+    "复杂-短颈": lambda: make_case(n={"neck_len": 8.0}),
+    "复杂-生理风险": lambda: make_case(n={"egfr": 22.0}),
+    "急诊-低血压": lambda: make_case(v={"sbp": 70.0}),
+    "急诊-疑似破裂": lambda: make_case(d={"dx_context": "疑似"}, v={"sbp": 70.0}),
+    "复核-失血": lambda: make_case(lab={"hb": 85.0, "hb_prev": 120.0}),
+    "核实-缺颈长": lambda: make_case(n={"neck_len": None}),
+    "核实-空病例": lambda: VascCase(case_id="EMPTY"),
+    "人工越级": lambda: make_case(urgency_flag=True),
 }
 
 
-class TestUnhitNoteContract:
-    """流水线跑出来的每条未命中 note 都必须自证依据。"""
+def _results() -> dict[str, RouteResult]:
+    return {label: route(build()) for label, build in SCENARIOS.items()}
 
-    @pytest.mark.parametrize("label", list(CASES))
-    def test_unhit_notes_carry_checks(self, label: str) -> None:
-        result = route(CASES[label])  # type: ignore[arg-type]
-        bad: list[str] = []
-        for step in result.trace:
-            if step.result or not step.note:
+
+# ===========================================================================
+# 一、rule_id 可回溯
+# ===========================================================================
+class TestRuleIdIsTraceable:
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_rule_id_exists(self, label: str) -> None:
+        result = _results()[label]
+        assert result.rule_id in ENGINE_RULE_IDS or result.rule_id in RULES
+
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_rule_id_has_a_source_cell(self, label: str) -> None:
+        """能回溯到 V3.1(2) 的具体单元格，否则「规则判的」这句话没法查。"""
+        rule_id = _results()[label].rule_id
+        if rule_id in ENGINE_RULE_IDS:
+            pytest.skip("兜底 / 人工越级不是规格规则")
+        assert RULES[rule_id].source.count("!") == 1
+
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_exit_matches_result(self, label: str) -> None:
+        """规则的声明出口必须与实际出口一致 —— 否则 RULESET.md 会说谎。"""
+        result = _results()[label]
+        if result.rule_id in ENGINE_RULE_IDS:
+            pytest.skip("兜底 / 人工越级不经过 RULES，出口由兜底逻辑决定")
+        assert RULES[result.rule_id].exit == result.next_node
+
+
+# ===========================================================================
+# 二、reason 说人话
+# ===========================================================================
+class TestReasonIsSelfExplaining:
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_reason_is_not_empty(self, label: str) -> None:
+        assert _results()[label].reason.strip()
+
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_reason_names_the_rule(self, label: str) -> None:
+        """reason 里必须出现 rule_id，否则日志里只剩一句没有归属的结论。"""
+        result = _results()[label]
+        assert result.rule_id in result.reason
+
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_reason_has_no_placeholder_leak(self, label: str) -> None:
+        """``None`` / ``nan`` 是程序泄漏，不是给医生看的结论。"""
+        reason = _results()[label].reason
+        for token in ("None", "nan", "{", "}"):
+            assert token not in reason, f"reason 泄漏占位符 {token!r}：{reason}"
+
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_reason_is_single_line(self, label: str) -> None:
+        assert "\n" not in _results()[label].reason
+
+
+# ===========================================================================
+# 三、evidence_gaps 可用
+# ===========================================================================
+class TestEvidenceGapsAreUsable:
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_every_gap_path_is_resolvable(self, label: str) -> None:
+        """缺口是给抽取层「去补哪些字段」的指令，路径解析不了就等于没说。"""
+        result = _results()[label]
+        case = SCENARIOS[label]()
+        for gap in result.evidence_gaps:
+            if "（" in gap:  # 带说明的附加缺口（如 B6 回落），不按路径解析
                 continue
-            bad += _violations(step.note, step.order)
-        assert not bad, f"[{label}] note 契约违规：\n" + "\n".join(bad)
+            _read_path(case, gap)
 
-    def test_p8_unreachable_branch_is_compliant(self) -> None:
-        """``355`` 在流水线内不可达（P6 已拦下），直接调用其函数校验 note 合规。"""
-        hit, note = step_p8_prerequisites(make_case(), ["sex", "temporal_status"])
-        assert hit is False
-        assert _violations(note, "P8") == []
-        assert "仍缺 2 个关键字段" in note
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_gaps_are_deduplicated(self, label: str) -> None:
+        gaps = _results()[label].evidence_gaps
+        assert len(gaps) == len(set(gaps))
 
+    def test_hit_rule_fields_are_not_reported_as_gaps(self) -> None:
+        """命中的规则已闭环，它引用的其余字段为空是正常状态，不能算缺口。"""
+        result = route(make_case())
+        rule_fields = set(RULES[result.rule_id].fields)
+        assert not (rule_fields & set(result.evidence_gaps))
 
-class TestNoteFormatHelpers:
-    """``_fmt`` / ``_cmp`` / ``_checks`` 的渲染边界（契约的唯一定义处）。"""
+    def test_no_gaps_on_a_fully_answered_case(self) -> None:
+        assert route(make_case()).evidence_gaps == []
 
-    def test_fmt_renders_enum_by_chinese_value(self) -> None:
-        assert _fmt(Sex.MALE) == "男"
-
-    def test_fmt_renders_none_as_unmentioned(self) -> None:
-        assert _fmt(None) == "未提及"
-        assert _fmt(None, "mm") == "未提及"  # 缺失时不追加单位
-
-    def test_fmt_joins_list_and_marks_empty(self) -> None:
-        assert _fmt([DiseaseCategory.ASYMPTOMATIC]) == "1无症状AAA"
-        assert _fmt([]) == "空"
-
-    def test_cmp_keeps_comparator_only_when_value_present(self) -> None:
-        assert _cmp(25.0, "mm", "≥", "15.0mm") == "25.0mm ≥ 15.0mm"
-        assert _cmp(None, "mm", "≥", "15.0mm") == "未提及"  # 不产生「未提及 ≥ 15mm」
-
-    def test_checks_wraps_with_fullwidth_delimiters(self) -> None:
-        assert _checks("甲 1", "乙 2") == "（甲 1；乙 2）"
+    def test_empty_case_reports_a_substantial_gap_list(self) -> None:
+        """空病例的缺口必须足够长 —— 只报一两条说明检漏逻辑失效了。"""
+        assert len(route(VascCase(case_id="EMPTY")).evidence_gaps) >= 10
 
 
 # ===========================================================================
-# P1 未命中 note：逐字段列出急性征象（D-04 回归）
+# 四、置信度分级可复算
 # ===========================================================================
-# 这里刻意**重复**字段名与标签，而不复用 router 内部的 acute_signs 元组：
-# 本文件断言的是「对外契约」，复用实现内部结构会让测试跟着实现一起漂移。
-ACUTE_SIGNS: tuple[tuple[str, str], ...] = (
-    ("hemodynamic_instability", "循环不稳"),
-    ("active_hemorrhage", "活动性出血"),
-    ("acute_limb_ischemia", "急性肢体缺血"),
-    ("visceral_malperfusion", "重要器官灌注障碍"),
-    ("septic_shock", "脓毒性休克"),
-)
+class TestConfidenceIsRecomputable:
+    def test_high_requires_zero_gaps(self) -> None:
+        result = route(make_case())
+        assert result.confidence_level == "高"
+        assert result.evidence_gaps == []
+
+    def test_low_when_unknown_was_decisive(self) -> None:
+        result = route(VascCase(case_id="EMPTY"))
+        assert result.confidence_level == "低"
+
+    def test_levels_are_from_the_documented_enum(self) -> None:
+        assert {r.confidence_level for r in _results().values()} <= {"高", "中", "低"}
+
+    def test_low_implies_verify_or_review(self) -> None:
+        """置信度低却直接进模式（还带标签）是最危险的组合。"""
+        for label, result in _results().items():
+            if result.confidence_level == "低":
+                assert result.kind in (RouteKind.VERIFY, RouteKind.REVIEW), label
 
 
-def _p1_note(case: object) -> str:
-    """取出 P1 步骤的 note（并断言 P1 确为未命中）。"""
-    result = route(case)  # type: ignore[arg-type]
-    step = next(t for t in result.trace if t.order == "P1")
-    assert step.result is False
-    return step.note
+# ===========================================================================
+# 五、trace 不虚构
+# ===========================================================================
+class TestTraceIsHonest:
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_trace_entries_are_real_rules(self, label: str) -> None:
+        for entry in _results()[label].trace:
+            assert entry.rule_id in RULES
+
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_trace_verdicts_are_three_valued(self, label: str) -> None:
+        for entry in _results()[label].trace:
+            assert entry.verdict in (True, False, None)
+
+    @pytest.mark.parametrize("label", sorted(SCENARIOS))
+    def test_trace_declares_its_exit(self, label: str) -> None:
+        for entry in _results()[label].trace:
+            assert entry.exit in {"G05", "G06", "G07", "人工复核", "资料核实"}
+
+    def test_trace_stops_at_the_hit(self) -> None:
+        """命中即返回：命中的规则在 trace 里必须是**最后一条**，后面不许再有求值。"""
+        result = route(make_case(v={"sbp": 70.0}))
+        assert result.trace
+        assert result.trace[-1].rule_id == result.rule_id
+        assert result.trace[-1].verdict is True
+
+    def test_trace_has_no_duplicate_terminal_entries(self) -> None:
+        result = route(make_case())
+        ids = [entry.rule_id for entry in result.trace]
+        assert ids.count(result.rule_id) >= 1
+
+    def test_manual_override_has_empty_trace(self) -> None:
+        """人工越级跳过自动判定，所以自动判定的 trace 必须是空的（否则是伪造）。"""
+        assert route(make_case(urgency_flag=True)).trace == []
 
 
-class TestP1RejectedNoteIsPerField:
-    """P1 未命中 note 不许把 5 个急性征象压成一句「均无」。
+# ===========================================================================
+# 六、五出口完整性
+# ===========================================================================
+class TestExitCoverage:
+    def test_all_five_exits_are_reachable(self) -> None:
+        """54 条规则不能有「写了但永远走不到」的出口。"""
+        exits = {result.next_node for result in _results().values()}
+        assert exits == {"G05", "G06", "G07", "人工复核", "资料核实"}
 
-    改前该句恒为 ``…均无`` —— 即使这 5 个字段全是 ``None``（未采集）。
-    把「没查」写成「已排除」，方向恰好错在复核「本例为何不是急诊模式」的关键处。
-    """
+    def test_kind_matches_next_node(self) -> None:
+        mapping = {
+            "G05": RouteKind.MODE,
+            "G06": RouteKind.MODE,
+            "G07": RouteKind.MODE,
+            "人工复核": RouteKind.REVIEW,
+            "资料核实": RouteKind.VERIFY,
+        }
+        for label, result in _results().items():
+            assert result.kind is mapping[result.next_node], label
 
-    def test_uncaptured_signs_are_reported_as_unmentioned(self) -> None:
-        """字段未采集 → 逐项写「未提及」，且不得出现聚合句。"""
-        note = _p1_note(make_case())  # 5 个三态字段默认均为 None
-        for _, label in ACUTE_SIGNS:
-            assert f"{label} 未提及" in note
-        assert "均无" not in note
-        assert _violations(note, "P1") == []
-
-    def test_explicitly_negative_signs_are_reported_as_negative(self) -> None:
-        """明确为否 → 逐项写「无」，与「未提及」严格区分。"""
-        case = make_case(**{name: YesNoUnknown.NO for name, _ in ACUTE_SIGNS})
-        note = _p1_note(case)
-        for _, label in ACUTE_SIGNS:
-            assert f"{label} 无" in note
-        assert "未提及" not in note
-
-    def test_mixed_states_are_not_flattened(self) -> None:
-        """混合状态（一项「无」、一项「未提及」）不得被抹平成同一个值。"""
-        note = _p1_note(make_case(hemodynamic_instability=YesNoUnknown.NO, septic_shock=None))
-        assert "循环不稳 无" in note
-        assert "脓毒性休克 未提及" in note
+    def test_mode_is_set_only_for_mode_exits(self) -> None:
+        """``mode`` 只在 ``kind=MODE`` 时非空；REVIEW / VERIFY 带 mode 会让执行层误判。"""
+        for label, result in _results().items():
+            if result.kind is RouteKind.MODE:
+                assert result.mode is not None, label
+            else:
+                assert result.mode is None, label

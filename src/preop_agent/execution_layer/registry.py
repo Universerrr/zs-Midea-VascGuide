@@ -89,23 +89,24 @@ def run_tool(
 
     参数：
         key: 工具键，必须在 :data:`TOOL_REGISTRY` 中。
-        state: 至少含 ``case``（``route_mode`` 需已回填）。
+        state: 至少含 ``case`` 与 ``route_result``（模式由后者给出）。
         upstream: 本次运行中已完成的**上游**工具产物（工具键 → 产物）。
 
     抛出：
         KeyError: ``key`` 未登记。
         NotImplementedError: 该工具尚未实现（说明文字即其阻塞原因）。
-        RuntimeError: ``case.route_mode`` 未回填。
+        RuntimeError: 未经路由层（缺 ``route_result`` 或模式为空）。
     """
     spec = SPEC_BY_KEY[key]
     if not spec.implemented:
         raise NotImplementedError(f"{spec.label} 未实现：{spec.blocked_reason}")
 
     case = state["case"]
-    if case.route_mode is None:
+    result = state.get("route_result")
+    if result is None or result.mode is None:
         raise RuntimeError(
-            f"{spec.label} 需要已回填 route_mode 的 case；请在 router_layer 之后调用。"
+            f"{spec.label} 需要已路由出模式的病例；请在 router_layer 之后、且结论为「进入模式」时调用。"
         )
 
-    request = ToolRequest(case=case, route_mode=case.route_mode, upstream=upstream or {})
+    request = ToolRequest(case=case, route_result=result, upstream=upstream or {})
     return RUNNER_BY_KEY[key](request)

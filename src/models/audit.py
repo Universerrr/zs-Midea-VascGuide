@@ -19,9 +19,35 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, ConfigDict, Field
 
-from .enums import FieldWriter
+
+class FieldWriter(StrEnum):
+    """字段写入者 —— 审计归责用：区分 LLM 判断 / 规则判断 / 人工覆写。
+
+    放在本模块而非共享枚举文件：它是**审计**的专属概念，唯一的消费者就是
+    下面的 :class:`FieldProvenance` 与 :class:`UrgencyFlagAudit`。类型与它的
+    使用场景同址，改归责口径时只需看这一个文件。
+
+    ⚠️ **成员值是审计哈希的一部分**（``field_evidence`` 挂在 ``VascCase`` 上，
+    而 ``case`` 进 :data:`HASHED_KEYS`）。改名（如「人工」→「医生」）会让已有
+    审计记录的哈希链对不上，因此只增不改。
+
+    启用状态（2026-10-26）：
+        · ``LLM``     —— 抽取器实现后由 :func:`extract_case_from_text` 写入（当前恒抛
+          ``NotImplementedError``，属三处留白之一）；
+        · ``IMAGING`` —— 工具 B 影像量化器实现后启用；注意 ``VascMeasurement`` 目前
+          **没有** provenance 通道，需要届时补上，否则该值无处安放；
+        · ``HUMAN``   —— 医生覆写 / 置位 ``urgency_flag`` 时写入；
+        · ``SYSTEM``  —— 程序回填（如 ``derive()``）。
+    """
+
+    LLM = "LLM"
+    IMAGING = "影像量化器"
+    HUMAN = "人工"
+    SYSTEM = "系统"
 
 
 class FieldProvenance(BaseModel):
@@ -75,4 +101,4 @@ class UrgencyFlagAudit(BaseModel):
     reason: str = Field(..., description="置位理由（临床依据原文或授权说明）。")
 
 
-__all__ = ["FieldProvenance", "UrgencyFlagAudit"]
+__all__ = ["FieldProvenance", "FieldWriter", "UrgencyFlagAudit"]

@@ -32,7 +32,7 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 > **确定性内核（数据模型 + 规则层 + 编排层）已落地并通过验证；LLM 接入与确定性工具均未开始。**
 > **术前路由的规格已升级为 V3.1（2），重写路线已定案，见下节。**
 
-### 📐 规格冻结与重写路线（2026-10-22）
+### 📐 V3.1(2) 重写（2026-10-26 完成）
 
 术前路由的规格真源为 **V3.1（2）**（`VascGuide_V3.1 (2).xlsx`，**169 字段 + 63 条规则**），
 全部裁定记录集中在一份《字段与规则映射表》里。两者分工必须分清：
@@ -44,35 +44,37 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 
 > 两个 Excel 都在**仓库之外**（本地规格文件），不是代码资产，不进 git；本仓库只承载实现。
 
-**重写路线**（进行中）：
+**落地结果**：
 
-- **规则写进代码**，不采用「规则即数据」的数据表方案。理由：V3.1(2) 的判据是自然语言
-  （「允许值」列一列四义、AND/OR 混写、gate 只在自然语言里），无法机械转成数据行；
-  拆解成本与直接写代码相当，而代码有类型检查与调试优势。
-- **字段模型重建为 160 个字段 / 14 个按域子模型**（访问形式 `case.n.neck_len`），**手写**不用生成器。
-  口径：170 − 7 判定产物 − 3 物化派生 = 160。**落点就是现有的 `src/models/preop/case.py`，
-  就地扩写，不新建 `v31/` 子包**——导入路径 `from src.models.preop import VascCase` 全程不变。
-- **在现有 `router.py` 上就地重写**（不新建 `router_v31.py`），实现 **54 条判定规则**
-  （G03 21 + G04 18 + G08 11 + G09 4）。G00–G02 的 9 条属「读取资料/证据质量/事实抽取」，归 LLM 抽取层，不进路由。
-- **重写顺序**：`case.py`（字段名）→ `router.py`（规则）→ `tests/`（测试）。
-  先后只反映**依赖关系**（路由读字段、测试读两者），**不是为了保持测试全绿**。
-- **测试同批重写，施工期不追求全绿**：`test_preop`(41) 与 `test_model_contract`(67) 必然大改；
-  `test_preop_graph`(105) 的架构守卫多数可留（涉及字段数/枚举的断言要动）；
-  `test_router_note_contract`(17) 取决于 note 契约是否延续。因此**也不留过渡态**——
-  老的 51 个平铺字段直接删除，不标 `TODO` 暂留，不存在「两份真源临时例外」。
-- **验收标准**（269 项不再是施工期门槛）：54 条规则的**三态用例**（必须覆盖 UNKNOWN 分支）、
-  160 字段契约断言、架构守卫（判定层禁 LLM / 审计哈希链闭合 / 进哈希模型无时间戳）。
+- **字段**：`case.py` 就地重建为 **160 字段 / 14 个按域子模型**（`case.n.neck_len`），手写不生成。
+  口径：170（169 + 补入 `N.ACCESS_TORTUOSITY`）− 7 判定产物 − 3 物化派生 = 160。
+  域子模型共用一个 `_StrictDomain` 基类（`extra="forbid"`）：抽取层拼错字段名会立刻报错，
+  而不是静默丢事实。
+- **规则**：`router.py` 就地重写为 **54 条判定规则**（G03 21 + G04 18 + G08 11 + G09 4）。
+  G00–G02 的 9 条属「读取资料 / 证据质量 / 事实抽取」，归 LLM 抽取层，不进路由。
+  `RULESET.md` 逐条登记 `rule_id ↔ 函数 ↔ V3.1(2) 源行`，测试守着两边不漂移。
+- **为什么要写进代码而不是数据表**：V3.1(2) 的判据是自然语言（「允许值」列一列四义、
+  AND/OR 混写、gate 只在自然语言里），无法机械转成数据行；拆解成本与直接写代码相当，
+  而代码有类型检查与调试优势。
+- **三值求值**：`True` / `False` / `None`(UNKNOWN)，Kleene 合取。**UNKNOWN 不短路、不当 False**；
+  不确定值（可疑/疑似/未评价…）只能产生 UNKNOWN，但**规则显式列出时算命中**
+  （规格把「医生明确写疑似 rAAA」当阳性触发）。
+- **两个非规则标识**：`MANUAL.URGENCY`（医生置位 `urgency_flag` 越级）与
+  `FALLBACK.VERIFY`（没有任何规则能判定 → 资料核实）。兜底不借 `G03.R15` / `G04.R14` 的 id，
+  否则 `RULESET.md` 的出口列会说谎。
+- **验收标准**（不再是「测试全绿」这一条）：54 条规则的三态用例、160 字段契约断言、
+  架构守卫（判定层禁 LLM / 审计哈希链闭合 / 进哈希模型无时间戳）。
 
 ### ✅ 已完成
 
 | 模块 | 内容 |
 |---|---|
-| **术前数据模型（5 个）** | `VascCase`（51 字段；🚧 将就地扩至 160 字段）、`VascMeasurement`、`AnatomyScore`、`RiskAssessment`、`FinalRecommendation` |
-| **共享枚举（19 个）** | `StrEnum` + 中文值，覆盖性别、病种、破裂状态、解剖分型、恶性肿瘤等 |
+| **术前数据模型（5 个）** | `VascCase`（**160 字段 / 14 个按域子模型**）、`VascMeasurement`、`AnatomyScore`、`RiskAssessment`、`FinalRecommendation` |
+| **枚举（2 个，各归其位）** | `FieldWriter`（写入者归责，定义在 `audit.py`）、`RouteMode`（路由模式三值，定义在 `recommendation.py`）。事实字段的取值域改用字段级 `Literal`（中文值直写）——V3.1(2) 的「允许值」列一列四义，单个 `StrEnum` 表达不了 |
 | **审计留痕结构** | `FieldProvenance`（字段原文出处 / 写入者 / 置信度）、`UrgencyFlagAudit` |
-| **确定性规则层** | `router.py`（P0a~P8 路由流水线）+ `version.py`（规则版本注册表），详见「四」 |
+| **确定性规则层** | `router.py`（V3.1(2) 的 54 条判定规则 + 三值求值）+ `RULESET.md`（规则↔源行对照）+ `version.py`（规则版本），详见「四」 |
 | **编排层（LangGraph）** | 四层节点 `input → router → execution → output` 串成 `StateGraph` 并接 SQLite Checkpoint；每节点自动留痕（节点名 / 起止时间 / 输入输出哈希），审计链可**逐环校验**，详见「五」 |
-| **测试与工具链** | 269 项测试全绿（41 路由基线 + 67 数据契约 + 105 编排层 + 39 规则分支 + 17 note 契约）、`ruff` 无告警、覆盖率 99% |
+| **测试与工具链** | **590 项测试**（86 路由基线 + 81 数据契约 + 107 编排层 + 199 规则分支 + 117 结论自证契约）、`ruff` 无告警、覆盖率 **99%**（`router.py` 99%、`audit.py` 与 `recommendation.py` 100%） |
 
 ### ⏳ 尚未开始
 
@@ -121,20 +123,18 @@ zs-Midea VascGuide/
 │   ├── core/                    # 核心引擎预留位〔骨架，当前未使用；见下方「说明」第 4 条〕
 │   ├── models/                  # Pydantic 数据模型
 │   │   ├── __init__.py          # ✅ 统一导出（模型 + 枚举 + 审计结构）
-│   │   ├── enums.py             # ✅ 19 个共享枚举（StrEnum，中文值）
-│   │   ├── audit.py             # ✅ 审计留痕结构（FieldProvenance / UrgencyFlagAudit）
+│   │   ├── audit.py             # ✅ 审计留痕结构（FieldProvenance / UrgencyFlagAudit）+ FieldWriter
 │   │   ├── preop/               # ✅ 术前模型包（含 __init__.py 聚合导出）
-│   │   │   ├── case.py          # ✅ VascCase + derive() + apply_route_result()
-│   │   │   │                    #    🚧 就地扩写目标：51 字段 → 160 字段 / 14 个域子模型
+│   │   │   ├── case.py          # ✅ VascCase（160 字段 / 14 个域子模型）+ derive() + apply_route_result()
 │   │   │   ├── measurement.py   # ✅ VascMeasurement + CenterlinePoint（仅模型，无计算）
 │   │   │   ├── assessment.py    # ✅ AnatomyScore + RiskAssessment（仅模型，无计算）
-│   │   │   └── recommendation.py   # ✅ FinalRecommendation + EvidenceItem + DecisionStep + ToolFinding
+│   │   │   └── recommendation.py   # ✅ FinalRecommendation + EvidenceItem + DecisionStep + ToolFinding + RouteMode
 │   │   ├── intraop.py           # IntraOpIntent（预留，空占位）
 │   │   └── postop.py            # PostOpCase / FollowUpPlan / FollowUpStatus（预留，空占位）
 │   ├── rules/                   # ✅ 确定性规则层（详见「四」；无 __init__.py）
-│   │   ├── router.py            # 🚧 路由判定流水线（V3.1(2) 就地重写中：54 条判定规则）
-│   │   ├── version.py           # ✅ 规则版本号注册表（将升级为 RULESET_VERSION，进哈希）
-│   │   └── RULESET.md           # 🚧 54 条规则 ↔ 函数名 ↔ V3.1(2) 源行 对照表（防规格漂移）
+│   │   ├── router.py            # ✅ 路由判定流水线（V3.1(2)：54 条判定规则 + 三值求值）
+│   │   ├── version.py           # ✅ 规则版本号（RULESET_VERSION = v312@v3.1.2，进哈希）
+│   │   └── RULESET.md           # ✅ 54 条规则 ↔ 函数名 ↔ V3.1(2) 源行 对照表（防规格漂移）
 │   ├── tools/                   # ✅ 5 个确定性工具（一工具一文件，全部未实现）
 │   │   ├── base.py              # ✅ ToolSpec / ToolRequest / MissingUpstreamError
 │   │   ├── guideline_engine.py  # 工具A · 指南引擎（阻塞：指南条目库）
@@ -163,11 +163,12 @@ zs-Midea VascGuide/
 │       ├── status_manager/      # ⑤ 状态管理
 │       └── output_translate/    # ⑥ 输出转译
 ├── tests/                       # 测试（无 __init__.py，见「八、开发约定」）
-│   ├── test_preop.py            # ✅ 41 项路由行为基线（V3.1 重写时需改造，含 E1/B5 连带）
-│   ├── test_model_contract.py   # ✅ 67 项数据契约
-│   ├── test_preop_graph.py      # ✅ 105 项编排层 + 调度表 + 依赖排序 + Checkpoint 往返 + 架构守卫
-│   ├── test_router_branches.py  # ✅ 39 项规则分支覆盖
-│   └── test_router_note_contract.py # ✅ 17 项 note 文本契约
+│   ├── conftest.py              # ✅ 唯一病例构造入口：baseline_kwargs() + make_case()（域级浅合并）
+│   ├── test_preop.py            # ✅ 86 项路由端到端基线（五出口 / 同桶优先级 / 标签）
+│   ├── test_model_contract.py   # ✅ 81 项数据契约（160 字段 / 不确定值白名单 / 严格模式）
+│   ├── test_preop_graph.py      # ✅ 107 项编排层 + 调度表 + 依赖排序 + Checkpoint 往返 + 架构守卫
+│   ├── test_router_branches.py  # ✅ 199 项规则分支（54 条逐条命中 + 三值语义 + 派生量）
+│   └── test_router_note_contract.py # ✅ 117 项结论自证契约（rule_id / reason / gaps / trace）
 ├── pyproject.toml               # 依赖与项目元数据（唯一"真源"）
 ├── uv.lock                      # 全量精确锁定（含传递依赖，由 uv 生成）
 ├── main.py                      # 系统入口（占位）
@@ -177,7 +178,7 @@ zs-Midea VascGuide/
 └── README.md                    # 本文档 —— 全项目唯一说明入口
 ```
 
-**图例**：✅ = 已实现并通过测试；🚧 = V3.1(2) 重写中（已定案待实现）；〔骨架〕= 只有目录结构，无业务逻辑；其余为预留文件。
+**图例**：✅ = 已实现并通过测试；〔骨架〕= 只有目录结构，无业务逻辑；其余为预留文件。
 
 > **说明**
 > 1. 本仓库根目录即为项目根目录，**必须从仓库根运行**（`pyproject.toml` 中 `[tool.uv] package = false`，不是可安装包）。
@@ -207,25 +208,29 @@ zs-Midea VascGuide/
 
 | 文件 | 职责 | 状态 |
 |---|---|---|
-| `router.py` | 路由判定流水线（纯函数，无副作用、无 IO、无全局状态） | 🚧 **就地重写中**：P0a~P8 → V3.1(2) 的 54 条判定规则 |
-| `version.py` | 规则版本号注册表（复合版本串，审计必需） | 保留，将升级为 `RULESET_VERSION`（进哈希） |
-| `RULESET.md` | 54 条规则 ↔ 函数名 ↔ V3.1(2) 源行 的对照表 | 🚧 待建（规格追溯，防第二真源） |
+| `router.py` | 路由判定流水线（纯函数，无副作用、无 IO、无全局状态） | ✅ V3.1(2) 的 54 条判定规则（G03 21 / G04 18 / G08 11 / G09 4） |
+| `version.py` | 规则版本号注册表（审计必需，进哈希） | ✅ `RULESET_VERSION = v312@v3.1.2` |
+| `RULESET.md` | 54 条规则 ↔ 函数名 ↔ V3.1(2) 源行 的对照表 | ✅ 与代码逐条对应（测试守着） |
 
 ### 2. 路由做什么（以及不做什么）
 
 `route(VascCase) → RouteResult`。它只回答**一个问题**：「这个病例该走哪条路？」
 
 ```
-事实层输入  ──▶  P0a~P8 判定链（命中即短路）  ──▶  三选一结论 + 判定轨迹 + 规则版本
-                 急诊 > 复杂 > 指南
+事实层输入 ──▶ G03 急诊(P01→P02→P03→P04) ──▶ G04 复杂(R01–R12/R15–R18→R13→R14) ──▶ G08 分类 ──▶ G09 收尾
+                         │                                    │
+                    G05 / 人工复核 / 资料核实            G06 / G07 / 资料核实
 ```
 
-- **短路即优先级**：判定链自上而下，一旦命中立即返回，后续步骤不再求值。
+- **短路即优先级**：G03 的四个桶依次求值，命中即返回；`G03 回流 > G06 > VERIFY`。
   「急诊 > 复杂 > 指南」不是配置项，而是**代码的物理结构**。
-- **两个兜底方向都是保守的**：全部不命中 → 回落为**复杂模式 + 需人工复核**（不默认「稳定」）；
-  指南模式下若仍有字段缺失 → 同样降级。关键字段缺失时置信度 `0.90 → 0.45`（×0.5）。
-- **每一步都留痕**：逐条写入 `StepTrace`（步骤号 / 判定条件 / 结果 / 规则编号 / 说明），
-  **含被否决的步骤**，最终结论附带 `RULESET_VERSION`。这是「历史结论可追溯复现」的落地方式。
+- **兜底方向是保守的**：没有任何规则能判定 → `FALLBACK.VERIFY`（资料核实），
+  **不默认「稳定」、也不拿 G07 当兜底**（G07 是排他分支：要求核心影像可评价）。
+- **三值求值**：`True` / `False` / `None`(UNKNOWN)。`None` 既不是「没命中」也不是「阴性」，
+  它只会让结论停在「资料核实」。
+- **每一步都留痕**：逐条写入 `RuleTrace`（规则编号 / 三值结果 / 声明出口），**含被否决的步骤**；
+  输出层再映射成 `DecisionStep`（序号 / 规则名 / 结果 / 规则编号 / V3.1(2) 源行）。
+- **置信度是分级不是点估计**（B4/B5 裁定）：`高`（无缺口）/ `中`（有缺口）/ `低`（有决定性未判定项）。
 
 ### 3. 设计原则
 
@@ -267,8 +272,8 @@ uv run python -c "from src.rules.version import RULESET_VERSION, RULESET_CHANGEL
 `router_layer` 节点（服务 LangGraph 编排）。**两处都必须是薄封装。**
 
 > **为什么规则不直接写在 `router_layer/` 里？** 因为三期 Agent 共享同一套临床口径，
-> 且规则必须能独立测试 —— 41 项路由测试 0.2 秒跑完，不需要 LangGraph、不需要数据库、
-> 不需要任何 API Key（相比之下编排层测试要 7 秒）。
+> 且规则必须能独立测试 —— 86 项路由端到端测试 0.3 秒跑完，不需要 LangGraph、不需要数据库、
+> 不需要任何 API Key（相比之下编排层测试要 4 秒）。
 > 绑定到 `preop_agent/` 下会导致跨层循环依赖、版本号漂移，并使「规则变更纪律」无法被机器检查。
 
 ---
@@ -459,60 +464,75 @@ uv run main.py
 
 ### 跑一次术前流水线（编排层）
 
-`main.py` 仍是占位入口。要实际跑通「病例 → 最终建议 + 可审计落盘」，直接用编排层入口：
+`main.py` 仍是占位入口。要实际跑通「病例 → 最终建议 + 可审计落盘」，直接用编排层入口。
+`VascCase` 的 160 个字段**按域分组**，取值用**中文字面量**直写（V3.1(2) 的「允许值」原文）：
+
+> 域前缀：`p` 人口学 / `t` 时间基准 / `d` 原始文书 / `q` 数据质量 / `s` 症状体征 / `v` 生命体征 /
+> `lab` 化验 / `c` CTA 报告文字 / `n` 解剖（颈·肾·髂·入路）/ `gen` 遗传 / `inf` 炎症 /
+> `cl` 分型输入 / `k` 会话级标记（`K.*`）/ `r` 路由回填（`R.*`）。
 
 ```python
-from src.models.enums import (
-    DiseaseCategory,
-    PriorRepair,
-    RuptureStatus,
-    Sex,
-    SymptomAAA,
-    TemporalStatus,
-)
-from src.models.preop.case import VascCase
-from src.preop_agent.graph import build_preop_graph, run_preop, sqlite_checkpointer, thread_config
+from src.models.preop import VascCase
+from src.preop_agent.graph import run_preop, sqlite_checkpointer
 
 case = VascCase(
     case_id="DEMO-001",
-    age=72,
-    sex=Sex.MALE,
-    temporal_status=TemporalStatus.CURRENT,
-    symptom_aaa_related=SymptomAAA.ABSENT,
-    rupture_status=RuptureStatus.INTACT,
-    prior_repair=PriorRepair.NONE,
-    disease_category=[DiseaseCategory.ASYMPTOMATIC],
-    max_diameter_mm=42.0,
-    neck_length_mm=25.0,
-    neck_angle_deg=20.0,
-    access_diameter_mm=9.0,
-    anatomy_level="肾下",
+    p={"age": 72, "sex": "男"},
+    d={"dx": "肯定", "cta": "腹主动脉瘤，最大径 42mm"},
+    q={"idmatch": "一致", "time": "有效", "cta_quality": "可评价"},
+    s={"pain_present": "否", "syncope": "否定", "abd_tender": "阴性", "aaa_tender": "阴性"},
+    v={"sbp": 120.0, "dbp": 70.0, "hr": 78.0, "rr": 18.0, "spo2": 97.0, "temp": 36.5, "acvpu": "A"},
+    n={
+        "cta_status": "完整",
+        "neck_len": 25.0,
+        "neck_d": 22.0,
+        "neck_angle": 20.0,
+        "renal_r": "未受累",
+        "renal_l": "未受累",
+        "seal_ifu": "符合",
+        "access_occlusion": "未见闭塞",
+    },
 )
 
 # 不传 checkpointer → 默认落盘到 .workbuddy/state/preop_checkpoints.sqlite
 state = run_preop(case)
 
-print(state["final_recommendation"].route_mode)  # 指南模式
-print(len(state["final_recommendation"].decision_path))  # 10（含被否决项）
+r = state["route_result"]
+print(r.kind, r.rule_id, r.next_node)  # 资料核实 FALLBACK.VERIFY 资料核实
+print(r.confidence_level, len(r.evidence_gaps))  # 低 32
 print([record.node for record in state["audit_trail"]])  # 四个节点
 print(state["thread_id"])  # 本次落在哪条线程（派生值，须回传）
 print(state["audit_persisted"])  # True
-
-# 换一个**独立连接**读回同一份 state —— 这就是「全程可审计」的兑现
-with sqlite_checkpointer() as reopened:
-    app = build_preop_graph(checkpointer=reopened)
-    print(app.get_state(thread_config(state["thread_id"])).values["case"].case_id)  # DEMO-001
 ```
 
-> 上面是**当前 API**（`VascCase` 平铺 51 字段）。V3.1(2) 重写完成后字段改为按域子模型访问
-> （`case.p.age` / `case.n.neck_len`），**导入路径不变**，只是构造参数分组。
+> **这个出口不是故障**：上例刻意只填关键域，缺的 32 项（破裂征象、疼痛细节、Hb 系列等）被判为
+> **UNKNOWN 而不是「阴性」**，汇总进 `evidence_gaps` 后走「资料核实」—— 这正是「未提及 ≠ 无」的兑现：
+> 宁可让人去补资料，也不允许缺项悄悄算作阴性。
+> 字段补齐后同一套代码即落到「指南模式」：以 `tests/conftest.py` 的 `baseline_kwargs()`（160 字段全有值的
+> 基线）为例，`route_mode` 为 **指南模式**、命中规则 `G04.R14`、`decision_path` 49 步（含被否决项）。
+
+换一个**独立连接**读回同一份 state —— 这就是「全程可审计」的兑现：
+
+```python
+from src.preop_agent.graph import build_preop_graph, thread_config
+
+with sqlite_checkpointer() as reopened:
+    app = build_preop_graph(checkpointer=reopened)
+    values = app.get_state(thread_config(state["thread_id"])).values
+    print(values["case"].case_id)  # DEMO-001
+```
+
+> **字段访问一律带域前缀**：`case.p.age` / `case.n.neck_len`，域内字段平铺中文字面量（`case.p.sex == "男"`）。
+> **不存在** `src.models.enums` 这类共享枚举模块 —— V3.1(2) 的「允许值」列一列四义，共享枚举表达不了，
+> 故每个字段用自己的 `Literal`；仅有的两个跨字段枚举各归其消费者：`FieldWriter` 在 `audit.py`、
+> `RouteMode` 在 `preop/recommendation.py`。
 
 > 脚本须**从仓库根**运行（`uv run python xxx.py` 或 `python -m`），否则 `import src` 会失败。
 
 ### 常用命令（测试 / 检查）
 
 ```bash
-# 跑全部测试（应为 263 passed）
+# 跑全部测试（应为 590 passed, 4 skipped）
 uv run pytest tests/ -q
 
 # 静态检查（应为 All checks passed）
@@ -537,7 +557,7 @@ uv run pytest tests/ --cov --cov-report=term-missing
 - **覆盖了哪些代码**：`--cov-report=html` 生成 `htmlcov/index.html`，红色行即未被测试执行到的分支。
 
 > ⚠️ **覆盖率 ≠ 测试结果**：前者衡量「代码有多少行被执行到」，后者衡量「每个用例过没过」。
-> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 269 项全绿、覆盖率 99%。
+> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 590 项全绿、覆盖率 99%。
 
 ---
 

@@ -1,355 +1,739 @@
-"""路由分支定向覆盖测试 —— 补齐 ``src/rules/router.py`` 中此前无病例触发的判定分支。
+"""路由分支测试 —— V3.1(2) **54 条判定规则**的逐条覆盖 + 三值语义守卫。
 
-与 ``tests/test_preop.py`` 的分工：
-    ``test_preop.py`` 是**路由基线**（断言一经确立不得修改），只覆盖每条路径的
-    代表性入口；本文件针对基线未触及的 **13 行**做定向回归保护，两者互补，
-    且**不修改**基线文件任何一个字符。
+分三层（刻意分开：失败时含义不同）：
 
-覆盖对象分两类，验证手法不同：
+1. **注册表守卫**：``RULES`` 与 V3.1(2) 是否对得上（条数 / 编号 / 源行 / 出口）。
+   这层失败 = 规格漂移，不是逻辑 bug。
+2. **逐条命中**（``HITS``）：每条规则至少一个「明确命中」用例。逐条直接调规则函数、
+   不经 ``route()`` 编排 —— 否则前面规则先命中就再也走不到后面，覆盖是假的。
+3. **三值语义**：``UNKNOWN`` 不短路、不确定值只产生 UNKNOWN、未提及 ≠ 阴性。
 
-1. **可达分支（10 处）** —— 真实存在、但此前无任何病例走到：
-   ``219`` / ``221`` / ``239`` / ``242``（P2·O21 炎症证据 / 遗传结缔组织病 /
-   「5其他特殊」病种 / 术后感染-瘘并发症）、``269``（P3·O18 瘤颈血栓钙化）、
-   ``285`` / ``287`` / ``293``（P3·O23 复杂修复史 / 再干预史 / 术后并发症）、
-   ``313``（P4·O14 冠心病）、``337``（P7·O26 非指南病种）。
-   每条断言同时校验「模式 + 规则编号 + 派生标记 + 置信度」，避免只覆盖到行、
-   却锁不住口径。
-
-2. **不可达防御分支（3 处）** —— ``329``（P6 病种无法识别的二级判定）、
-   ``355``（P8 前置否决）、``452``（P8 否决后的复杂兜底）。在 ``route()`` 的
-   调用契约下它们**不可达**：P6 已对 ``missing`` 非空短路，而走到 P8 的前提
-   是 P6 未命中（即 ``missing`` 为空），两个条件互斥。
-   对这类分支用「三重钉法」，既拿到覆盖、又不掩盖「不可达」这一事实：
-     · 不变量测试 —— 证明流水线内确实不可达（任一关键字段缺失都在 P6 被拦下）；
-     · 函数级测试 —— 证明被绕开的那段逻辑本身行为正确；
-     · 契约演练 —— 临时让 P6 放行，证明 P8 否决路径仍然可用，即这三行是
-       **防御性冗余**而非错误代码（P6 契约一旦变更即可立即生效）。
-
-运行：``uv run pytest tests/test_router_branches.py -v``
+依赖运行时状态的 4 条（``G04.R14``、``G08.R09``、``G09.R03``、``G09.R04``）单独测：
+它们读的是编排层写进 ``_Ctx`` 的中间结果，不是病例字段，无法用「一条用例一个 dict」表达。
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+from conftest import make_case
 
-from src.models.enums import (
-    DiseaseCategory,
-    EndoleakType,
-    InfectionEvidence,
-    PriorRepair,
-    RouteMode,
-    YesNoUnknown,
-)
-from src.models.preop.case import CRITICAL_FACT_FIELDS, VascCase
+from src.models.preop.case import VascCase
+from src.models.preop.recommendation import RouteMode
 from src.rules.router import (
-    NECK_THROMBUS_CALC_THRESHOLD_PCT,
+    G03_P01,
+    G03_P02,
+    G03_P03,
+    G04_BLOCKING,
+    G04_EXTRA,
+    G08_RULES,
+    LABEL_BY_RULE,
+    OUTCOME_PRIORITY,
+    RULES,
+    RouteKind,
+    _and,
+    _Ctx,
+    _eq,
+    _not,
+    _or,
+    _read_path,
     route,
-    step_p6_missing,
-    step_p8_prerequisites,
 )
 
-# 复用基线工厂，保证「字段齐全的指南病例」只有一处定义，避免两份默认口径漂移。
-from tests.test_preop import make_case
+VALID_EXITS = {"G05", "G06", "G07", "人工复核", "资料核实"}
+
+
+def verdict_of(rule_id: str, **overrides: object) -> bool | None:
+    """直接调规则函数求值（跳过编排，避免前置规则抢先命中）。"""
+    return RULES[rule_id].func(_Ctx(make_case(**overrides)))  # type: ignore[arg-type]
 
 
 # ===========================================================================
-# 可达分支 · P2 特殊病变（O21）
+# 一、注册表守卫
 # ===========================================================================
-class TestP2SpecialLesionBranches:
-    """P2·O21 中四个此前无用例触发的入口。"""
+class TestRuleRegistry:
+    def test_rule_count_is_54(self) -> None:
+        assert len(RULES) == 54
 
-    def test_inflammatory_evidence(self) -> None:
-        """炎症证据 = 有 → 特殊病变（219）。"""
-        result = route(make_case(inflammatory_evidence=YesNoUnknown.YES))
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.is_special_lesion
-        assert "炎症证据" in result.reason
-        assert result.confidence == 0.90  # 字段齐全，是真实命中而非缺失降级
-
-    def test_genetic_syndrome(self) -> None:
-        """遗传 / 结缔组织病 = 有 → 特殊病变（221）。"""
-        result = route(make_case(genetic_syndrome=YesNoUnknown.YES))
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.is_special_lesion
-        assert "遗传" in result.reason
-
-    def test_other_special_category(self) -> None:
-        """病种含「5其他特殊」→ 特殊病变（239）。"""
-        result = route(make_case(disease_category=[DiseaseCategory.OTHER_SPECIAL]))
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.is_special_lesion
-        assert DiseaseCategory.OTHER_SPECIAL.value in result.reason
-
-    def test_postop_infection_complication(self) -> None:
-        """术后「感染 / 瘘」并发症 → 走 P2 特殊病变（242），早于 P3 的术后分支。"""
-        result = route(make_case(postop_complication="支架移植物感染"))
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.is_special_lesion
-        assert "术后感染/瘘" in result.reason
-
-    def test_suspected_infection_is_not_affirmative(self) -> None:
-        """口径反例：「疑似感染」≠「有感染」（O21），不得误升级为特殊病变。
-
-        ``InfectionEvidence.SUSPECTED`` 与 ``YesNoUnknown.YES`` 的 value 不同，
-        ``_is_truthy`` 只认「有」—— 这是四态枚举独立成类的全部意义，必须钉住。
-        """
-        result = route(make_case(infection_evidence=InfectionEvidence.SUSPECTED))
-        assert not result.is_special_lesion
-        assert result.route_mode is RouteMode.GUIDELINE
-
-
-# ===========================================================================
-# 可达分支 · P3 复杂解剖 / 复杂手术（O15~O23）
-# ===========================================================================
-class TestP3ComplexAnatomyBranches:
-    def test_neck_thrombus_calc_over_threshold(self) -> None:
-        """O18 瘤颈血栓 / 钙化超阈值 → 复杂解剖（269）。"""
-        result = route(make_case(neck_thrombus_calc_pct=NECK_THROMBUS_CALC_THRESHOLD_PCT + 1))
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.complex_anatomy
-        assert "O18" in result.reason
-
-    @pytest.mark.parametrize("pct", [0, NECK_THROMBUS_CALC_THRESHOLD_PCT])
-    def test_neck_thrombus_calc_at_or_below_threshold(self, pct: int) -> None:
-        """口径边界：O18 是**严格大于**阈值，等于阈值不触发。"""
-        result = route(make_case(neck_thrombus_calc_pct=pct))
-        assert result.route_mode is RouteMode.GUIDELINE
-        assert not result.complex_anatomy
-
-    @pytest.mark.parametrize("repair", [PriorRepair.FEVAR, PriorRepair.BEVAR, PriorRepair.OTHER])
-    def test_complex_prior_repair(self, repair: PriorRepair) -> None:
-        """O23 复杂修复史（FEVAR / BEVAR / 其他）→ 复杂（285）。
-
-        EVAR / OSR 属常规修复，**不在**该集合内，故单独反例见下一用例。
-        """
-        result = route(make_case(prior_repair=repair))
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.complex_anatomy
-        assert "O23" in result.reason
-
-    def test_complex_surgery_history_without_prior_repair(self) -> None:
-        """O23 无既往修复 + 复杂手术 / 多次再干预史 = 有 → 复杂（287）。"""
-        result = route(make_case(complex_surgery_history=YesNoUnknown.YES))
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.complex_anatomy
-        assert "O23" in result.reason
-
-    def test_postop_complication_without_prior_repair(self) -> None:
-        """O23 无既往修复 + 术后并发症关键词 → 复杂（293）。
-
-        注意：该出口的 reason **不带规则编号**（仅「P3 术后并发症：…」），
-        与 O15~O20 各出口的文案格式不同，故此处按文案断言。
-        """
-        result = route(make_case(postop_complication="Ⅱ型内漏伴瘤囊增大"))
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.complex_anatomy
-        assert "术后并发症" in result.reason
-
-    @pytest.mark.parametrize("repair", [PriorRepair.EVAR, PriorRepair.OSR])
-    def test_postop_complication_ignored_when_prior_repair_present(
-        self, repair: PriorRepair
-    ) -> None:
-        """口径反例：已有修复史者不因「术后并发症」判为术前复杂（288 的 ``is NONE`` 前提）。
-
-        这类病例属术后随访路径，应走 P7 指南（此处的内漏状态为「无」，属稳定随访）。
-        """
-        result = route(
-            make_case(
-                disease_category=[DiseaseCategory.POSTOPERATIVE],
-                prior_repair=repair,
-                postop_complication="内漏",
-                endoleak_type=EndoleakType.NONE,
-            )
-        )
-        assert result.route_mode is RouteMode.GUIDELINE
-        assert not result.complex_anatomy
-
-
-# ===========================================================================
-# 可达分支 · P4 严重合并症（O11~O14）
-# ===========================================================================
-class TestP4ComorbidityBranches:
-    def test_cad(self) -> None:
-        """O14 冠心病 CAD = 有 → 复杂（313）。"""
-        result = route(make_case(cad=YesNoUnknown.YES))
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.severe_comorbidity
-        assert "O14" in result.reason
-
-
-# ===========================================================================
-# 可达分支 · P7 指南场景（O26）
-# ===========================================================================
-class TestP7GuidelineBranches:
     @pytest.mark.parametrize(
-        "category",
-        [DiseaseCategory.SYMPTOMATIC_UNRUPTURED, DiseaseCategory.RUPTURED_OR_SUSPECTED],
+        ("domain", "expected"), [("G03", 21), ("G04", 18), ("G08", 11), ("G09", 4)]
     )
-    def test_non_guideline_category_falls_back_to_complex(self, category: DiseaseCategory) -> None:
-        """O26 非指南病种 → P7 不命中（337），由 P7b 兜底复杂 + 人工复核。
+    def test_rule_count_per_domain(self, domain: str, expected: int) -> None:
+        assert sum(1 for rid in RULES if rid.startswith(f"{domain}.")) == expected
 
-        构造说明：这里只给「病种标签」，症状 / 破裂**事实字段**保持基线（无 / 未破裂），
-        因此 P1 不触发。该用例同时钉住两件事——① 病种标签本身不足以触发急诊；
-        ② 非指南标签不得被默认判为「稳定」。
-        """
-        result = route(make_case(disease_category=[category]))
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.manual_review_required
-        assert not result.guideline_eligible
-        p7 = next(t for t in result.trace if t.order == "P7")
-        assert p7.result is False
-        assert any(t.order == "P7b" for t in result.trace)
+    def test_ids_are_contiguous(self) -> None:
+        """编号必须连续：缺号通常意味着规格里有条规则被漏实现。"""
+        for domain in ("G03", "G04", "G08", "G09"):
+            got = sorted(int(rid.split(".R")[1]) for rid in RULES if rid.startswith(f"{domain}."))
+            assert got == list(range(1, len(got) + 1)), f"{domain} 编号不连续：{got}"
 
+    def test_every_rule_declares_a_source_cell(self) -> None:
+        """``source`` 是第二真源的凭据：必须形如 ``G03!9``，能回指 V3.1(2) 单元格。"""
+        bad = [rid for rid, spec in RULES.items() if not spec.source or "!" not in spec.source]
+        assert not bad, bad
 
-# ===========================================================================
-# 不可达防御分支 · 不变量（证明流水线内不可达）
-# ===========================================================================
-class TestUnreachableDefensiveBranches:
-    """P6 二级判定（329）、P8 前置否决（355）与 P8 兜底（452）的可达性论证。
+    def test_source_cell_domain_matches_rule_domain(self) -> None:
+        bad = [rid for rid, spec in RULES.items() if not spec.source.startswith(rid.split(".")[0])]
+        assert not bad, bad
 
-    不可达证明：走到 P8 的前提是 P6 未命中；P6 命中条件之一是 ``missing`` 非空；
-    而 P8 的否决条件恰是 ``missing`` 非空 —— 两者互斥。故 P8 否决路径恒不执行，
-    连带其后的复杂兜底（452）也不执行。
-    """
+    def test_every_rule_has_a_valid_exit(self) -> None:
+        assert {spec.exit for spec in RULES.values()} <= VALID_EXITS
 
-    @pytest.mark.parametrize("field", CRITICAL_FACT_FIELDS)
-    def test_any_missing_critical_field_blocks_before_p8(self, field: str) -> None:
-        """任一关键字段缺失都在 P6 被拦截，且**不会**进入 P8（355 / 452 不可达的机械证明）。"""
-        value: object = [] if field == "disease_category" else None
-        result = route(make_case(**{field: value}))
+    def test_every_rule_declares_fields(self) -> None:
+        bad = [rid for rid, spec in RULES.items() if not spec.fields]
+        assert not bad, bad
 
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.confidence == 0.45  # 0.90 × MISSING_PENALTY
-        assert result.manual_review_required
-        assert field in result.missing_critical_fields
-        assert not any(t.order == "P8" for t in result.trace)
+    def test_declared_fields_are_readable_paths(self) -> None:
+        """``fields`` 是缺口清单的来源；路径写错的话缺口永远为空（静默失效）。"""
+        case = make_case()
+        bad: list[str] = []
+        for rid, spec in RULES.items():
+            for path in spec.fields:
+                try:
+                    _read_path(case, path)
+                except Exception:  # noqa: BLE001 - 路径错就是错，异常类型不重要
+                    bad.append(f"{rid}::{path}")
+        assert not bad, bad
 
-    def test_empty_category_is_caught_by_missing_guard_first(self) -> None:
-        """病种为空时，由 P6 的 ``missing`` 分支（326）先返回，二级判定（329）不执行。
-
-        两条分支的文案不同，据此可判定实际走的是哪一条。
-        """
-        result = route(make_case(disease_category=[]))
-        note = next(t.note for t in result.trace if t.order == "P6")
-        assert "关键字段缺失" in note
-        assert "病种无法识别" not in note
-
-
-# ===========================================================================
-# 不可达防御分支 · 函数级与契约演练（证明逻辑本身正确）
-# ===========================================================================
-class TestDefensiveBranchLogic:
-    def test_p6_secondary_judgment_works_at_function_level(self) -> None:
-        """函数级：显式传入空 ``missing`` 时，329 的二级判定确实生效。
-
-        它保证「病种无法识别」不是死文案 —— 一旦上游 ``missing`` 判定口径收紧
-        （例如 disease_category 不再计入关键字段），该分支会立刻接管。
-        """
-        hit, note = step_p6_missing(make_case(disease_category=[]), [])
-        assert hit is True
-        assert "病种无法识别" in note
-
-    def test_p8_denial_works_at_function_level(self) -> None:
-        """函数级：355 的前置否决在 ``missing`` 非空时正确返回，且报出缺失个数。"""
-        ok, note = step_p8_prerequisites(make_case(), ["sex", "rupture_status"])
-        assert ok is False
-        assert "仍缺 2 个关键字段" in note
-
-    def test_p8_denial_path_still_works_when_p6_lets_through(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """契约演练：临时让 P6 放行，验证 P8 否决路径（355）与兜底返回（452）仍然可用。
-
-        ``sex`` 置空使 ``missing`` 非空（而 ``disease_category`` 保留指南病种，
-        以便 P7 命中、真正走到 P8）。演练结果必须仍是「复杂 + 人工复核 + 置信度×0.5」，
-        证明这两行是**防御性冗余**而不是错误代码。
-        """
-        from src.rules import router as router_module
-
-        monkeypatch.setattr(
-            router_module,
-            "step_p6_missing",
-            lambda case, missing: (False, "P6 演练：临时放行"),
+    def test_ruleset_md_documents_every_rule(self) -> None:
+        """代码是第一真源，``RULESET.md`` 是第二真源；两边必须一一对应。"""
+        md = (Path(__file__).resolve().parent.parent / "src" / "rules" / "RULESET.md").read_text(
+            encoding="utf-8"
         )
+        missing = sorted(rid for rid in RULES if f"| {rid} |" not in md)
+        assert not missing, f"RULESET.md 缺：{missing}"
 
-        result = route(make_case(sex=None))
-
-        assert result.missing_critical_fields == ["sex"]
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.confidence == 0.45
-        assert result.manual_review_required
-        p8 = next(t for t in result.trace if t.order == "P8")
-        assert p8.result is False
-        assert "仍缺 1 个关键字段" in p8.note
+    def test_every_rule_is_reachable_in_pipeline(self) -> None:
+        """54 条都必须被某个编排桶调用；漏进桶 = 永远不执行。"""
+        covered = set(G03_P01) | set(G03_P02) | set(G03_P03) | set(G04_BLOCKING) | set(G04_EXTRA)
+        covered |= set(G08_RULES)
+        covered |= {"G03.R15", "G04.R13", "G04.R14", "G08.R09", "G08.R10", "G08.R11"}
+        covered |= {"G09.R01", "G09.R02", "G09.R03", "G09.R04"}
+        missing = sorted(set(RULES) - covered)
+        assert not missing, f"未进任何桶：{missing}"
 
 
 # ===========================================================================
-# 缺省值语义：未提及 ≠ 无（table2@v1.6 修复的 P7 术后内漏缺省值穿透）
+# 二、三值原语（Kleene）
 # ===========================================================================
-class TestMissingValueSemantics:
-    """术后随访的内漏状态：只有「明确无内漏 / 稳定Ⅱ型」可放行指南。
-
-    背景：原实现用 ``endoleak_type is not None`` 作守卫，``None``（未提及）会跌出
-    该分支，被下游「低复杂度指南病种」出口放行为指南 + 免人工复核 + 置信度 0.90 ——
-    等价于把「没查」当成「查过了且无内漏」。本类把「未提及」与「无」的区分钉死，
-    防止后来者再把否定式守卫写回来。
-    """
-
-    @staticmethod
-    def _postop(**overrides: object) -> VascCase:
-        return make_case(
-            disease_category=[DiseaseCategory.POSTOPERATIVE],
-            prior_repair=PriorRepair.EVAR,
-            **overrides,
-        )
+class TestThreeValuedPrimitives:
+    """``None`` 是 UNKNOWN：不是「没命中」，也不是「阴性」。"""
 
     @pytest.mark.parametrize(
-        ("label", "endoleak", "expected"),
+        ("args", "expected"),
         [
-            ("未提及 → 复杂（安全侧）", None, RouteMode.COMPLEX),
-            ("不明 → 复杂", EndoleakType.UNKNOWN, RouteMode.COMPLEX),
-            ("Ⅰa 型高危 → 复杂", EndoleakType.IA, RouteMode.COMPLEX),
-            ("Ⅲa 型高危 → 复杂", EndoleakType.IIIA, RouteMode.COMPLEX),
-            ("Ⅳ 型 → 复杂", EndoleakType.IV, RouteMode.COMPLEX),
-            ("明确无内漏 → 指南", EndoleakType.NONE, RouteMode.GUIDELINE),
-            ("稳定Ⅱ型 → 指南", EndoleakType.II, RouteMode.GUIDELINE),
+            ((True, True), True),
+            ((True, False), False),
+            ((True, None), None),
+            ((False, None), False),  # False 压过 UNKNOWN：已确定不成立
+            ((None, None), None),
         ],
     )
-    def test_endoleak_state_decides_route(
-        self, label: str, endoleak: EndoleakType | None, expected: RouteMode
-    ) -> None:
-        result = route(self._postop(endoleak_type=endoleak))
-        assert result.route_mode is expected, label
+    def test_and(self, args: tuple[bool | None, ...], expected: bool | None) -> None:
+        assert _and(*args) is expected
 
-    def test_unmentioned_is_not_treated_as_absent_endoleak(self) -> None:
-        """核心回归：未提及必须走安全侧，且 note 要如实声明「未提及」。"""
-        result = route(self._postop(endoleak_type=None))
-        assert result.route_mode is RouteMode.COMPLEX
-        assert result.guideline_eligible is False
-        assert result.manual_review_required
-        p7 = next(t for t in result.trace if t.order == "P7")
-        assert p7.result is False
-        assert "未提及" in p7.note
-        assert "非稳定Ⅱ型" in p7.note
+    @pytest.mark.parametrize(
+        ("args", "expected"),
+        [
+            ((True, None), True),  # True 压过 UNKNOWN：已确定成立
+            ((False, False), False),
+            ((False, None), None),
+            ((None, None), None),
+        ],
+    )
+    def test_or(self, args: tuple[bool | None, ...], expected: bool | None) -> None:
+        assert _or(*args) is expected
 
-    def test_unmentioned_keeps_confidence_but_flags_review(self) -> None:
-        """6 项关键字段齐全 ⇒ 置信度不下调（0.90），但人工复核标记必须置真。"""
-        result = route(self._postop(endoleak_type=None))
-        assert result.missing_critical_fields == []
-        assert result.confidence == 0.90
-        assert result.manual_review_required
+    @pytest.mark.parametrize(("value", "expected"), [(True, False), (False, True), (None, None)])
+    def test_not(self, value: bool | None, expected: bool | None) -> None:
+        assert _not(value) is expected
 
-    def test_p7b_fallback_note_covers_postop_entry(self) -> None:
-        """P7b 兜底文案须涵盖「内漏状态不可确认稳定」，而不只说「非指南病种」。"""
-        result = route(self._postop(endoleak_type=None))
-        p7b = next(t for t in result.trace if t.order == "P7b")
-        assert "术后内漏" in p7b.note
-        assert result.reason == p7b.note
+    def test_eq_explicit_listing_wins(self) -> None:
+        """规格把「疑似」当**阳性触发**（G03.R04/R07/G08.R03）——显式列出即命中。"""
+        assert _eq("疑似", "疑似") is True
 
-    def test_explicit_stable_values_are_unaffected(self) -> None:
-        """对照组：显式填「无内漏 / Ⅱ型」的病例结论、置信度、复核标记均不变。"""
-        for et in (EndoleakType.NONE, EndoleakType.II):
-            result = route(self._postop(endoleak_type=et))
-            assert result.route_mode is RouteMode.GUIDELINE, et
-            assert result.confidence == 0.90, et
-            assert result.manual_review_required is False, et
+    def test_eq_uncertain_value_is_unknown(self) -> None:
+        """规则没显式要「疑似」时，它只能是 UNKNOWN，不能支撑任何结论。"""
+        assert _eq("疑似", "确认") is None
+        assert _eq("未评价", "确认") is None
+
+    def test_eq_known_negative_is_false(self) -> None:
+        assert _eq("未见", "明确") is False
+
+    def test_eq_missing_is_unknown(self) -> None:
+        assert _eq(None, "明确") is None
+
+
+class TestUnknownDoesNotShortCircuit:
+    @pytest.mark.parametrize("rule_id", sorted(RULES))
+    def test_empty_case_never_hits(self, rule_id: str) -> None:
+        """空病例：所有规则都不得返回 True —— 未知绝不能当成立。"""
+        verdict = RULES[rule_id].func(_Ctx(VascCase(case_id="EMPTY")))
+        assert verdict is not True, f"{rule_id} 在空病例上命中了 —— 未知被当成了成立"
+
+    def test_empty_case_routes_to_verify(self) -> None:
+        """兜底是资料核实，不是指南（G07 是排他分支）。"""
+        result = route(VascCase(case_id="EMPTY"))
+        assert result.kind is RouteKind.VERIFY
+        assert result.next_node == "资料核实"
+        assert result.confidence_level == "低"
+        assert result.evidence_gaps
+
+    def test_missing_neck_length_blocks_low_complexity(self) -> None:
+        """颈长缺失不得判低复杂（G04.R13）。"""
+        assert verdict_of("G04.R13", n={"neck_len": None}) is True
+
+    def test_unmentioned_is_not_negative(self) -> None:
+        """``pain_present`` 未提及 ≠ 「否」：R15 的放行 gate 必须因此失效。"""
+        assert verdict_of("G03.R15", s={"pain_present": None}) is None
+
+
+# ===========================================================================
+# 三、54 条逐条命中
+# ===========================================================================
+HITS: list[tuple[str, dict[str, object]]] = [
+    # ---- G03 急诊（21）----
+    (
+        "G03.R01",
+        {
+            "q": {"cta_enhance": "适当", "cta_phase": "动脉期"},
+            "c": {"extrav": "明确", "extrav_contig": "明确连续", "source_kind": "正式报告"},
+        },
+    ),
+    (
+        "G03.R02",
+        {
+            "c": {
+                "aorta": ["腹主动脉瘤"],
+                "hematoma": "明确",
+                "hematoma_adj": "明确相邻",
+                "source_kind": "专家确认",
+            }
+        },
+    ),
+    ("G03.R03", {"c": {"rupture_report": "明确破裂"}}),
+    ("G03.R04", {"d": {"dx_context": "疑似"}, "v": {"sbp": 70.0}}),
+    (
+        "G03.R05",
+        {"s": {"pain_current": "当前新发", "pain_site": ["背"], "pain_attrib": "明确相关"}},
+    ),
+    (
+        "G03.R06",
+        {
+            "s": {
+                "pain_current": "本次进展",
+                "pain_site": ["腰"],
+                "pain_onset": "突然",
+                "pain_attrib": "未判断",
+            }
+        },
+    ),
+    ("G03.R07", {"c": {"rupture_report": "疑似破裂"}}),
+    ("G03.R08", {"d": {"surg": ["EVAR"]}, "s": {"gi_bleed": ["黑便"]}}),
+    ("G03.R09", {"s": {"limb": ["痛", "苍白"], "pulse_deficit": "缺失"}}),
+    ("G03.R10", {"v": {"spo2": 91.0, "rr": 22.0, "sbp": 105.0, "hr": 95.0}}),
+    ("G03.R11", {"v": {"spo2": 92.0, "rr": 22.0, "hr": 95.0}}),
+    ("G03.R12", {"s": {"syncope": "肯定"}, "q": {"cta_enhance": "不足"}}),
+    ("G03.R13", {"q": {"idmatch": "不一致"}}),
+    ("G03.R14", {"q": {"current_assess": "未评估"}}),
+    ("G03.R15", {}),
+    ("G03.R16", {"d": {"dx_context": "疑似"}}),
+    (
+        "G03.R17",
+        {"lab": {"hb": 85.0, "hb_prev": 120.0, "hb_comparable": True, "hb_confound": False}},
+    ),
+    (
+        "G03.R18",
+        {
+            "d": {"dx_context": "无相关记录"},
+            "s": {
+                "pain_current": "当前新发",
+                "pain_site": ["背"],
+                "pain_onset": "突然",
+                "pain_severity": 8,
+            },
+        },
+    ),
+    ("G03.R19", {"lab": {"hb": 85.0, "hb_prev": 120.0, "hb_comparable": None}}),
+    ("G03.R20", {"v": {"sbp": 70.0}}),
+    ("G03.R21", {"lab": {"lact": 3.0, "lact_uln": 2.0}, "q": {"unit": "有效"}}),
+    # ---- G04 复杂（18，R14 另行测试）----
+    ("G04.R01", {"n": {"neck_len": 8.0}}),
+    ("G04.R02", {"n": {"neck_len": 2.0}}),
+    ("G04.R03", {"n": {"renal_l": "明确受累"}}),
+    ("G04.R04", {"n": {"renal_l": "明确受累", "sma": "明确受累"}}),
+    (
+        "G04.R05",
+        {"n": {"renal_l": "明确受累", "sma": "明确受累", "ca": "明确受累", "thoracic": "否"}},
+    ),
+    ("G04.R06", {"n": {"thoracic": "是"}}),
+    ("G04.R07", {"n": {"infection_ctx": "医师明确"}}),
+    ("G04.R08", {"n": {"seal_ifu": "不符"}}),
+    ("G04.R09", {"n": {"iliac_bilat": "双侧", "iia_left": "闭塞"}}),
+    ("G04.R10", {"n": {"access_occlusion": "双侧闭塞"}}),
+    ("G04.R11", {"n": {"prev_repair": "EVAR", "endoleak_type": "I"}}),
+    ("G04.R12", {"n": {"egfr": 25.0}}),
+    ("G04.R13", {"n": {"neck_len": None}}),
+    ("G04.R15", {"n": {"genetic_ctx": "确诊"}}),
+    ("G04.R16", {"n": {"inflammatory_ctx": "影像高度提示"}}),
+    ("G04.R17", {"gen": {"aaa_age_onset": 45}}),
+    ("G04.R18", {"n": {"inflammatory_ctx": "可疑", "infection_ctx": "高度怀疑"}}),
+    # ---- G08 分类（11，R09 另行测试）----
+    ("G08.R01", {}),
+    ("G08.R02", {"cl": {"symptom_aaa": "医师确认相关"}}),
+    ("G08.R03", {"cl": {"aaa_rupture": "明确"}}),
+    ("G08.R04", {"cl": {"infection": "原生感染明确"}}),
+    ("G08.R05", {"cl": {"pau": "明确"}}),
+    ("G08.R06", {"cl": {"prev_evor": "EVAR", "post_reason": "内漏"}}),
+    ("G08.R07", {"cl": {"iliac_site": ["左侧", "CIA"]}}),
+    (
+        "G08.R08",
+        {"n": {"thoracic": "否", "sma": "明确受累", "ca": "明确受累", "renal_l": "明确受累"}},
+    ),
+    ("G08.R10", {"n": {"inflammatory_ctx": "临床确认"}}),
+    ("G08.R11", {"n": {"genetic_ctx": "疑似遗传背景"}}),
+    # ---- G09 收尾（4，R03/R04 另行测试）----
+    ("G09.R01", {"k": {"new_urgent": "是"}}),
+    ("G09.R02", {"q": {"idmatch": "不一致"}}),
+]
+
+STATEFUL_RULES = frozenset({"G04.R14", "G08.R09", "G09.R03", "G09.R04"})
+
+
+class TestEveryRuleHits:
+    @pytest.mark.parametrize(("rule_id", "overrides"), HITS, ids=[h[0] for h in HITS])
+    def test_rule_hits(self, rule_id: str, overrides: dict[str, object]) -> None:
+        assert verdict_of(rule_id, **overrides) is True, f"{rule_id} 未按预期命中"
+
+    def test_hit_table_covers_every_independently_testable_rule(self) -> None:
+        """``HITS`` 漏一条 = 那条规则没有命中证据。"""
+        assert {rid for rid, _ in HITS} == set(RULES) - STATEFUL_RULES
+
+    def test_hit_table_is_not_self_contradictory(self) -> None:
+        """不许重复 rule_id —— 重复会掩盖「改了一条忘改另一条」。"""
+        ids = [rid for rid, _ in HITS]
+        assert len(ids) == len(set(ids))
+
+
+# ===========================================================================
+# 四、依赖运行时状态的 4 条
+# ===========================================================================
+class TestStatefulRules:
+    def _ctx(self, **overrides: object) -> _Ctx:
+        return _Ctx(make_case(**overrides))  # type: ignore[arg-type]
+
+    def test_r14_needs_blocking_results(self) -> None:
+        """R14 的判据是「上面 12 条都没命中」；没跑过就无从判断 → UNKNOWN。"""
+        assert RULES["G04.R14"].func(self._ctx()) is None
+
+    def test_r14_releases_when_all_blocking_are_false(self) -> None:
+        ctx = self._ctx()
+        ctx.g04_blocking = [False] * len(G04_BLOCKING)
+        assert RULES["G04.R14"].func(ctx) is True
+
+    def test_r14_does_not_release_when_one_is_unknown(self) -> None:
+        """有一条判不了（UNKNOWN）就不得放行 —— 「判不了」不能当成「没命中」。"""
+        ctx = self._ctx()
+        ctx.g04_blocking = [False] * (len(G04_BLOCKING) - 1) + [None]
+        assert RULES["G04.R14"].func(ctx) is not True
+
+    def test_r14_does_not_release_without_cta(self) -> None:
+        ctx = self._ctx(n={"cta_status": "缺失"})
+        ctx.g04_blocking = [False] * len(G04_BLOCKING)
+        assert RULES["G04.R14"].func(ctx) is False
+
+    def test_r09_detects_conflict_from_own_labels(self) -> None:
+        ctx = self._ctx()
+        ctx.labels = ["D1", "D3"]
+        assert RULES["G08.R09"].func(ctx) is True
+
+    def test_r09_detects_conflict_from_prefilled_labels(self) -> None:
+        """抽取层预填的 ``cl.diag_multi`` 同样可能自相矛盾，不能只信自己算的。"""
+        assert verdict_of("G08.R09", cl={"diag_multi": ["D1", "D2"]}) is True
+
+    def test_r09_single_label_is_not_conflict(self) -> None:
+        ctx = self._ctx()
+        ctx.labels = ["D1"]
+        assert RULES["G08.R09"].func(ctx) is False
+
+    def test_r03_reads_diag_conflict_state(self) -> None:
+        ctx = self._ctx()
+        ctx.diag_conflict = True
+        assert RULES["G09.R03"].func(ctx) is True
+        ctx.diag_conflict = False
+        assert RULES["G09.R03"].func(ctx) is False
+        ctx.diag_conflict = None
+        assert RULES["G09.R03"].func(ctx) is None
+
+    def test_r04_requires_at_least_one_label(self) -> None:
+        """冲突已排除但一个标签都没有 → 确定「不能分类」，是 False 不是 UNKNOWN。"""
+        ctx = self._ctx()
+        ctx.diag_conflict = False
+        assert RULES["G09.R04"].func(ctx) is False
+        ctx.labels = ["D1"]
+        assert RULES["G09.R04"].func(ctx) is True
+
+    def test_r04_is_unknown_while_conflict_unresolved(self) -> None:
+        ctx = self._ctx()
+        ctx.labels = ["D1"]
+        ctx.diag_conflict = None
+        assert RULES["G09.R04"].func(ctx) is None
+
+    def test_label_mapping_is_total(self) -> None:
+        """产出标签的 G08 规则必须在 ``LABEL_BY_RULE`` 里有映射，否则标签被静默丢掉。"""
+        producers = {
+            "G08.R01",
+            "G08.R02",
+            "G08.R03",
+            "G08.R04",
+            "G08.R05",
+            "G08.R06",
+            "G08.R07",
+            "G08.R08",
+            "G08.R10",
+        }
+        assert producers <= set(LABEL_BY_RULE)
+
+
+# ===========================================================================
+# 五、编排：出口优先级与兜底
+# ===========================================================================
+class TestExitOrchestration:
+    def test_clean_case_goes_guideline(self) -> None:
+        result = route(make_case())
+        assert result.kind is RouteKind.MODE
+        assert result.mode is RouteMode.GUIDELINE
+        assert result.next_node == "G07"
+
+    def test_hypotension_goes_emergency(self) -> None:
+        result = route(make_case(v={"sbp": 70.0}))
+        assert result.mode is RouteMode.EMERGENCY
+        assert result.next_node == "G05"
+
+    def test_short_neck_goes_complex(self) -> None:
+        result = route(make_case(n={"neck_len": 8.0}))
+        assert result.mode is RouteMode.COMPLEX
+        assert result.next_node == "G06"
+
+    def test_p01_beats_p02(self) -> None:
+        """同一病例同时满足急诊与人工复核条件时，急诊优先。"""
+        result = route(make_case(v={"sbp": 70.0}, lab={"hb": 85.0, "hb_prev": 120.0}))
+        assert result.next_node == "G05"
+
+    def test_review_beats_verify(self) -> None:
+        """P02（人工复核）压过 P03（资料核实）。"""
+        result = route(
+            make_case(lab={"hb": 85.0, "hb_prev": 120.0}, q={"current_assess": "未评估"})
+        )
+        assert result.next_node == "人工复核"
+
+    def test_manual_urgency_overrides_everything(self) -> None:
+        result = route(make_case(urgency_flag=True))
+        assert result.mode is RouteMode.EMERGENCY
+        assert result.rule_id == "MANUAL.URGENCY"
+
+    def test_manual_urgency_reason_is_explicit(self) -> None:
+        assert "人工置位" in route(make_case(urgency_flag=True)).reason
+
+    def test_outcome_priority_matches_documented_order(self) -> None:
+        assert OUTCOME_PRIORITY[RouteKind.REVIEW] > OUTCOME_PRIORITY[RouteKind.MODE]
+        assert OUTCOME_PRIORITY[RouteKind.MODE] > OUTCOME_PRIORITY[RouteKind.VERIFY]
+
+    def test_guideline_is_exclusive_not_fallback(self) -> None:
+        """资料不足时不得落到 G07 —— 真正的兜底是资料核实。"""
+        for case in (
+            VascCase(case_id="EMPTY"),
+            make_case(n={"neck_len": None}),
+            make_case(n={"cta_status": "缺失"}),
+        ):
+            assert route(case).next_node != "G07"
+
+    def test_deterministic(self) -> None:
+        case = make_case(n={"neck_len": 8.0})
+        first, second = route(case), route(case)
+        assert (first.rule_id, first.next_node, first.class_output) == (
+            second.rule_id,
+            second.next_node,
+            second.class_output,
+        )
+
+
+# ===========================================================================
+# 六、B6：量化值缺失时的回落
+# ===========================================================================
+class TestMeasurementFallback:
+    def test_fallback_registers_data_source_gap(self) -> None:
+        """缺量化值时读报告值，但必须留痕，不能与量化值混为一谈。"""
+        case = make_case(cl={"aaa_diam": None}, c={"maxd": 42.0})
+        gaps = route(case).evidence_gaps
+        assert any("回落" in g or "c.maxd" in g for g in gaps), gaps
+
+    def test_no_fallback_when_measurement_present(self) -> None:
+        from src.models.preop.measurement import VascMeasurement
+
+        case = make_case(cl={"aaa_diam": None}, c={"maxd": 42.0})
+        measurement = VascMeasurement(case_id="M", max_diameter_mm=45.0, method="vmtk")
+        gaps = route(case, measurement).evidence_gaps
+        assert not any("回落" in g for g in gaps), gaps
+
+
+# ===========================================================================
+# 七、标签与置信度
+# ===========================================================================
+class TestLabelsAndConfidence:
+    def test_clean_case_gets_d1(self) -> None:
+        assert route(make_case()).class_output == ["D1"]
+
+    def test_ruptured_gets_d3(self) -> None:
+        assert "D3" in route(make_case(cl={"aaa_rupture": "明确"})).class_output
+
+    def test_conflicting_labels_go_to_review(self) -> None:
+        result = route(make_case(cl={"diag_multi": ["D1", "D3"]}))
+        assert result.kind is RouteKind.REVIEW
+        assert result.rule_id == "G09.R03"
+
+    def test_inflammatory_yields_d5_subtype(self) -> None:
+        assert "D5" in route(make_case(n={"inflammatory_ctx": "影像高度提示"})).class_output
+
+    def test_genetic_does_not_add_d8(self) -> None:
+        """遗传只作病因修饰标签，**不新增 D8**（D1–D7 编号必须保持）。"""
+        allowed = {"D1", "D2", "D3", "D4", "D5", "D6", "D7", "Ⅳ型TAAA扩展"}
+        result = route(make_case(n={"genetic_ctx": "确诊"}))
+        assert set(result.class_output) <= allowed
+
+    def test_confidence_is_high_when_no_gap(self) -> None:
+        assert route(make_case()).confidence_level == "高"
+
+    def test_confidence_is_low_when_unknown_decisive(self) -> None:
+        assert route(VascCase(case_id="EMPTY")).confidence_level == "低"
+
+    def test_ruleset_version_is_recorded(self) -> None:
+        from src.rules.version import RULESET_VERSION
+
+        assert route(make_case()).ruleset_version == RULESET_VERSION
+
+
+# ===========================================================================
+# 八、三值原语的边界（这些分支不写测试就等于没守）
+# ===========================================================================
+class TestPrimitiveEdgeCases:
+    def test_has_none_list_is_unknown(self) -> None:
+        from src.rules.router import _has
+
+        assert _has(None, "痛") is None
+
+    def test_has_uncertain_token_is_unknown(self) -> None:
+        from src.rules.router import _has
+
+        assert _has(["未知"], "痛") is None
+
+    def test_has_known_negative_is_false(self) -> None:
+        from src.rules.router import _has
+
+        assert _has(["无"], "痛") is False
+
+    def test_absent_requires_an_explicit_record(self) -> None:
+        """空列表 → False：**没有记录 ≠ 明确阴性**。"""
+        from src.rules.router import _absent
+
+        assert _absent([], ("呕血",)) is False
+        assert _absent(None, ("呕血",)) is False
+
+    def test_absent_true_only_when_explicitly_clean(self) -> None:
+        from src.rules.router import _absent
+
+        assert _absent(["无"], ("呕血",)) is True
+
+    def test_absent_uncertain_is_unknown(self) -> None:
+        from src.rules.router import _absent
+
+        assert _absent(["未知"], ("呕血",)) is None
+
+    def test_absent_dangerous_present_is_false(self) -> None:
+        from src.rules.router import _absent
+
+        assert _absent(["呕血"], ("呕血",)) is False
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_bool_is_not_a_number(self, value: bool) -> None:
+        """``True`` 会被当成 1 —— 布尔绝不能混进数值判据。"""
+        from src.rules.router import _num
+
+        assert _num(value) is None
+
+    def test_branch_occlusion_three_states(self) -> None:
+        from src.rules.router import _branch_occluded
+
+        assert _branch_occluded(_Ctx(make_case(c={"branch": {}}))) is None
+        occluded = _Ctx(make_case(c={"branch": {"SMA": "闭塞", "CA": "通畅"}}))
+        assert _branch_occluded(occluded) is True
+        unclear = _Ctx(make_case(c={"branch": {"SMA": "未知"}}))
+        assert _branch_occluded(unclear) is None
+        clear = _Ctx(make_case(c={"branch": {"SMA": "通畅"}}))
+        assert _branch_occluded(clear) is False
+
+
+class TestDerivedStates:
+    """物化派生量（不进模型、不进哈希，只参与本次判定）。"""
+
+    def test_news2_scale2_is_unknown(self) -> None:
+        """用了未实现的新量表 → 宁可没有分数，也不能拿错量表算。"""
+        assert _Ctx(make_case(v={"spo2_scale": "Scale2经确认"})).news2 is None
+
+    def test_genetic_derived_from_syndrome(self) -> None:
+        ctx = _Ctx(make_case(n={"genetic_ctx": None}, gen={"syndrome_type": "Marfan"}))
+        assert ctx.genetic_ctx == "确诊"
+
+    def test_genetic_derived_from_variant(self) -> None:
+        ctx = _Ctx(make_case(n={"genetic_ctx": None}, gen={"variant_class": "可能致病"}))
+        assert ctx.genetic_ctx == "确诊"
+
+    def test_genetic_suspected_from_family_history(self) -> None:
+        ctx = _Ctx(make_case(n={"genetic_ctx": None}, gen={"family_aneurysm": "阳性"}))
+        assert ctx.genetic_ctx == "疑似遗传背景"
+
+    def test_genetic_clear_when_explicitly_negative(self) -> None:
+        ctx = _Ctx(make_case(n={"genetic_ctx": None}, gen={"family_aneurysm": "明确无相关史"}))
+        assert ctx.genetic_ctx == "无已知阳性线索"
+
+    def test_genetic_unknown_when_nothing_recorded(self) -> None:
+        # 注意：``make_case(gen={})`` 是**域级浅更新**，不会清空基线，必须逐键置 None
+        blank = {
+            "syndrome_type": None,
+            "variant_class": None,
+            "family_aneurysm": None,
+            "syndromic_features": None,
+            "aaa_age_onset": None,
+        }
+        ctx = _Ctx(make_case(n={"genetic_ctx": None}, gen=blank))
+        assert ctx.genetic_ctx is None
+
+    def test_inflammatory_high_from_mantle_sign(self) -> None:
+        ctx = _Ctx(make_case(n={"inflammatory_ctx": None}, inf={"mantle_sign": "明确存在"}))
+        assert ctx.inflammatory_ctx == "影像高度提示"
+
+    def test_inflammatory_suspected_from_wall_fibrosis(self) -> None:
+        ctx = _Ctx(make_case(n={"inflammatory_ctx": None}, inf={"wall_fibrosis": "可疑"}))
+        assert ctx.inflammatory_ctx == "可疑"
+
+    def test_inflammatory_clear_when_both_negative(self) -> None:
+        ctx = _Ctx(
+            make_case(
+                n={"inflammatory_ctx": None}, inf={"mantle_sign": "未见", "wall_fibrosis": "未见"}
+            )
+        )
+        assert ctx.inflammatory_ctx == "无当前支持证据"
+
+    def test_crp_alone_does_not_trigger_inflammation(self) -> None:
+        """G04.R16 明文：单纯 CRP/ESR 升高不触发。
+
+        基线里 ``mantle_sign`` / ``wall_fibrosis`` 是「未见」，必须先置 None ——
+        ``make_case(inf={...})`` 是**域级浅更新**，不写进 dict 的键保持基线值。
+        """
+        ctx = _Ctx(
+            make_case(
+                n={"inflammatory_ctx": None},
+                inf={
+                    "mantle_sign": None,
+                    "wall_fibrosis": None,
+                    "inflamm_markers": "CRP 88 mg/L（参考上限 5）",
+                },
+            )
+        )
+        assert ctx.inflammatory_ctx is None
+
+    def test_materialized_state_wins_over_derivation(self) -> None:
+        """抽取层给了主状态就以它为准，不再拿明细覆写。"""
+        ctx = _Ctx(make_case(n={"genetic_ctx": "未评价"}, gen={"syndrome_type": "Marfan"}))
+        assert ctx.genetic_ctx == "未评价"
+
+
+# ===========================================================================
+# 九、G09 编排（回流 / 身份冲突）
+# ===========================================================================
+class TestG09Orchestration:
+    def test_new_urgent_reflows_to_emergency(self) -> None:
+        """分类期出现新危险证据 → 立即回流 G05，不因分类进行中而延迟。"""
+        result = route(make_case(k={"new_urgent": "是"}))
+        assert (result.next_node, result.rule_id) == ("G05", "G09.R01")
+
+    def test_identity_conflict_is_caught_before_classification(self) -> None:
+        """``G09.R02`` 端到端**不可达**：``G03.R13`` 在判定前就拦下了身份冲突。
+
+        这不是缺陷，是分层拦截的必然结果——记录下来，免得以后有人以为漏测。
+        规则本身另有单元测试（``TestEveryRuleHits`` / ``TestStatefulRules``）。
+        """
+        result = route(make_case(q={"idmatch": "不一致"}))
+        assert result.rule_id == "G03.R13"
+        assert result.next_node == "资料核实"
+
+    def test_identity_conflict_by_field_flag_also_caught_early(self) -> None:
+        result = route(make_case(q={"conflict": ["身份"]}))
+        assert result.rule_id == "G03.R13"
+
+
+# ===========================================================================
+# 十、判定产物（不进 VascCase，随 RouteResult 下去）
+# ===========================================================================
+#: Ⅳ 型 TAAA 的四个关键段：胸段不扩张 + SMA + 腹腔干 + 一侧肾动脉 明确受累。
+TAAA_IV_PATTERN = {
+    "thoracic": "否",
+    "sma": "明确受累",
+    "ca": "明确受累",
+    "renal_l": "明确受累",
+}
+
+
+class TestJudgmentProducts:
+    """``CL.TAAA_IV`` —— Ⅳ 型 TAAA 解剖扩展。
+
+    它是**判定产物**（映射表 ``01!163``）：不进 ``VascCase``、不进 160 字段清单，
+    由 ``G08.R08`` 算出后挂在 ``RouteResult.cl_taaa_iv``。下游（指南引擎）按
+    「条目子集」需要它，从 ``route_result`` 取，不从 ``case`` 取——否则就等于
+    承认它是一份病例事实，而它是规则算出来的。
+    """
+
+    def test_taaa_grade_maps_three_states(self) -> None:
+        """三值 → 四值：成立=符合，不成立=不符合，未判定=不可评价。"""
+        from src.rules.router import _taaa_grade
+
+        assert _taaa_grade(True) == "符合"
+        assert _taaa_grade(False) == "不符合"
+        assert _taaa_grade(None) == "不可评价"
+
+    def test_iv_pattern_is_confirmed(self) -> None:
+        result = route(make_case(n=TAAA_IV_PATTERN))
+        assert result.cl_taaa_iv == "符合"
+        assert "Ⅳ型TAAA扩展" in result.class_output
+
+    def test_clean_case_is_negative_not_unknown(self) -> None:
+        """四个关键段都「未受累」→ 明确排除，必须与「不可评价」分开。"""
+        assert route(make_case()).cl_taaa_iv == "不符合"
+
+    def test_thoracic_involvement_is_negative(self) -> None:
+        """胸段受累就不是 Ⅳ 型（Ⅳ 型要求膈下、胸段不扩张）。"""
+        result = route(make_case(n={**TAAA_IV_PATTERN, "thoracic": "是"}))
+        assert result.cl_taaa_iv == "不符合"
+
+    def test_emergency_exit_carries_no_judgment_product(self) -> None:
+        """急诊出口不跑 G08 → 值为 None（不是「不符合」，是**根本没判**）。"""
+        result = route(make_case(v={"sbp": 70.0}))
+        assert result.next_node == "G05"
+        assert result.cl_taaa_iv is None
+
+    def test_missing_field_goes_to_verify_not_unknown_grade(self) -> None:
+        """缺关键字段 → 转资料核实，而不是给出「不可评价」的分型。
+
+        原因：``G08.R08`` 与 ``G04.R03`` 读同一批字段（thoracic/sma/ca/renal）。
+        任一为 UNKNOWN，``G04`` 的阻断型规则就是 UNKNOWN；``G04.R14`` 用
+        ``all(v is False)`` 放行 → 不放行 → 兜底「资料核实」，根本到不了 G08。
+
+        推论：**「不可评价」端到端不可达**，只能由 ``_taaa_grade`` 的分支覆盖。
+        这不是缺陷，正是「资料不足不下结论」红线的表现——记在这里，免得以后
+        有人以为漏测。
+        """
+        result = route(make_case(n={**TAAA_IV_PATTERN, "sma": None}))
+        assert result.mode is None
+        assert result.next_node == "资料核实"
+        assert result.cl_taaa_iv is None

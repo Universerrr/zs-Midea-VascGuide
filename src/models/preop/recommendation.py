@@ -5,16 +5,40 @@
     由决策树仲裁产出治疗方案 + 证据链。
 
 审计要求（核心）：
-    1. 必须记录**完整决策路径**（P1~P8 逐条求值结果，含被否决项）；
-    2. 必须记录**规则版本号**（复合串：表1 版本 + 表2 版本）；
+    1. 必须记录**完整决策路径**（逐条规则求值结果，含被否决项）；
+    2. 必须记录**规则版本号**（``RULESET_VERSION``，如 ``v312@v3.1.2``）；
     3. 必须记录**输入快照哈希**，保证可复现。
 """
 
 from __future__ import annotations
 
+from enum import StrEnum
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..enums import RouteMode
+
+class RouteMode(StrEnum):
+    """最终路由模式。优先级：急诊 > 复杂 > 指南。
+
+    与 :class:`src.rules.router.RouteKind` 是**正交的两轴**，不可合并：
+
+    ==================  ============================================
+    ``RouteKind``       结论属哪一类（进入模式 / 人工复核 / 资料核实）
+    ``RouteMode``       进入模式时走哪条路径（本枚举，仅 kind=MODE 时非空）
+    ==================  ============================================
+
+    放在本模块而非共享枚举文件：它是 ``FinalRecommendation.route_mode`` 的取值域，
+    而 :class:`FinalRecommendation` 是它最上游的消费者。执行层与工具层从本模块
+    取用（``rules → models`` 单向依赖），**不能**反向定义在 ``router.py`` 里 ——
+    那会让模型层依赖判定层并形成循环导入。
+
+    ⚠️ 成员值是审计哈希的一部分（``RouteResult`` 在 ``HASHED_KEYS`` 里），只增不改。
+    """
+
+    EMERGENCY = "急诊模式"
+    COMPLEX = "复杂模式"
+    GUIDELINE = "指南模式"
 
 
 class EvidenceItem(BaseModel):
@@ -32,11 +56,17 @@ class DecisionStep(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    order: str = Field(..., description="判定顺序（P0a~P8）。")
-    condition: str = Field(..., description="判定条件描述。")
-    result: bool = Field(..., description="该步求值结果。")
-    rule_ref: str | None = Field(default=None, description="依据覆盖规则编号。")
-    note: str | None = Field(default=None, description="补充说明。")
+    order: int = Field(..., ge=1, description="求值顺序（从 1 起，按实际执行次序）。")
+    condition: str = Field(..., description="判定条件描述（取规则名）。")
+    result: bool | None = Field(
+        ...,
+        description=(
+            "该步求值结果。**三值**：True 成立 / False 不成立 / None 未判定（UNKNOWN）。"
+            "None 不等于 False —— 它表示资料不足，不能当作阴性。"
+        ),
+    )
+    rule_ref: str | None = Field(default=None, description="依据规则编号（如 G03.R04）。")
+    note: str | None = Field(default=None, description="规则来源（V3.1(2) 单元格，如 G03!12）。")
 
 
 class ToolFinding(BaseModel):
@@ -72,12 +102,24 @@ class FinalRecommendation(BaseModel):
     case_id: str = Field(..., description="关联病例标识。")
 
     # ---- 决策结论 ----
-    route_mode: RouteMode = Field(..., description="最终路由模式。")
+    route_mode: RouteMode | None = Field(
+        default=None,
+        description=(
+            "最终路由模式。**仅当结论是「进入模式」时非空**；"
+            "转人工复核或资料核实时为 None（此时没有可执行的工具计划）。"
+        ),
+    )
     primary_recommendation: str = Field(
         ..., description="主建议（如「进入急诊应急预案」/「择期修复评估」）。"
     )
     treatment_options: list[str] = Field(default_factory=list, description="可选治疗方案清单。")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="结论置信度。")
+    confidence_level: Literal["高", "中", "低"] = Field(
+        ...,
+        description=(
+            "证据充分性分级（B4/B5 裁定：不输出无依据的点估计）。"
+            "判据可枚举：低＝有决定性未判定项；中＝有缺口但不影响结论；高＝无缺口。"
+        ),
+    )
     manual_review_required: bool = Field(..., description="是否需人工复核。")
 
     # ---- 证据与审计 ----
@@ -98,7 +140,7 @@ class FinalRecommendation(BaseModel):
 
     ruleset_version: str = Field(
         ...,
-        description="规则版本号（复合串，如 'table1@v1.0+table2@v1.3'）。审计必需。",
+        description="规则版本号（如 'v312@v3.1.2'）。审计必需。",
     )
     input_snapshot_hash: str | None = Field(default=None, description="输入快照哈希（用于复现）。")
     translated_text: str | None = Field(
@@ -107,4 +149,4 @@ class FinalRecommendation(BaseModel):
     )
 
 
-__all__ = ["DecisionStep", "EvidenceItem", "FinalRecommendation", "ToolFinding"]
+__all__ = ["DecisionStep", "EvidenceItem", "FinalRecommendation", "RouteMode", "ToolFinding"]

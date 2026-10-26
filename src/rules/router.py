@@ -1,626 +1,1592 @@
-"""路由判定流水线（P0a~P8）—— 确定性代码，禁止 LLM。
+"""术前路由判定流水线 —— V3.1(2) 的 **54 条判定规则**。
 
-依据：`.workbuddy/spec/VascCase字段设计表.xlsx`
-      · Sheet `06_路由决策流水线`（P0a~P8 执行顺序 + 依据规则）
-      · Sheet `03_P1-P8判定映射`（每步所需字段）
-      · 表2 覆盖规则 O01~O29（阈值口径）
+对照表见 ``src/rules/RULESET.md``（rule_id ↔ 函数 ↔ 源行）。本模块是规格的**第二真源**：
+``RULES`` 字典里的 ``source`` 指向 V3.1(2) 的具体单元格，改规则必须同步改表。
 
-执行语义（务必遵守）：
-    自上而下求值，**命中即短路返回**；上一步的判定结果影响后续步是否仍需判定。
-    P0a/P0b 是「前置预处理」，不产生路由，只做语义与多标签治理。
-    P1 急诊 → P2 特殊病变 → P3 复杂解剖 → P4 严重合并症 → P5 证据冲突 →
-    P6 字段缺失 → P7/P8 指南。优先级 急诊 > 复杂 > 指南。
+三条语义（不可妥协）
+--------------------
+1. **三值求值**：``True`` / ``False`` / ``None``(=UNKNOWN)。Kleene 合取：任一 ``False`` → ``False``；
+   否则任一 ``None`` → ``None``；全 ``True`` → ``True``。**UNKNOWN 不短路、不当 False**。
+2. **不确定值**（可疑/疑似/未评价/不可评价/未知…）先折成 ``UNKNOWN``，永不参与「成立/不成立」。
+3. **未提及 ≠ 阴性**：缺字段只能是 ``UNKNOWN``，不得当 ``False`` 放行。
 
-note 文本契约（审计证据粒度，供渲染/审计层解析；改动须同步本契约）：
-    **未命中**步骤的 ``note`` 形如 ``<结论句>（<检查项>；<检查项>；…）``，
-    全角括号包裹、全角分号分隔。检查项分三类：
-      · 数值判据：``<中文名> <值><单位> <比较符> <阈值><单位>``
-        例：``瘤颈长度 25.0mm ≥ 15.0mm``
-      · 布尔/三态：``<中文名> <取值>``；显式置位标志记 ``未置位``
-      · 枚举/列表：``<中文名> <中文取值>``，多值以 ``、`` 连接，缺失记 ``未提及``
-      · 字段缺失时，数值判据**只记 ``未提及``、不附比较符**——写成
-        ``未提及 ≥ 15mm`` 是伪陈述（无值可比），会误导复核者。
-    检查项内部如需补充说明，用全角逗号 ``，``（与项间分隔符 ``；`` 区分）。
-    **一个检查项 = 一个字段**：禁止把多个字段压成一句聚合结论（``均无`` / ``均未提及``
-    / ``全部正常`` 之类）。聚合句会把「未提及」与「明确为否」抹平成同一个「无」，
-    正向复核者隐瞒了「这条依据到底查了没有」，与下面的缺失值语义契约直接冲突；
-    字段有几个就写几项，逐项列出取值。
-    目的：使「该步为何**未**命中」可由第三方独立复核（对照值与阈值自行验算），
-    而非只能采信结论句。命中步骤的 note 保持原有「编号 + 值 + 阈值」写法。
+出口（五值，与 ``RouteKind`` 对应）
+----------------------------------
+``G05`` 急诊 / ``G06`` 复杂 / ``G07`` 指南 → ``MODE``；
+``人工复核`` → ``REVIEW``；``资料核实`` → ``VERIFY``。
+优先级：**G03 回流 > G06 > VERIFY**；``G07`` 是排他分支，**兜底是 VERIFY**。
 
-缺失值语义契约（**未提及 ≠ 无**，判定口径；改动须同步本契约）：
-    ``None`` 代表「**未提及**」（没查 / 没写 / 抽取失败），与「**明确为否**」是
-    两回事，不得合并处理：
-      · 明确为否（``EndoleakType.NONE``「无内漏」、``PriorRepair.NONE``「无既往修复」
-        等）是**已核实的事实**，可支撑**放行**判定；
-      · 未提及是**数据缺口**，不得支撑任何「安全侧」结论，一律按**不确定**处理，
-        走否决 / 兜底路径。
-    实现纪律：**禁止用 ``if field is not None:`` 作放行守卫**。该写法会让 ``None``
-    跌出分支、落到下游的放行出口，等价于把「没查」当成「查过了且正常」。
-    正确写法是**白名单正列举**：只有明确取值才放行，其余（含 ``None``）落拒绝分支。
-     反面教材（已修，table2@v1.6）：P7 术后内漏分支原用 ``and endoleak_type is not None``
-    守卫，导致「内漏类型未提及」的随访病例被下游出口放行为指南模式 + 免人工复核。
-    反面教材（已修，table2@v1.7）：P1 未命中 note 曾把这 5 个三态字段压成一句
-    ``…均无``；字段实际为 ``None``（未提及）时，该句把「未采集」陈述成了「已排除」。
-
-返回值：
-    ``RouteResult`` —— 结构化路由结论 + 逐步判定轨迹（供审计落盘）。
-本模块不得 import 任何 LLM 客户端（治理红线）。
+范围
+----
+只实现 G03(21) / G04(18) / G08(11) / G09(4) = **54 条**。
+G00–G02 的 9 条属「读取资料 / 证据质量 / 事实抽取」，归 LLM 抽取层，不进本模块。
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from enum import StrEnum
+from typing import Literal
 
-from ..models.enums import (
-    AnatomyLevel,
-    CKDStage,
-    DiseaseCategory,
-    EndoleakType,
-    HeartFailureNYHA,
-    MalignancyStatus,
-    PriorRepair,
-    RouteMode,
-    RuptureStatus,
-    SymptomAAA,
-)
+from ..models.preop.case import UNCERTAIN_TOKENS, VascCase
+from ..models.preop.measurement import VascMeasurement
+from ..models.preop.recommendation import RouteMode
 from .version import RULESET_VERSION
 
-if TYPE_CHECKING:
-    from ..models.preop.case import VascCase
-
-
 # ===========================================================================
-# 工程阈值（与表2 覆盖规则一一对应；改动须 bump 表2 版本号）
+# 出口与结果
 # ===========================================================================
-NECK_LENGTH_THRESHOLD_MM = 15.0  # O15：瘤颈长度 < 15mm → 复杂解剖
-NECK_ANGLE_THRESHOLD_DEG = 45.0  # O16：瘤颈成角 > 45° → 复杂解剖
-ACCESS_DIAMETER_THRESHOLD_MM = 7.0  # O17：入路直径 < 7mm → 复杂解剖
-NECK_THROMBUS_CALC_THRESHOLD_PCT = 50  # O18：瘤颈血栓/钙化 > 50% → 复杂解剖
+Verdict = bool | None
+"""``None`` 表示 UNKNOWN —— 不是「没命中」，也不是「阴性」。"""
 
-# 特殊主动脉病种（P2 / O21）
-SPECIAL_SUBTYPE_KEYWORDS: tuple[str, ...] = (
-    "感染",
-    "炎症",
-    "囊状",
-    "pau",
-    "imh",
-    "iaad",
-    "假性动脉瘤",
-    "遗传",
-    "结缔组织",
-    "瘘",
-)
+NextNode = Literal["G05", "G06", "G07", "人工复核", "资料核实"]
+EmergencyLevel = Literal["明确危险", "高度疑似", "不能排除", "未触发", "冲突"]
+ConfidenceLevel = Literal["高", "中", "低"]
+TaaaGrade = Literal["符合", "疑似", "不符合", "不可评价"]
+"""``CL.TAAA_IV``（Ⅳ型 TAAA 解剖扩展）的四值 —— V3.1(2) 允许值原样。
 
-# 复杂解剖分型（P3 / O22）—— 枚举集判定，等价于原关键词匹配且无子串误判风险
-COMPLEX_ANATOMY_LEVELS = frozenset(
-    {
-        AnatomyLevel.SHORT_NECK_INFRARENAL,
-        AnatomyLevel.JUXTARENAL,
-        AnatomyLevel.PARARENAL,
-        AnatomyLevel.PARAVISCERAL,
-        AnatomyLevel.TYPE_IV_TAAA,
-    }
-)
-
-# 「肯定」取值：三态/四态枚举中唯一表示「有」的取值
-AFFIRMATIVE_VALUE = "有"
-
-# 复杂手术史 / 再次干预（P3 / O23）—— 与「无既往修复」相对
-COMPLEX_PRIOR_REPAIR = frozenset({PriorRepair.FEVAR, PriorRepair.BEVAR, PriorRepair.OTHER})
-
-# 术后并发症关键词（P3，需结合 prior_repair）
-POSTOP_COMPLICATION_KEYWORDS: tuple[str, ...] = (
-    "内漏",
-    "瘤囊增大",
-    "支架移位",
-    "闭塞",
-    "吻合口",
-    "感染",
-    "瘘",
-    "再破裂",
-)
-
-# 低复杂度指南病种（P7 / O26）
-GUIDELINE_CATEGORIES = frozenset(
-    {
-        DiseaseCategory.ASYMPTOMATIC,
-        DiseaseCategory.ILIAC_ANEURYSM,
-        DiseaseCategory.POSTOPERATIVE,
-    }
-)
-
-# 置信度
-BASE_CONFIDENCE = 0.90  # 正常基准
-MISSING_PENALTY = 0.5  # 关键字段缺失时 ×0.5（O25）
+它是**判定产物**（映射表 ``01!163``），不进 ``VascCase``、不进 160 字段清单；
+由 :func:`g08_r08_taaa_iv_label` 算出后随 :class:`RouteResult` 带给下游工具。
+"""
 
 
-# ===========================================================================
-# 结构化输出
-# ===========================================================================
-@dataclass
-class StepTrace:
-    """单个判定步骤的轨迹记录（审计：含被否决项）。"""
+class RouteKind(StrEnum):
+    """路由结论的大类。与 ``NextNode`` 五值一一对应。"""
 
-    order: str  # P0a / P0b / P1 ~ P8
-    condition: str  # 判定条件描述
-    result: bool  # 该步求值结果
-    rule_ref: str  # 依据覆盖规则编号
-    note: str = ""  # 补充说明
+    MODE = "进入模式"
+    REVIEW = "人工复核"
+    VERIFY = "资料核实"
+
+
+FALLBACK_VERIFY = "FALLBACK.VERIFY"
+"""兜底标识：**没有任何规则能判定**时的出口。
+
+为什么不借某条规则的 id：兜底不是规则判的结论，而是「判不了」这件事本身。
+借用 ``G03.R15`` / ``G04.R14`` 会让 ``RULESET.md`` 的出口列说谎
+（它们的出口是 G06 / G07，不是资料核实）。
+"""
+
+MANUAL_URGENCY = "MANUAL.URGENCY"
+"""人工越级标识：医生置位 ``urgency_flag``，跳过自动判定。"""
+
+OUTCOME_PRIORITY: dict[RouteKind, int] = {
+    RouteKind.REVIEW: 3,  # 人工复核压过一切模式
+    RouteKind.MODE: 2,
+    RouteKind.VERIFY: 1,
+}
+"""冲突时取优先级高者。**VERIFY 最低**：能进模式就不因资料瑕疵退回核查。"""
+
+
+@dataclass(frozen=True)
+class RuleTrace:
+    """单条规则的求值留痕（审计用；不要塞进 case）。"""
+
+    rule_id: str
+    verdict: Verdict
+    exit: NextNode
 
 
 @dataclass
 class RouteResult:
-    """路由结论 + 完整判定轨迹。"""
+    """路由结论 + 判定轨迹 + 证据缺口。"""
 
-    route_mode: RouteMode
+    kind: RouteKind
+    rule_id: str
     reason: str
-    urgency_triggered: bool
-    is_special_lesion: bool
-    complex_anatomy: bool
-    severe_comorbidity: bool
-    guideline_eligible: bool
-    missing_critical_fields: list[str] = field(default_factory=list)
-    confidence: float = BASE_CONFIDENCE
-    manual_review_required: bool = False
+    next_node: NextNode
+    emergency_level: EmergencyLevel
+    mode: RouteMode | None = None
+    evidence_gaps: list[str] = field(default_factory=list)
+    confidence_level: ConfidenceLevel = "中"
+    class_output: list[str] = field(default_factory=list)
+    cl_taaa_iv: TaaaGrade | None = None
+    """Ⅳ型 TAAA 解剖扩展（判定产物）。``None`` = 没跑到 G08（急诊出口）。
+
+    为什么不放 ``VascCase``：它是规则算出来的，不是抽取出来的病例事实。
+    放进去会让「病例输入」与「判定输出」混在一处，且 160 字段的契约数字会失守。
+    下游（指南引擎）按「条目子集」需要它，从 ``route_result`` 取即可。
+    """
+    k_identity_conflict: str | None = None
+    k_diag_conflict: str | None = None
+    k_classifiable: str | None = None
+    trace: list[RuleTrace] = field(default_factory=list)
     ruleset_version: str = RULESET_VERSION
-    trace: list[StepTrace] = field(default_factory=list)
 
 
 # ===========================================================================
-# 各步判定（纯函数）
+# 三值求值原语
 # ===========================================================================
-def _is_truthy(v: object) -> bool:
-    """三态/四态枚举 → 布尔：**仅「有」为真**。
+def _token(v: object) -> object:
+    """枚举取 ``value``；其余原样。"""
+    return getattr(v, "value", v)
 
-    缺失 / 未提及 / 未描述 / **疑似** 一律不为真（「疑似感染」不等于「有感染」，O21）。
 
-    ⚠️ 实现要点：按 ``value`` 比较，**不得用 ``is`` 身份比较**。事实层字段可能使用
-    不同的枚举类（``YesNoUnknown`` / ``InfectionEvidence`` / ``Tortuosity``），
-    ``v is YesNoUnknown.YES`` 在换类后会**静默返回 False**，导致 P2/P3 判定无声失效。
-    """
-    if v is None:
+def _is_uncertain_token(v: object) -> bool:
+    return isinstance(v, str) and v in UNCERTAIN_TOKENS
+
+
+def _and(*vs: Verdict) -> Verdict:
+    if any(v is False for v in vs):
         return False
-    return getattr(v, "value", v) == AFFIRMATIVE_VALUE
+    if any(v is None for v in vs):
+        return None
+    return True
 
 
-def _fmt(value: object, unit: str = "") -> str:
-    """把字段值渲染为 ``note`` 文本（**仅用于文案，不参与任何判定**）。
+def _or(*vs: Verdict) -> Verdict:
+    if any(v is True for v in vs):
+        return True
+    if any(v is None for v in vs):
+        return None
+    return False
 
-    规则：枚举取 ``value``（中文取值）；列表以 ``、`` 连接（空列表记 ``空``）；
-    ``None`` 统一记 ``未提及``；``unit`` 仅用于数值字段拼接单位。
+
+def _not(v: Verdict) -> Verdict:
+    return None if v is None else (not v)
+
+
+def _eq(value: object, *allowed: object) -> Verdict:
+    """取值相等。**显式列出即命中；未列出且属不确定值 → UNKNOWN**。
+
+    顺序必须 ``t in allowed`` 在前：规格里「医生明确写疑似 rAAA」把「疑似」当
+    **阳性触发**（G03.R04 / R07 / G08.R03）。若先折成 UNKNOWN，这些规则永不命中。
+    反过来，规则没显式要「疑似」时它仍是 UNKNOWN，不能拿去支撑任何结论。
     """
-    if value is None:
-        return "未提及"
-    if isinstance(value, (list, tuple)):
-        return "、".join(_fmt(v) for v in value) or "空"
-    return f"{getattr(value, 'value', value)}{unit}"
+    t = _token(value)
+    if t is None:
+        return None
+    if t in allowed:
+        return True
+    if _is_uncertain_token(t):
+        return None
+    return False
 
 
-def _checks(*items: str) -> str:
-    """把检查项拼成 ``note`` 契约要求的后缀 ``（…；…；…）``。
-
-    分隔符与包裹符在此**唯一定义**，渲染层可按它切分（见模块文档 note 契约）。
-    """
-    return "（" + "；".join(items) + "）"
-
-
-def _cmp(value: object, unit: str, op: str, threshold: str) -> str:
-    """数值判据渲染：有值 → ``<值><单位> <比较符> <阈值>``；字段缺失 → ``未提及``。
-
-    缺失时刻意**不附比较符**：``未提及 ≥ 15mm`` 是无意义的伪陈述。
-    """
-    if value is None:
-        return "未提及"
-    return f"{value}{unit} {op} {threshold}"
+def _has(values: list[object] | None, *targets: str) -> Verdict:
+    """多选字段包含判断。有目标 → True；无目标但含不确定词 → UNKNOWN。"""
+    if values is None:
+        return None
+    tokens = [_token(v) for v in values]
+    if any(t in targets for t in tokens):
+        return True
+    if any(_is_uncertain_token(t) for t in tokens):
+        return None
+    return False
 
 
-def collect_missing_critical_fields(case: VascCase) -> list[str]:
-    """收集缺失的关键事实层字段（O25 / CRITICAL_FACT_FIELDS）。
-
-    注意：只检查事实层字段——判定层由代码派生，必然存在，不可能缺失。
-    """
-    from ..models.preop.case import CRITICAL_FACT_FIELDS
-
-    missing: list[str] = []
-    for name in CRITICAL_FACT_FIELDS:
-        value = getattr(case, name, None)
-        if value is None:
-            missing.append(name)
-        elif isinstance(value, list) and len(value) == 0:
-            # disease_category 为空列表，同样视为未识别
-            missing.append(name)
-    return missing
+def _absent(values: list[object] | None, dangerous: tuple[str, ...]) -> Verdict:
+    """多选字段**明确不含**危险项。空列表 → False（没有记录 ≠ 阴性）。"""
+    if not values:
+        return False
+    tokens = [_token(v) for v in values]
+    if any(t in dangerous for t in tokens):
+        return False
+    if any(_is_uncertain_token(t) for t in tokens):
+        return None
+    return True
 
 
-def step_p1_emergency(case: VascCase) -> tuple[bool, str]:
-    """P1 急诊触发判定（O01~O10）。
-
-    触发条件（任一为真）：
-      1. urgency_flag 显式置位（O01，人工/系统指定，最高优先）；
-      2. 破裂 / 疑似破裂（O02~R02）；
-      3. AAA 归因性症状「有」（O03~O05）；
-      4. 循环不稳 / 活动性出血 / 急性肢体缺血 / 灌注障碍 / 脓毒症（O06~O10）。
-    """
-    if case.urgency_flag:
-        return True, "P1·O01 显式急症标志 urgency_flag 置位"
-
-    if case.rupture_status in (RuptureStatus.CONFIRMED, RuptureStatus.SUSPECTED):
-        return True, f"P1·O02 破裂状态 = {case.rupture_status.value}"
-
-    if case.symptom_aaa_related is SymptomAAA.PRESENT:
-        return True, "P1·O03 AAA 归因性症状 = 有"
-
-    acute_signs = (
-        ("hemodynamic_instability", "循环不稳", "O06"),
-        ("active_hemorrhage", "活动性出血", "O07"),
-        ("acute_limb_ischemia", "急性肢体缺血", "O08"),
-        ("visceral_malperfusion", "重要器官灌注障碍", "O09"),
-        ("septic_shock", "脓毒性休克", "O10"),
-    )
-    for attr, label, rule in acute_signs:
-        if _is_truthy(getattr(case, attr, None)):
-            return True, f"P1·{rule} {label} = 有"
-
-    return False, "P1 无急诊触发" + _checks(
-        "急症标志 未置位",
-        f"破裂状态 {_fmt(case.rupture_status)}",
-        f"AAA 归因性症状 {_fmt(case.symptom_aaa_related)}",
-        # 逐字段列出取值，**不得聚合成「均无」**：这 5 个字段未采集（None）时，
-        # 聚合句会把「未提及」陈述成「已排除」（见模块文档缺失值语义契约）。
-        *(f"{label} {_fmt(getattr(case, attr, None))}" for attr, label, _ in acute_signs),
-    )
+def _num(value: object) -> float | None:
+    if value is None or isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
 
 
-def step_p2_special(case: VascCase) -> tuple[bool, str]:
-    """P2 特殊主动脉病种 / 复杂病变（O21）。
-
-    覆盖：感染性、炎症性、囊状、PAU、IMH、IAAD、假性动脉瘤、遗传/结缔组织、
-          **活动性恶性肿瘤**、主动脉-肠瘘 / 腔静脉瘘，以及 disease_category 含
-          「感染性/其他特殊」。
-
-    注：``infection_evidence`` 取「疑似」时**不**触发本步（仅「有」为真，见
-        :func:`_is_truthy`）；该口径待临床确认后可能调整。
-    """
-    if _is_truthy(case.infection_evidence):
-        return True, "P2·O21 感染证据 = 有"
-    if _is_truthy(case.inflammatory_evidence):
-        return True, "P2·O21 炎症证据 = 有"
-    if _is_truthy(case.genetic_syndrome):
-        return True, "P2·O21 遗传/结缔组织病 = 有"
-    if case.malignancy is MalignancyStatus.ACTIVE:
-        return True, "P2·O21 合并活动性恶性肿瘤"
-
-    pieces = [
-        case.special_lesion_type or "",
-        case.lesion_subtype or "",
-        case.lesion_morphology or "",
-    ]
-    haystack = " ".join(pieces).lower()
-    for kw in SPECIAL_SUBTYPE_KEYWORDS:
-        if kw in haystack:
-            return True, f"P2·O21 特殊病变线索命中「{kw}」"
-
-    cats = set(case.disease_category or [])
-    if DiseaseCategory.INFECTIOUS in cats:
-        return True, "P2·O21 病种含「4感染性主动脉疾病」"
-    if DiseaseCategory.OTHER_SPECIAL in cats:
-        return True, "P2·O21 病种含「5其他特殊主动脉疾病」"
-
-    if case.postop_complication and any(k in case.postop_complication for k in ("感染", "瘘")):
-        return True, "P2·O21 术后感染/瘘并发症"
-
-    return False, "P2 无特殊病变" + _checks(
-        f"感染证据 {_fmt(case.infection_evidence)}",
-        f"炎症证据 {_fmt(case.inflammatory_evidence)}",
-        f"遗传/结缔组织病 {_fmt(case.genetic_syndrome)}",
-        f"恶性肿瘤 {_fmt(case.malignancy)}",
-        "特殊病变线索 未命中",
-        f"病种 {_fmt(case.disease_category)}",
-        "术后并发症 未含感染/瘘线索",
-    )
+def _lt(v: object, t: float) -> Verdict:
+    x = _num(v)
+    return None if x is None else x < t
 
 
-def step_p3_complex_anatomy(case: VascCase) -> tuple[bool, str]:
-    """P3 复杂解剖 / 复杂手术 / 异常术后（O15~O20, O22, O23）。"""
-    # O15 瘤颈长度
-    if case.neck_length_mm is not None and case.neck_length_mm < NECK_LENGTH_THRESHOLD_MM:
-        return True, f"P3·O15 瘤颈长度 {case.neck_length_mm}mm < {NECK_LENGTH_THRESHOLD_MM}mm"
-    # O16 瘤颈成角
-    if case.neck_angle_deg is not None and case.neck_angle_deg > NECK_ANGLE_THRESHOLD_DEG:
-        return True, f"P3·O16 瘤颈成角 {case.neck_angle_deg}° > {NECK_ANGLE_THRESHOLD_DEG}°"
-    # O17 入路直径
-    if (
-        case.access_diameter_mm is not None
-        and case.access_diameter_mm < ACCESS_DIAMETER_THRESHOLD_MM
-    ):
-        return (
-            True,
-            f"P3·O17 入路直径 {case.access_diameter_mm}mm < {ACCESS_DIAMETER_THRESHOLD_MM}mm",
-        )
-    # O18 瘤颈血栓/钙化
-    if (
-        case.neck_thrombus_calc_pct is not None
-        and case.neck_thrombus_calc_pct > NECK_THROMBUS_CALC_THRESHOLD_PCT
-    ):
-        return (
-            True,
-            f"P3·O18 瘤颈血栓/钙化 {case.neck_thrombus_calc_pct}% > {NECK_THROMBUS_CALC_THRESHOLD_PCT}%",
-        )
-    # O19 迂曲 / 极度成角
-    if _is_truthy(case.tortuosity):
-        return True, "P3·O19 迂曲/极度成角 = 有"
-    # O20 生长速率
-    if case.growth_rate_mm_per_year is not None and case.growth_rate_mm_per_year >= 10:
-        return True, f"P3·O20 年增长率 {case.growth_rate_mm_per_year}mm/年 ≥ 10mm/年"
-    # O22 复杂解剖分型（枚举集判定，无子串误判）
-    if case.anatomy_level in COMPLEX_ANATOMY_LEVELS:
-        return True, f"P3·O22 复杂解剖分型 = {case.anatomy_level.value}"
-
-    # O23 复杂手术史 / 异常术后
-    if case.prior_repair in COMPLEX_PRIOR_REPAIR:
-        return True, f"P3·O23 既往修复史 = {case.prior_repair.value}（复杂再干预）"
-    if case.prior_repair is PriorRepair.NONE and _is_truthy(case.complex_surgery_history):
-        return True, "P3·O23 复杂手术/多次再干预史 = 有"
-    if (
-        case.prior_repair is PriorRepair.NONE
-        and case.postop_complication
-        and any(k in case.postop_complication for k in POSTOP_COMPLICATION_KEYWORDS)
-    ):
-        return True, f"P3 术后并发症：{case.postop_complication}"
-
-    # AAA 合并髂动脉瘤（表1 L02 → 复杂）
-    cats = set(case.disease_category or [])
-    if DiseaseCategory.ASYMPTOMATIC in cats and DiseaseCategory.ILIAC_ANEURYSM in cats:
-        return True, "P3·表1 L02 AAA 合并髂动脉瘤"
-
-    return False, "P3 解剖/手术复杂度未达阈值" + _checks(
-        f"瘤颈长度 {_cmp(case.neck_length_mm, 'mm', '≥', f'{NECK_LENGTH_THRESHOLD_MM}mm')}",
-        f"瘤颈成角 {_cmp(case.neck_angle_deg, '°', '≤', f'{NECK_ANGLE_THRESHOLD_DEG}°')}",
-        f"入路直径 {_cmp(case.access_diameter_mm, 'mm', '≥', f'{ACCESS_DIAMETER_THRESHOLD_MM}mm')}",
-        "瘤颈血栓/钙化 "
-        f"{_cmp(case.neck_thrombus_calc_pct, '%', '≤', f'{NECK_THROMBUS_CALC_THRESHOLD_PCT}%')}",
-        f"迂曲/极度成角 {_fmt(case.tortuosity)}",
-        f"年增长率 {_cmp(case.growth_rate_mm_per_year, 'mm/年', '<', '10mm/年')}",
-        f"解剖分型 {_fmt(case.anatomy_level)}",
-        f"既往修复史 {_fmt(case.prior_repair)}",
-        "术后并发症 未含复杂关键词",
-        f"病种 {_fmt(case.disease_category)}，未合并髂动脉瘤",
-    )
+def _gt(v: object, t: object) -> Verdict:
+    x, y = _num(v), _num(t)
+    return None if x is None or y is None else x > y
 
 
-def step_p4_comorbidity(case: VascCase) -> tuple[bool, str]:
-    """P4 严重合并症（O11~O14）。"""
-    nyha = case.heart_failure_nyha
-    if nyha in (HeartFailureNYHA.III, HeartFailureNYHA.IV):
-        return True, f"P4·O11 心衰 {nyha.value} 级 ≥ III"
-    if _is_truthy(case.copd):
-        return True, "P4·O12 COPD = 有"
-    if case.ckd_stage in (CKDStage.S3, CKDStage.S4, CKDStage.S5):
-        return True, f"P4·O13 CKD {case.ckd_stage.value} 期 ≥ 3"
-    if _is_truthy(case.cad):
-        return True, "P4·O14 冠心病 CAD = 有"
-    return False, "P4 无严重合并症" + _checks(
-        f"心衰 {_fmt(case.heart_failure_nyha, ' 级')}，阈值 ≥ III 级",
-        f"COPD {_fmt(case.copd)}",
-        f"CKD {_fmt(case.ckd_stage, ' 期')}，阈值 ≥ 3 期",
-        f"冠心病 CAD {_fmt(case.cad)}",
-    )
+def _ge(v: object, t: float) -> Verdict:
+    x = _num(v)
+    return None if x is None else x >= t
 
 
-def step_p5_conflict(case: VascCase) -> tuple[bool, str]:
-    """P5 证据冲突（O24）。"""
-    if _is_truthy(case.evidence_conflict):
-        return True, "P5·O24 指南与影像证据冲突"
-    return False, "P5 无证据冲突" + _checks(f"证据冲突标志 {_fmt(case.evidence_conflict)}")
+def _between(v: object, lo: float, hi: float) -> Verdict:
+    x = _num(v)
+    return None if x is None else lo <= x <= hi
 
 
-def step_p6_missing(case: VascCase, missing: list[str]) -> tuple[bool, str]:
-    """P6 关键字段缺失 / 病种无法识别（O25）。"""
-    from ..models.preop.case import CRITICAL_FACT_FIELDS
-
-    if missing:
-        return True, f"P6·O25 关键字段缺失：{'、'.join(missing)}"
-    if not case.disease_category:
-        return True, "P6·O25 病种无法识别（disease_category 为空）"
-    return False, "P6 关键字段齐全" + _checks(
-        f"{len(CRITICAL_FACT_FIELDS)} 项关键字段均已填：{'、'.join(CRITICAL_FACT_FIELDS)}",
-        f"病种 {_fmt(case.disease_category)}",
-    )
+def _present(*vs: object) -> Verdict:
+    """全部**有明确取值**（非 None、非不确定、列表非空）。"""
+    out: list[Verdict] = []
+    for v in vs:
+        if isinstance(v, list):
+            out.append(bool(v))
+            continue
+        t = _token(v)
+        out.append(None if (t is None or _is_uncertain_token(t)) else True)
+    return _and(*out)
 
 
-def step_p7_guideline(case: VascCase) -> tuple[bool, str]:
-    """P7 低复杂度常规指南场景（O26）。"""
-    cats = set(case.disease_category or [])
-    if not (cats & GUIDELINE_CATEGORIES):
-        return False, "P7 不属于常规指南病种" + _checks(
-            f"病种 {_fmt(case.disease_category)}",
-            "常规指南病种：无症状 AAA / 孤立性髂动脉瘤 / 术后随访",
-        )
-
-    # 术后病种：内漏类型决定归属（表2 T10）——**白名单正列举**，不是 `is not None` 守卫。
-    #   只有「无内漏」/「稳定Ⅱ型」放行指南；其余（含未提及 / 不明 / Ⅰ型 / Ⅲ型 / Ⅳ型）
-    #   一律否决 → 由 P7b 兜底为复杂 + 人工复核（不得默认「稳定」）。
-    #   ⚠️ 未提及（None）≠ 无内漏（EndoleakType.NONE）：前者是数据缺口，不是「已排除内漏」。
-    #      若写成 `and case.endoleak_type is not None`，None 会跌出本分支、被下方
-    #      「低复杂度指南病种」出口当作稳定随访放行（实测：指南 + 免人工复核 + 0.90）。
-    if DiseaseCategory.POSTOPERATIVE in cats:
-        et = case.endoleak_type
-        if et in (EndoleakType.NONE, EndoleakType.II):
-            return True, f"P7·O26 术后随访内漏状态 = {et.value}（稳定）"
-        return False, "P7·O26 术后内漏类型非稳定Ⅱ型" + _checks(
-            f"内漏类型 {_fmt(et)}",
-            "稳定取值：无内漏 / Ⅱ型，未提及 ≠ 无内漏",
-        )
-
-    hit = cats & GUIDELINE_CATEGORIES
-    return True, f"P7·O26 低复杂度指南病种：{'、'.join(c.value for c in hit)}"
-
-
-def step_p8_prerequisites(case: VascCase, missing: list[str]) -> tuple[bool, str]:
-    """P8 全部适用前置条件已核实（O26, O27）。"""
-    if missing:
-        return False, (
-            f"P8 前置未满足：仍缺 {len(missing)} 个关键字段"
-            + _checks(f"缺失字段：{'、'.join(missing)}")
-        )
-    return True, "P8·O27 前置条件齐备，资料完整"
+def _missing(v: object) -> Verdict:
+    """字段是否缺失（含不确定值）。"""
+    t = _token(v)
+    return t is None or _is_uncertain_token(t)
 
 
 # ===========================================================================
-# 主流水线
+# 求值上下文：物化派生 + 便捷访问
 # ===========================================================================
-def route(case: VascCase) -> RouteResult:
-    """执行 P0a~P8 完整流水线，返回路由结论与判定轨迹。
+ABD_BACK_SITES = ("上腹", "下腹", "脐周", "侧腹", "腰", "背")
+"""「腹 / 背 / 侧腹 / 腰」—— 主动脉相关疼痛的部位集合。"""
 
-    ⚠️ 纯确定性函数：不读文件、不调网络、不依赖时间、不引入 LLM。
+HB_DROP_THRESHOLD_G_L = 30.0
+"""Hb 快速下降阈值（拟定安全复核值）。48h 窗口由抽取层在 ``L.HB_COMPARABLE`` 内判断：
+该布尔的语义就是「同患者 + 采样间隔 ≤48h + 单位一致」，规则层只读事实，不重复判定。"""
+
+NRS_SEVERE = 7
+NEWS2_REVIEW_LOW, NEWS2_REVIEW_HIGH, NEWS2_CRITICAL = 5, 6, 7
+EGFR_LOW, SAC_GROWTH_MM, SBP_SHOCK, DIAMETER_AAA_MM = 30.0, 10.0, 80.0, 30.0
+
+
+@dataclass
+class _Ctx:
+    """一次判定的上下文：case + 量化值 + 物化派生量（不进模型、不进哈希）。"""
+
+    case: VascCase
+    measurement: VascMeasurement | None = None
+
+    def __post_init__(self) -> None:
+        c = self.case
+        self.p, self.t, self.d, self.q = c.p, c.t, c.d, c.q
+        self.s, self.v, self.lab, self.c = c.s, c.v, c.lab, c.c
+        self.n, self.gen, self.inf = c.n, c.gen, c.inf
+        self.cl, self.k, self.r = c.cl, c.k, c.r
+
+        # ---- 物化派生（F6 裁定：不落模型，只参与本次判定）----
+        hb, hb_prev = _num(self.lab.hb), _num(self.lab.hb_prev)
+        # 下降量 = 既往 − 当前（正值 = 下降）。写成当前 − 既往会得到负数，规则永不命中。
+        self.hb_delta: float | None = None if hb is None or hb_prev is None else hb_prev - hb
+        self.news2, self.news2_single3 = _news2(self.v)
+        self.genetic_ctx = self.n.genetic_ctx or _derive_genetic_ctx(self.gen)
+        self.inflammatory_ctx = self.n.inflammatory_ctx or _derive_inflammatory_ctx(self.inf)
+
+        # ---- 运行时状态（编排层写入，非字段）----
+        self.labels: list[str] = []
+        self.diag_conflict: bool | None = None
+        self.g04_blocking: list[Verdict] = []
+        self.gaps_extra: list[str] = []
+        self.taaa_iv: TaaaGrade | None = None
+
+
+def _news2(v: object) -> tuple[float | None, bool | None]:
+    """NEWS2 总分与「是否有单项 3 分」。
+
+    7 项**全部可算**才给总分；单项 3 分只要该项可算即可判。
+    ``Scale2经确认`` 未实现 → 直接 UNKNOWN（用错量表比没分数更危险）。
     """
-    trace: list[StepTrace] = []
+    if _token(v.spo2_scale) == "Scale2经确认":  # type: ignore[attr-defined]
+        return None, None
 
-    # ---- P0a 语义预处理（O28）：非判定步，只登记 ----
-    trace.append(
-        StepTrace(
-            "P0a",
-            "语义预处理：否定/时态/归因/疑似",
-            True,
-            "O28",
-            "事件时态与肯定/否定已在前置抽取层处理；本步仅登记。",
+    def s_rr(x: float) -> int:
+        return 3 if x <= 8 else 1 if x <= 11 else 0 if x <= 20 else 2 if x <= 24 else 3
+
+    def s_spo2(x: float) -> int:
+        return 3 if x <= 91 else 2 if x <= 93 else 1 if x <= 95 else 0
+
+    def s_sbp(x: float) -> int:
+        return 3 if x <= 90 else 2 if x <= 100 else 1 if x <= 110 else 0 if x <= 219 else 3
+
+    def s_hr(x: float) -> int:
+        return (
+            3
+            if x <= 40
+            else 1
+            if x <= 50
+            else 0
+            if x <= 90
+            else 1
+            if x <= 110
+            else 2
+            if x <= 130
+            else 3
         )
+
+    def s_temp(x: float) -> int:
+        return 3 if x <= 35.0 else 1 if x <= 36.0 else 0 if x <= 38.0 else 1 if x <= 39.0 else 2
+
+    comps: dict[str, int | None] = {
+        "rr": None if _num(v.rr) is None else s_rr(_num(v.rr)),  # type: ignore[attr-defined]
+        "spo2": None if _num(v.spo2) is None else s_spo2(_num(v.spo2)),  # type: ignore[attr-defined]
+        "sbp": None if _num(v.sbp) is None else s_sbp(_num(v.sbp)),  # type: ignore[attr-defined]
+        "hr": None if _num(v.hr) is None else s_hr(_num(v.hr)),  # type: ignore[attr-defined]
+        "temp": None if _num(v.temp) is None else s_temp(_num(v.temp)),  # type: ignore[attr-defined]
+    }
+    acvpu = _token(v.acvpu)  # type: ignore[attr-defined]
+    comps["acvpu"] = (
+        None if acvpu is None or _is_uncertain_token(acvpu) else (0 if acvpu == "A" else 3)
     )
-    # ---- P0b 多标签处理（O29）：保留全部标签，主模式由优先级仲裁 ----
-    trace.append(
-        StepTrace(
-            "P0b",
-            "多标签处理：保留全部标签，主模式取最高优先级",
-            True,
-            "O29",
-            f"当前病种标签 {len(case.disease_category or [])} 个。",
-        )
+    oxygen = _token(v.oxygen)  # type: ignore[attr-defined]
+    comps["oxygen"] = (
+        None if oxygen is None or _is_uncertain_token(oxygen) else (2 if oxygen == "是" else 0)
     )
 
-    missing = collect_missing_critical_fields(case)
-
-    # ---- P1 急诊 ----
-    hit, note = step_p1_emergency(case)
-    trace.append(StepTrace("P1", "是否存在急诊触发？", hit, "O01~O10", note))
-    if hit:
-        return _build(
-            RouteMode.EMERGENCY,
-            note,
-            case,
-            missing,
-            trace,
-            True,
-            manual_review=False,
-        )
-
-    # ---- P2 特殊病变 ----
-    hit, note = step_p2_special(case)
-    trace.append(StepTrace("P2", "是否存在特殊主动脉病种或复杂病变？", hit, "O21", note))
-    if hit:
-        return _build(RouteMode.COMPLEX, note, case, missing, trace, False)
-
-    # ---- P3 复杂解剖 / 复杂手术 / 异常术后 ----
-    hit, note = step_p3_complex_anatomy(case)
-    trace.append(StepTrace("P3", "是否复杂解剖/复杂手术/异常术后？", hit, "O15~O20,O22,O23", note))
-    if hit:
-        return _build(RouteMode.COMPLEX, note, case, missing, trace, False)
-
-    # ---- P4 严重合并症 ----
-    hit, note = step_p4_comorbidity(case)
-    trace.append(StepTrace("P4", "是否存在严重合并症？", hit, "O11~O14", note))
-    if hit:
-        return _build(RouteMode.COMPLEX, note, case, missing, trace, False)
-
-    # ---- P5 证据冲突 ----
-    hit, note = step_p5_conflict(case)
-    trace.append(StepTrace("P5", "指南与影像证据是否冲突？", hit, "O24", note))
-    if hit:
-        return _build(RouteMode.COMPLEX, note, case, missing, trace, False, manual_review=True)
-
-    # ---- P6 关键字段缺失 ----
-    hit, note = step_p6_missing(case, missing)
-    trace.append(StepTrace("P6", "决策关键字段是否缺失/病种无法识别？", hit, "O25", note))
-    if hit:
-        return _build(RouteMode.COMPLEX, note, case, missing, trace, False, manual_review=True)
-
-    # ---- P7 指南场景 ----
-    hit, note = step_p7_guideline(case)
-    trace.append(StepTrace("P7", "是否属于低复杂度常规指南场景？", hit, "O26", note))
-    if not hit:
-        # P7 未确立指南场景（病种不属常规指南，**或**术后内漏状态不可确认稳定），
-        # 且 P1~P6 均未命中 —— 兜底为复杂（不得默认「稳定」）
-        note_fallback = (
-            "P7 未确立指南场景（病种或术后内漏状态不满足 O26），且 P1~P6 均未触发 → 兜底复杂模式"
-        )
-        trace.append(StepTrace("P7b", "兜底判定", True, "O25", note_fallback))
-        return _build(
-            RouteMode.COMPLEX, note_fallback, case, missing, trace, False, manual_review=True
-        )
-
-    # ---- P8 前置条件核实 ----
-    hit8, note8 = step_p8_prerequisites(case, missing)
-    trace.append(StepTrace("P8", "全部适用前置条件是否已核实？", hit8, "O26,O27", note8))
-    if hit8:
-        return _build(RouteMode.GUIDELINE, note, case, missing, trace, False)
-    return _build(RouteMode.COMPLEX, note8, case, missing, trace, False, manual_review=True)
+    values = list(comps.values())
+    single3: bool | None = (
+        True if any(s == 3 for s in values) else (None if any(s is None for s in values) else False)
+    )
+    total: float | None = (
+        None if any(s is None for s in values) else float(sum(s for s in values if s))
+    )
+    return total, single3
 
 
-def _build(
-    mode: RouteMode,
-    reason: str,
-    case: VascCase,
-    missing: list[str],
-    trace: list[StepTrace],
-    urgency_triggered: bool,
+def _derive_genetic_ctx(gen: object) -> str | None:
+    """遗传证据明细 → 主状态（三层：``GEN.*`` → ``N.GENETIC_CTX`` → 规则）。
+
+    只在抽取层没给主状态时兜底派生；证据不足以支撑结论时返回 ``None``。
+    """
+    st = _token(gen.syndrome_type)  # type: ignore[attr-defined]
+    vc = _token(gen.variant_class)  # type: ignore[attr-defined]
+    if st in ("Marfan", "Loeys-Dietz", "血管型EDS", "其他确诊综合征") or vc in ("致病", "可能致病"):
+        return "确诊"
+    fam = _token(gen.family_aneurysm)  # type: ignore[attr-defined]
+    feats = gen.syndromic_features  # type: ignore[attr-defined]
+    age = gen.aaa_age_onset  # type: ignore[attr-defined]
+    if st == "疑似" or fam == "阳性" or feats or (isinstance(age, int) and age < 60):
+        return "疑似遗传背景"
+    if fam == "明确无相关史" and isinstance(age, int) and age >= 60 and not feats:
+        return "无已知阳性线索"
+    return None
+
+
+def _derive_inflammatory_ctx(inf: object) -> str | None:
+    """炎症证据明细 → 主状态。**单纯 CRP/ESR 升高不触发**（G04.R16 明文）。"""
+    mantle = _token(inf.mantle_sign)  # type: ignore[attr-defined]
+    wall = _token(inf.wall_fibrosis)  # type: ignore[attr-defined]
+    if mantle == "明确存在":
+        return "影像高度提示"
+    if mantle == "可疑" or wall == "可疑":
+        return "可疑"
+    if mantle == "未见" and wall == "未见":
+        return "无当前支持证据"
+    return None
+
+
+# ===========================================================================
+# 通用判据片段
+# ===========================================================================
+def _aaa_confirmed(x: _Ctx) -> Verdict:
+    """AAA 已确认：报告确认 / 既往已修复 / 量化直径 ≥30mm，三条通路任一。"""
+    return _or(
+        _eq(x.cl.aaa_reported, "确认"),
+        _eq(x.d.dx_context, "确认", "既往已修复"),
+        _ge(x.cl.aaa_diam, DIAMETER_AAA_MM),
+    )
+
+
+def _aaa_suspected(x: _Ctx) -> Verdict:
+    """AAA 已确认或疑似（需要近端解剖分级的前置条件）。"""
+    return _or(_aaa_confirmed(x), _eq(x.cl.aaa_reported, "疑似"), _eq(x.d.dx_context, "疑似"))
+
+
+def _acute_abd_back_pain(x: _Ctx) -> Verdict:
+    """本次新发/加重的腹背侧腰痛。"""
+    return _and(_eq(x.s.pain_current, "当前新发", "本次进展"), _has(x.s.pain_site, *ABD_BACK_SITES))
+
+
+def _branch_occluded(x: _Ctx) -> Verdict:
+    if not x.c.branch:
+        return None
+    vals = [_token(v) for v in x.c.branch.values()]
+    if any(v == "闭塞" for v in vals):
+        return True
+    if any(_is_uncertain_token(v) for v in vals):
+        return None
+    return False
+
+
+# ===========================================================================
+# G03 · 急诊判定（21 条）
+# ===========================================================================
+def g03_r01_direct_extravasation(x: _Ctx) -> Verdict:
+    return _and(
+        _eq(x.q.cta_enhance, "适当"),
+        _eq(x.q.cta_phase, "动脉期"),
+        _eq(x.c.extrav, "明确"),
+        _eq(x.c.extrav_contig, "明确连续"),
+        _eq(x.c.source_kind, "正式报告", "专家确认"),
+    )
+
+
+def g03_r02_aneurysm_with_hematoma(x: _Ctx) -> Verdict:
+    return _and(
+        _aaa_confirmed(x),
+        _eq(x.c.hematoma, "明确"),
+        _eq(x.c.hematoma_adj, "明确相邻"),
+        _eq(x.c.source_kind, "正式报告", "专家确认"),
+    )
+
+
+def g03_r03_rupture_reported(x: _Ctx) -> Verdict:
+    return _and(_eq(x.c.rupture_report, "明确破裂"), _eq(x.q.idmatch, "一致"))
+
+
+def g03_r04_suspected_rupture_unstable(x: _Ctx) -> Verdict:
+    trigger = _or(
+        _eq(x.d.dx_context, "疑似"),
+        _and(_aaa_confirmed(x), _or(_acute_abd_back_pain(x), _eq(x.s.syncope, "肯定", "可疑"))),
+    )
+    unstable = _or(_lt(x.v.sbp, SBP_SHOCK), _eq(x.v.conscious_change, "新发下降"))
+    return _and(trigger, unstable)
+
+
+def g03_r05_aaa_acute_pain_attributed(x: _Ctx) -> Verdict:
+    return _and(
+        _aaa_confirmed(x), _acute_abd_back_pain(x), _eq(x.s.pain_attrib, "明确相关", "怀疑相关")
+    )
+
+
+def g03_r06_aaa_sudden_pain_unattributed(x: _Ctx) -> Verdict:
+    return _and(
+        _aaa_confirmed(x),
+        _acute_abd_back_pain(x),
+        _eq(x.s.pain_onset, "突然"),
+        _eq(x.s.pain_attrib, "未判断"),
+    )
+
+
+def g03_r07_rupture_not_excluded(x: _Ctx) -> Verdict:
+    return _or(
+        _eq(x.c.rupture_report, "疑似破裂"),
+        _eq(x.c.extrav, "可疑"),
+        _eq(x.c.hematoma, "可疑"),
+        _and(_eq(x.c.source_kind, "算法候选"), _eq(x.q.report_vs_algo, "仅算法", "冲突")),
+    )
+
+
+def g03_r08_graft_with_gi_bleed(x: _Ctx) -> Verdict:
+    graft = _or(_has(x.d.surg, "EVAR", "OSR"), _eq(x.c.graft, "有"))
+    return _and(graft, _has(x.s.gi_bleed, "呕血", "黑便", "便血"))
+
+
+def g03_r09_acute_limb_ischemia(x: _Ctx) -> Verdict:
+    severe = _or(
+        _has(x.s.limb, "运动障碍", "麻木"),
+        _eq(x.s.pulse_deficit, "有", "缺失"),
+        _branch_occluded(x),
+    )
+    return _and(_has(x.s.limb, "痛", "苍白", "发凉"), severe)
+
+
+def g03_r10_news2_critical(x: _Ctx) -> Verdict:
+    return _ge(x.news2, NEWS2_CRITICAL)
+
+
+def g03_r11_news2_urgent_review(x: _Ctx) -> Verdict:
+    band = _between(x.news2, NEWS2_REVIEW_LOW, NEWS2_REVIEW_HIGH)
+    single = True if x.news2_single3 else (None if x.news2_single3 is None else False)
+    return _or(band, single)
+
+
+def g03_r12_no_enhanced_cta_with_clues(x: _Ctx) -> Verdict:
+    clues = _or(_acute_abd_back_pain(x), _eq(x.s.syncope, "肯定", "可疑"))
+    no_cta = _or(_eq(x.q.cta_enhance, "不足", "无动脉期"), _eq(x.q.cta_phase, "平扫", "未知"))
+    return _and(_aaa_confirmed(x), clues, no_cta)
+
+
+def g03_r13_key_fact_conflict(x: _Ctx) -> Verdict:
+    return _or(
+        _eq(x.q.idmatch, "不一致"),
+        _has(x.q.conflict, "数值", "身份", "语义", "时间"),
+        _eq(x.q.report_vs_algo, "冲突"),
+    )
+
+
+def g03_r14_screen_incomplete(x: _Ctx) -> Verdict:
+    return _or(
+        _not(_eq(x.q.current_assess, "本次已评估")),
+        _not(_present(x.v.sbp, x.v.hr, x.v.acvpu)),
+        _not(_present(x.s.pain_present, x.s.syncope, x.s.gi_bleed, x.s.limb)),
+    )
+
+
+def g03_r15_no_emergency_release(x: _Ctx) -> Verdict:
+    return _and(
+        _eq(x.q.idmatch, "一致"),
+        _eq(x.q.current_assess, "本次已评估"),
+        _eq(x.s.pain_present, "否"),
+        _eq(x.s.syncope, "否定"),
+        _absent(x.s.gi_bleed, ("呕血", "黑便", "便血")),
+        _absent(x.s.limb, ("痛", "苍白", "发凉", "麻木", "无力", "运动障碍")),
+        _present(x.v.sbp, x.v.hr, x.v.acvpu),
+    )
+
+
+def g03_r16_suspected_rupture_reported(x: _Ctx) -> Verdict:
+    return _and(
+        _eq(x.q.idmatch, "一致"),
+        _or(_eq(x.d.dx_context, "疑似"), _eq(x.c.rupture_report, "疑似破裂")),
+    )
+
+
+def g03_r17_hb_drop_comparable(x: _Ctx) -> Verdict:
+    return _and(
+        _eq(x.lab.hb_comparable, True),
+        _eq(x.lab.hb_confound, False),
+        _ge(x.hb_delta, HB_DROP_THRESHOLD_G_L),
+    )
+
+
+def g03_r18_severe_sudden_pain_no_aaa(x: _Ctx) -> Verdict:
+    severe = _or(_ge(x.s.pain_severity, NRS_SEVERE), _eq(x.s.pain_severe_screen, True))
+    return _and(
+        _eq(x.q.idmatch, "一致"),
+        _eq(x.d.dx_context, "无相关记录"),
+        _acute_abd_back_pain(x),
+        _eq(x.s.pain_onset, "突然"),
+        severe,
+    )
+
+
+def g03_r19_hb_drop_uncertain(x: _Ctx) -> Verdict:
+    """数值差够大，但**可比性/干扰没有被确认为干净** → 只登记「差异待查」。
+
+    这里把 UNKNOWN 按「未确认」处理而不是留成 UNKNOWN：R17 已经吃掉了
+    「可比且无干扰」的情形，剩下的（False 或 None）都应进人工复核。
+    这是**安全侧**的确定性判断——不主张快速失血，但绝不漏掉复核。
+    """
+    not_clean = _token(x.lab.hb_comparable) is not True or _token(x.lab.hb_confound) is not False
+    return _and(_ge(x.hb_delta, HB_DROP_THRESHOLD_G_L), bool(not_clean))
+
+
+def g03_r20_severe_hypotension(x: _Ctx) -> Verdict:
+    return _lt(x.v.sbp, SBP_SHOCK)
+
+
+def g03_r21_lactate_above_uln(x: _Ctx) -> Verdict:
+    return _and(_gt(x.lab.lact, x.lab.lact_uln), _eq(x.q.unit, "有效", "可转换"))
+
+
+# ===========================================================================
+# G04 · 复杂度判定（18 条）
+# ===========================================================================
+def g04_r01_short_neck(x: _Ctx) -> Verdict:
+    return _and(
+        _between(x.n.neck_len, 4, 10), _eq(x.n.renal_l, "未受累"), _eq(x.n.renal_r, "未受累")
+    )
+
+
+def g04_r02_juxtarenal(x: _Ctx) -> Verdict:
+    return _and(
+        _ge(x.n.neck_len, 0),
+        _lt(x.n.neck_len, 4),
+        _eq(x.n.renal_l, "未受累"),
+        _eq(x.n.renal_r, "未受累"),
+    )
+
+
+def g04_r03_pararenal(x: _Ctx) -> Verdict:
+    renal = _or(_eq(x.n.renal_l, "明确受累"), _eq(x.n.renal_r, "明确受累"))
+    return _and(renal, _eq(x.n.sma, "未受累"))
+
+
+def g04_r04_visceral_pararenal(x: _Ctx) -> Verdict:
+    renal = _or(_eq(x.n.renal_l, "明确受累"), _eq(x.n.renal_r, "明确受累"))
+    return _and(renal, _eq(x.n.sma, "明确受累"), _eq(x.n.ca, "未受累"))
+
+
+def g04_r05_taaa_iv_extension(x: _Ctx) -> Verdict:
+    renal = _or(_eq(x.n.renal_l, "明确受累"), _eq(x.n.renal_r, "明确受累"))
+    return _and(renal, _eq(x.n.sma, "明确受累"), _eq(x.n.ca, "明确受累"), _eq(x.n.thoracic, "否"))
+
+
+def g04_r06_beyond_project_boundary(x: _Ctx) -> Verdict:
+    return _eq(x.n.thoracic, "是")
+
+
+def g04_r07_infection_or_fistula(x: _Ctx) -> Verdict:
+    return _or(_eq(x.n.infection_ctx, "医师明确", "高度怀疑"), _eq(x.n.fistula_ctx, "明确", "疑似"))
+
+
+def g04_r08_ifu_mismatch(x: _Ctx) -> Verdict:
+    return _eq(x.n.seal_ifu, "不符")
+
+
+def g04_r09_iliac_limitation(x: _Ctx) -> Verdict:
+    iia = _or(_eq(x.n.iia_left, "闭塞", "严重狭窄"), _eq(x.n.iia_right, "闭塞", "严重狭窄"))
+    return _and(_eq(x.n.iliac_bilat, "双侧"), iia)
+
+
+def g04_r10_access_occlusion(x: _Ctx) -> Verdict:
+    return _eq(x.n.access_occlusion, "双侧闭塞")
+
+
+def g04_r11_prior_repair_reintervention(x: _Ctx) -> Verdict:
+    evidence = _or(
+        _eq(x.n.endoleak_type, "I", "III"),
+        _eq(x.n.graft_major, "组件分离", "移位", "明显闭塞"),
+        _ge(x.n.sac_growth, SAC_GROWTH_MM),
+    )
+    return _and(_not(_eq(x.n.prev_repair, "无")), evidence)
+
+
+def g04_r12_physiologic_risk(x: _Ctx) -> Verdict:
+    return _or(
+        _lt(x.n.egfr, EGFR_LOW),
+        _eq(x.n.dialysis, "是"),
+        _eq(x.n.heart_class, "III", "IV"),
+        _eq(x.n.resp_support, "长期吸氧", "无创通气", "有创通气"),
+    )
+
+
+def g04_r13_insufficient_for_low_complexity(x: _Ctx) -> Verdict:
+    anatomy = _or(
+        _eq(x.n.cta_status, "缺失", "部分", "冲突"),
+        _missing(x.n.neck_len),
+        _missing(x.n.renal_l),
+        _missing(x.n.renal_r),
+        _missing(x.n.sma),
+        _missing(x.n.ca),
+        _eq(x.n.renal_l, "不可评价"),
+        _eq(x.n.renal_r, "不可评价"),
+        _eq(x.n.sma, "不可评价"),
+        _eq(x.n.ca, "不可评价"),
+    )
+    return _and(_aaa_suspected(x), anatomy)
+
+
+def g04_r14_low_complexity_to_guideline(x: _Ctx) -> Verdict:
+    """低复杂放行：**没有任何阻断型复杂规则命中**，且核心影像可评价。
+
+    ⚠️ 只有「阻断型」（R01–R12）参与放行判断。R15–R18 是**加分型**（遗传/炎症线索），
+    其 `UNKNOWN` 不得阻断放行——规格原文「仅因未做遗传检测/CRP 不强制所有常规病例升复杂」。
+    真正的资料缺口由 R13 管（核心解剖字段缺失 → 资料核实）。
+    """
+    if not x.g04_blocking:
+        return None
+    # 必须**全部明确 False**：任一条 UNKNOWN 都意味着「判不了」，不能当作没命中。
+    # 例：``n.seal_ifu`` 为「未核验」时 R08 返回 UNKNOWN —— 没核验 ≠ 符合 IFU。
+    all_clear = all(v is False for v in x.g04_blocking)
+    return _and(all_clear, _eq(x.n.cta_status, "完整", "部分"))
+
+
+def g04_r15_genetic_confirmed(x: _Ctx) -> Verdict:
+    return _eq(x.genetic_ctx, "确诊")
+
+
+def g04_r16_inflammatory(x: _Ctx) -> Verdict:
+    return _eq(x.inflammatory_ctx, "临床确认", "影像高度提示")
+
+
+def g04_r17_genetic_suspected(x: _Ctx) -> Verdict:
+    feats = x.gen.syndromic_features
+    feature_hit = True if feats else (None if feats is None else False)
+    return _and(
+        _or(_aaa_confirmed(x), _eq(x.d.dx_context, "疑似")),
+        _or(
+            _lt(x.gen.aaa_age_onset, 60),
+            _eq(x.gen.family_aneurysm, "阳性"),
+            feature_hit,
+        ),
+    )
+
+
+def g04_r18_inflammation_vs_infection(x: _Ctx) -> Verdict:
+    return _and(
+        _eq(x.inflammatory_ctx, "可疑", "影像高度提示", "临床确认"),
+        _eq(x.n.infection_ctx, "医师明确", "高度怀疑"),
+    )
+
+
+# ===========================================================================
+# G08 · 病种分类（11 条）
+# ===========================================================================
+def g08_r01_d1_asymptomatic(x: _Ctx) -> Verdict:
+    aaa = _or(_eq(x.cl.aaa_reported, "确认"), _ge(x.cl.aaa_diam, DIAMETER_AAA_MM))
+    return _and(
+        aaa,
+        _eq(x.cl.symptom_aaa, "无当前症状", "明确归因其他"),
+        _eq(x.cl.aaa_rupture, "未见相关证据"),
+    )
+
+
+def g08_r02_d2_symptomatic_unruptured(x: _Ctx) -> Verdict:
+    aaa = _or(_eq(x.cl.aaa_reported, "确认"), _ge(x.cl.aaa_diam, DIAMETER_AAA_MM))
+    return _and(
+        aaa,
+        _eq(x.cl.symptom_aaa, "医师确认相关", "医师怀疑相关"),
+        _not(_eq(x.cl.aaa_rupture, "明确")),
+    )
+
+
+def g08_r03_d3_ruptured(x: _Ctx) -> Verdict:
+    return _eq(x.cl.aaa_rupture, "明确", "疑似")
+
+
+def g08_r04_d4_infected(x: _Ctx) -> Verdict:
+    return _or(
+        _eq(x.cl.infection, "原生感染明确", "原生感染疑似", "移植物感染明确", "移植物感染疑似"),
+        _eq(x.cl.fistula, "主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似"),
+    )
+
+
+def g08_r05_d5_special(x: _Ctx) -> Verdict:
+    return _or(
+        _eq(x.cl.pau, "明确", "可疑"),
+        _eq(x.cl.imh, "明确", "可疑"),
+        _eq(x.cl.iaad, "明确", "可疑"),
+        _eq(x.cl.saccular, "明确", "疑似"),
+        _eq(x.cl.pseudo, "明确", "疑似"),
+    )
+
+
+def g08_r06_d6_postop(x: _Ctx) -> Verdict:
+    return _and(_not(_eq(x.cl.prev_evor, "无")), _present(x.cl.post_reason))
+
+
+def g08_r07_d7_iliac(x: _Ctx) -> Verdict:
+    return _has(x.cl.iliac_site, "左侧", "右侧", "CIA", "IIA", "EIA")
+
+
+def g08_r08_taaa_iv_label(x: _Ctx) -> Verdict:
+    renal = _or(_eq(x.n.renal_l, "明确受累"), _eq(x.n.renal_r, "明确受累"))
+    return _and(_eq(x.n.thoracic, "否"), _eq(x.n.sma, "明确受累"), _eq(x.n.ca, "明确受累"), renal)
+
+
+def _taaa_grade(v: Verdict) -> TaaaGrade:
+    """``G08.R08`` 的三值 → ``CL.TAAA_IV`` 的四值。
+
+    「疑似」当前**不可达**，这是有意的：三值求值只能给 成立 / 不成立 / 未判定，
+    而「疑似」要求「部分关键字段明确受累、部分可疑」这种细分判据 —— V3.1(2)
+    没给。宁可不产出这个值，也不去猜一个听起来合理的中间态。
+
+    于是映射是确定的：命中 → 符合；明确不命中 → 不符合；有未判定项 → 不可评价。
+    「不可评价」与「不符合」必须分开：前者是资料不足，后者是已排除，混用会
+    让指南引擎把「判不了」当成「不是 Ⅳ 型」而选错条目子集。
+    """
+    if v is True:
+        return "符合"
+    if v is False:
+        return "不符合"
+    return "不可评价"
+
+
+def g08_r09_multi_label_conflict(x: _Ctx) -> Verdict:
+    """D1/D2/D3 互斥；同时出现 ≥2 个即冲突（D3 危险优先）。
+
+    两个来源都要看：① 本轮规则算出的 ``x.labels``；② 抽取层预填的
+    ``cl.diag_multi``（外部给的标签同样可能自相矛盾，不能只信自己算的）。
+    """
+    seen = set(x.labels) | {str(v) for v in (x.cl.diag_multi or [])}
+    return sum(1 for lab in ("D1", "D2", "D3") if lab in seen) >= 2
+
+
+def g08_r10_inflammatory_as_d5_subtype(x: _Ctx) -> Verdict:
+    return _eq(x.inflammatory_ctx, "临床确认", "影像高度提示", "可疑")
+
+
+def g08_r11_genetic_as_modifier(x: _Ctx) -> Verdict:
+    return _eq(x.genetic_ctx, "确诊", "疑似遗传背景")
+
+
+# ===========================================================================
+# G09 · 分类收尾（4 条）
+# ===========================================================================
+def g09_r01_new_emergency_reflow(x: _Ctx) -> Verdict:
+    return _eq(x.k.new_urgent, "是")
+
+
+def g09_r02_identity_conflict(x: _Ctx) -> Verdict:
+    return _or(_eq(x.q.idmatch, "不一致"), _has(x.q.conflict, "身份"))
+
+
+def g09_r03_diagnosis_conflict(x: _Ctx) -> Verdict:
+    if x.diag_conflict is None:
+        return None
+    return x.diag_conflict
+
+
+def g09_r04_classify_and_stop(x: _Ctx) -> Verdict:
+    """正常出口：无新急症 + 冲突已排除 + 至少一个可信标签。
+
+    ``diag_conflict`` 为 ``None``（冲突还没判定）时必须 UNKNOWN ——
+    「不知道有没有冲突」不等于「没有冲突」。
+    """
+    if x.diag_conflict is None:
+        return None
+    if not x.labels:
+        return False
+    return not x.diag_conflict
+
+
+# ===========================================================================
+# 规则登记表（54 条，唯一真源）
+# ===========================================================================
+@dataclass(frozen=True)
+class RuleSpec:
+    func: Callable[[_Ctx], Verdict]
+    source: str
+    exit: NextNode
+    name: str
+    fields: tuple[str, ...] = ()
+    level: EmergencyLevel = "明确危险"
+
+
+LABEL_BY_RULE: dict[str, str] = {
+    "G08.R01": "D1",
+    "G08.R02": "D2",
+    "G08.R03": "D3",
+    "G08.R04": "D4",
+    "G08.R05": "D5",
+    "G08.R06": "D6",
+    "G08.R07": "D7",
+    "G08.R08": "Ⅳ型TAAA扩展",
+    "G08.R10": "D5",
+}
+
+RULES: dict[str, RuleSpec] = {
+    # ---- G03（21）----
+    "G03.R01": RuleSpec(
+        g03_r01_direct_extravasation,
+        "G03!9",
+        "G05",
+        "明确主动脉壁外造影剂外溢",
+        ("c.extrav", "c.extrav_contig", "q.cta_enhance", "c.source_kind"),
+    ),
+    "G03.R02": RuleSpec(
+        g03_r02_aneurysm_with_hematoma,
+        "G03!10",
+        "G05",
+        "主动脉瘤伴相邻血肿",
+        ("c.hematoma", "c.hematoma_adj", "c.aorta"),
+    ),
+    "G03.R03": RuleSpec(
+        g03_r03_rupture_reported,
+        "G03!11",
+        "G05",
+        "医师报告明确主动脉破裂",
+        ("c.rupture_report", "q.idmatch"),
+    ),
+    "G03.R04": RuleSpec(
+        g03_r04_suspected_rupture_unstable,
+        "G03!12",
+        "G05",
+        "疑似破裂伴血流动力学不稳定",
+        ("d.dx_context", "v.sbp", "v.conscious_change", "s.pain_current"),
+        "高度疑似",
+    ),
+    "G03.R05": RuleSpec(
+        g03_r05_aaa_acute_pain_attributed,
+        "G03!13",
+        "G05",
+        "AAA 合并急性相关疼痛",
+        ("s.pain_current", "s.pain_site", "s.pain_attrib"),
+    ),
+    "G03.R06": RuleSpec(
+        g03_r06_aaa_sudden_pain_unattributed,
+        "G03!14",
+        "G05",
+        "已知 AAA + 突发疼痛（归因未定）",
+        ("s.pain_current", "s.pain_onset", "s.pain_attrib"),
+        "高度疑似",
+    ),
+    "G03.R07": RuleSpec(
+        g03_r07_rupture_not_excluded,
+        "G03!15",
+        "G05",
+        "CTA 可疑破裂征象",
+        ("c.rupture_report", "c.extrav", "c.hematoma", "q.report_vs_algo"),
+        "不能排除",
+    ),
+    "G03.R08": RuleSpec(
+        g03_r08_graft_with_gi_bleed,
+        "G03!16",
+        "G05",
+        "主动脉移植物史合并消化道出血",
+        ("d.surg", "s.gi_bleed"),
+    ),
+    "G03.R09": RuleSpec(
+        g03_r09_acute_limb_ischemia,
+        "G03!17",
+        "G05",
+        "急性肢体缺血危险征象",
+        ("s.limb", "s.pulse_deficit", "c.branch"),
+    ),
+    "G03.R10": RuleSpec(
+        g03_r10_news2_critical,
+        "G03!18",
+        "G05",
+        "NEWS2 严重恶化（≥7）",
+        ("v.rr", "v.sbp", "v.hr", "v.spo2", "v.acvpu", "v.temp", "v.oxygen"),
+    ),
+    "G03.R11": RuleSpec(
+        g03_r11_news2_urgent_review,
+        "G03!19",
+        "人工复核",
+        "NEWS2 需紧急复核（5–6 或单项 3）",
+        ("v.rr", "v.sbp", "v.hr", "v.spo2", "v.temp"),
+    ),
+    "G03.R12": RuleSpec(
+        g03_r12_no_enhanced_cta_with_clues,
+        "G03!20",
+        "G05",
+        "无可靠增强 CTA 但有急症线索",
+        ("q.cta_enhance", "q.cta_phase", "d.dx_context"),
+        "不能排除",
+    ),
+    "G03.R13": RuleSpec(
+        g03_r13_key_fact_conflict,
+        "G03!21",
+        "资料核实",
+        "关键事实冲突",
+        ("q.idmatch", "q.conflict", "q.report_vs_algo"),
+    ),
+    "G03.R14": RuleSpec(
+        g03_r14_screen_incomplete,
+        "G03!22",
+        "资料核实",
+        "最低筛查项未满足",
+        ("q.current_assess", "s.pain_present", "v.sbp", "v.hr", "v.acvpu"),
+    ),
+    "G03.R15": RuleSpec(
+        g03_r15_no_emergency_release,
+        "G03!23",
+        "G06",
+        "明确无急症触发后放行",
+        ("q.idmatch", "q.current_assess", "s.pain_present", "s.syncope", "v.sbp"),
+    ),
+    "G03.R16": RuleSpec(
+        g03_r16_suspected_rupture_reported,
+        "G03!24",
+        "G05",
+        "医生明确怀疑破裂（不要求 SBP<80）",
+        ("q.idmatch", "d.dx_context", "c.rupture_report"),
+        "高度疑似",
+    ),
+    "G03.R17": RuleSpec(
+        g03_r17_hb_drop_comparable,
+        "G03!25",
+        "人工复核",
+        "可比 Hb 在窗口内明显下降",
+        ("lab.hb", "lab.hb_prev", "lab.hb_comparable", "lab.hb_confound"),
+    ),
+    "G03.R18": RuleSpec(
+        g03_r18_severe_sudden_pain_no_aaa,
+        "G03!26",
+        "人工复核",
+        "无已知 AAA 但突发剧烈腹背痛",
+        ("s.pain_current", "s.pain_site", "s.pain_onset", "s.pain_severity"),
+    ),
+    "G03.R19": RuleSpec(
+        g03_r19_hb_drop_uncertain,
+        "G03!27",
+        "人工复核",
+        "Hb 差异明显但可比性/干扰未明",
+        ("lab.hb", "lab.hb_prev", "lab.hb_comparable", "lab.hb_confound"),
+    ),
+    "G03.R20": RuleSpec(
+        g03_r20_severe_hypotension,
+        "G03!28",
+        "G05",
+        "严重低血压（不依赖已知 AAA）",
+        ("v.sbp", "q.idmatch"),
+    ),
+    "G03.R21": RuleSpec(
+        g03_r21_lactate_above_uln,
+        "G03!29",
+        "人工复核",
+        "乳酸高于同次检验上限",
+        ("lab.lact", "lab.lact_uln", "q.unit"),
+    ),
+    # ---- G04（18）----
+    "G04.R01": RuleSpec(
+        g04_r01_short_neck,
+        "G04!40",
+        "G06",
+        "短颈型肾下 AAA",
+        ("n.neck_len", "n.renal_l", "n.renal_r"),
+    ),
+    "G04.R02": RuleSpec(
+        g04_r02_juxtarenal,
+        "G04!41",
+        "G06",
+        "近肾型 AAA",
+        ("n.neck_len", "n.renal_l", "n.renal_r"),
+    ),
+    "G04.R03": RuleSpec(
+        g04_r03_pararenal, "G04!42", "G06", "肾旁型 AAA", ("n.renal_l", "n.renal_r", "n.sma")
+    ),
+    "G04.R04": RuleSpec(
+        g04_r04_visceral_pararenal,
+        "G04!43",
+        "G06",
+        "内脏旁型 AAA",
+        ("n.renal_l", "n.renal_r", "n.sma", "n.ca"),
+    ),
+    "G04.R05": RuleSpec(
+        g04_r05_taaa_iv_extension,
+        "G04!44",
+        "G06",
+        "Ⅳ型 TAAA 扩展",
+        ("n.renal_l", "n.sma", "n.ca", "n.thoracic"),
+    ),
+    "G04.R06": RuleSpec(
+        g04_r06_beyond_project_boundary, "G04!45", "G06", "超过Ⅳ型 TAAA 项目边界", ("n.thoracic",)
+    ),
+    "G04.R07": RuleSpec(
+        g04_r07_infection_or_fistula,
+        "G04!46",
+        "G06",
+        "感染或主动脉相关瘘",
+        ("n.infection_ctx", "n.fistula_ctx"),
+    ),
+    "G04.R08": RuleSpec(
+        g04_r08_ifu_mismatch, "G04!47", "G06", "已核验的器械近端 IFU 不适配", ("n.seal_ifu",)
+    ),
+    "G04.R09": RuleSpec(
+        g04_r09_iliac_limitation,
+        "G04!48",
+        "G06",
+        "内髂灌注及双侧髂动脉限制",
+        ("n.iliac_bilat", "n.iia_left", "n.iia_right"),
+    ),
+    "G04.R10": RuleSpec(
+        g04_r10_access_occlusion, "G04!49", "G06", "常规股动脉通路受限", ("n.access_occlusion",)
+    ),
+    "G04.R11": RuleSpec(
+        g04_r11_prior_repair_reintervention,
+        "G04!50",
+        "G06",
+        "重要 EVAR/OSR 术后再干预线索",
+        ("n.prev_repair", "n.endoleak_type", "n.sac_growth"),
+    ),
+    "G04.R12": RuleSpec(
+        g04_r12_physiologic_risk,
+        "G04!51",
+        "G06",
+        "重要生理风险需综合评估",
+        ("n.egfr", "n.dialysis", "n.heart_class", "n.resp_support"),
+    ),
+    "G04.R13": RuleSpec(
+        g04_r13_insufficient_for_low_complexity,
+        "G04!52",
+        "资料核实",
+        "资料不足不允许判为低复杂",
+        ("n.cta_status", "n.neck_len", "n.renal_l", "n.sma", "n.ca"),
+    ),
+    "G04.R14": RuleSpec(
+        g04_r14_low_complexity_to_guideline,
+        "G04!53",
+        "G07",
+        "低复杂进入指南模式",
+        ("n.cta_status",),
+    ),
+    "G04.R15": RuleSpec(
+        g04_r15_genetic_confirmed,
+        "G04!54",
+        "G06",
+        "已明确遗传综合征或遗传性主动脉病",
+        ("n.genetic_ctx",),
+    ),
+    "G04.R16": RuleSpec(
+        g04_r16_inflammatory,
+        "G04!55",
+        "G06",
+        "炎症性 AAA 明确或影像高度提示",
+        ("n.inflammatory_ctx", "inf.mantle_sign", "inf.wall_fibrosis"),
+    ),
+    "G04.R17": RuleSpec(
+        g04_r17_genetic_suspected,
+        "G04!56",
+        "G06",
+        "存在遗传评估线索但尚未确诊",
+        ("gen.aaa_age_onset", "gen.family_aneurysm", "gen.syndromic_features"),
+    ),
+    "G04.R18": RuleSpec(
+        g04_r18_inflammation_vs_infection,
+        "G04!57",
+        "G06",
+        "炎症与感染的鉴别",
+        ("n.inflammatory_ctx", "n.infection_ctx"),
+    ),
+    # ---- G08（11）----
+    "G08.R01": RuleSpec(
+        g08_r01_d1_asymptomatic,
+        "G08!21",
+        "G06",
+        "D1 无症状 AAA 入口",
+        ("cl.aaa_reported", "cl.symptom_aaa", "cl.aaa_rupture"),
+    ),
+    "G08.R02": RuleSpec(
+        g08_r02_d2_symptomatic_unruptured,
+        "G08!22",
+        "G06",
+        "D2 症状性未破裂 AAA 入口",
+        ("cl.aaa_reported", "cl.symptom_aaa", "cl.aaa_rupture"),
+    ),
+    "G08.R03": RuleSpec(
+        g08_r03_d3_ruptured,
+        "G08!23",
+        "G06",
+        "D3 破裂/疑似破裂 AAA 入口",
+        ("cl.aaa_rupture", "cl.aaa_reported"),
+    ),
+    "G08.R04": RuleSpec(
+        g08_r04_d4_infected,
+        "G08!24",
+        "G06",
+        "D4 感染性主动脉病变入口",
+        ("cl.infection", "cl.fistula"),
+    ),
+    "G08.R05": RuleSpec(
+        g08_r05_d5_special,
+        "G08!25",
+        "G06",
+        "D5 特殊主动脉病变入口",
+        ("cl.pau", "cl.imh", "cl.iaad", "cl.saccular", "cl.pseudo"),
+    ),
+    "G08.R06": RuleSpec(
+        g08_r06_d6_postop,
+        "G08!26",
+        "G06",
+        "D6 EVAR/OSR 术后入口",
+        ("cl.prev_evor", "cl.post_reason"),
+    ),
+    "G08.R07": RuleSpec(
+        g08_r07_d7_iliac, "G08!27", "G06", "D7 髂动脉瘤入口", ("cl.iliac_site", "cl.iliac_diam")
+    ),
+    "G08.R08": RuleSpec(
+        g08_r08_taaa_iv_label,
+        "G08!28",
+        "G06",
+        "Ⅳ型 TAAA 扩展标签",
+        ("n.thoracic", "n.sma", "n.ca"),
+    ),
+    "G08.R09": RuleSpec(
+        g08_r09_multi_label_conflict, "G08!29", "人工复核", "多标签与冲突处理", ("cl.diag_multi",)
+    ),
+    "G08.R10": RuleSpec(
+        g08_r10_inflammatory_as_d5_subtype,
+        "G08!30",
+        "G06",
+        "炎症性 AAA 归入 D5 特殊病种",
+        ("n.inflammatory_ctx", "inf.mantle_sign"),
+    ),
+    "G08.R11": RuleSpec(
+        g08_r11_genetic_as_modifier,
+        "G08!31",
+        "G06",
+        "遗传综合征保留为病因修饰标签",
+        ("n.genetic_ctx", "gen.syndrome_type"),
+    ),
+    # ---- G09（4）----
+    "G09.R01": RuleSpec(
+        g09_r01_new_emergency_reflow, "G09!7", "G05", "发现新急症立即回流", ("k.new_urgent",)
+    ),
+    "G09.R02": RuleSpec(
+        g09_r02_identity_conflict,
+        "G09!8",
+        "资料核实",
+        "身份或关键数据冲突",
+        ("q.idmatch", "q.conflict"),
+    ),
+    "G09.R03": RuleSpec(
+        g09_r03_diagnosis_conflict,
+        "G09!9",
+        "人工复核",
+        "病种判断相互矛盾",
+        ("cl.diag_multi", "k.diag_conflict"),
+    ),
+    "G09.R04": RuleSpec(
+        g09_r04_classify_and_stop,
+        "G09!10",
+        "G06",
+        "输出疾病分类并停止",
+        ("k.classifiable", "k.class_output"),
+    ),
+}
+
+assert len(RULES) == 54, f"V3.1(2) 有 54 条判定规则，实际 {len(RULES)}"
+
+# G03 优先级桶（P01–P04 是分组，不是规则，不进 RULES）
+G03_P01 = (
+    "G03.R01",
+    "G03.R02",
+    "G03.R03",
+    "G03.R04",
+    "G03.R05",
+    "G03.R06",
+    "G03.R07",
+    "G03.R08",
+    "G03.R09",
+    "G03.R10",
+    "G03.R12",
+    "G03.R16",
+    "G03.R20",
+)
+G03_P02 = ("G03.R11", "G03.R17", "G03.R18", "G03.R19", "G03.R21")
+G03_P03 = ("G03.R13", "G03.R14")
+G03_P04 = ("G03.R15",)
+G04_BLOCKING = (
+    "G04.R01",
+    "G04.R02",
+    "G04.R03",
+    "G04.R04",
+    "G04.R05",
+    "G04.R06",
+    "G04.R07",
+    "G04.R08",
+    "G04.R09",
+    "G04.R10",
+    "G04.R11",
+    "G04.R12",
+)
+"""阻断型：命中即判复杂；其 UNKNOWN 也不是放行理由（交给 R13 兜）。"""
+G04_EXTRA = ("G04.R15", "G04.R16", "G04.R17", "G04.R18")
+"""加分型：遗传/炎症线索。命中→复杂；其 UNKNOWN **不阻断** G07 放行。"""
+G08_RULES = (
+    "G08.R01",
+    "G08.R02",
+    "G08.R03",
+    "G08.R04",
+    "G08.R05",
+    "G08.R06",
+    "G08.R07",
+    "G08.R08",
+)
+
+
+# ===========================================================================
+# 编排
+# ===========================================================================
+def _read_path(case: VascCase, path: str) -> object:
+    obj: object = case
+    for part in path.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def _collect_gaps(x: _Ctx, rule_ids: tuple[str, ...], trace: list[RuleTrace]) -> list[str]:
+    """把**导致 UNKNOWN 的**空字段列成缺口清单（去重、保序）。
+
+    只统计求值结果为 ``UNKNOWN`` 的规则。原因：``True``（命中）与 ``False``
+    （确定不成立）都意味着该规则已闭环，此时它声明的其余字段即使为空也**不是缺口**
+    —— 例如无既往修复时 ``CL.POST_REASON`` 本就该空，若照收会把 ``confidence_level``
+    从「高」拉低到「中」，让与本次判定无关的字段污染置信度分级。
+    没跑过的规则（前面已命中而提前返回）同理不收。
+    """
+    verdicts = {t.rule_id: t.verdict for t in trace}
+    gaps: list[str] = []
+    for rid in rule_ids:
+        if verdicts.get(rid, False) is not None:
+            continue
+        for path in RULES[rid].fields:
+            if path in gaps:
+                continue
+            val = _read_path(x.case, path)
+            if val is None or _is_uncertain_token(_token(val)) or val == []:
+                gaps.append(path)
+    return gaps + [g for g in x.gaps_extra if g not in gaps]
+
+
+def _confidence(gaps: list[str], unknown_decisive: bool) -> ConfidenceLevel:
+    if unknown_decisive:
+        return "低"
+    return "中" if gaps else "高"
+
+
+def _run(x: _Ctx, rule_ids: tuple[str, ...], trace: list[RuleTrace]) -> tuple[str | None, bool]:
+    """按顺序求值；返回 ``(首个命中的 rule_id, 期间是否出现 UNKNOWN)``。"""
+    has_unknown = False
+    for rid in rule_ids:
+        v = RULES[rid].func(x)
+        trace.append(RuleTrace(rid, v, RULES[rid].exit))
+        if v is True:
+            return rid, has_unknown
+        if v is None:
+            has_unknown = True
+    return None, has_unknown
+
+
+def _classifiable(x: _Ctx) -> str:
+    if not x.labels:
+        return "不能分类"
+    return "疑似" if x.diag_conflict else "确定"
+
+
+def _make(
+    x: _Ctx,
     *,
-    manual_review: bool = False,
+    kind: RouteKind,
+    rule_id: str,
+    reason: str,
+    next_node: NextNode,
+    level: EmergencyLevel,
+    mode: RouteMode | None = None,
+    gaps: list[str] | None = None,
+    unknown_decisive: bool = False,
+    trace: list[RuleTrace] | None = None,
 ) -> RouteResult:
-    """汇总派生字段并计算置信度。"""
-    # 判定层标记（供 VascCase 回填，也供审计）
-    is_special = any(t.order == "P2" and t.result for t in trace)
-    complex_anat = any(t.order == "P3" and t.result for t in trace)
-    severe_comorb = any(t.order == "P4" and t.result for t in trace)
-
-    confidence = BASE_CONFIDENCE
-    if missing:
-        confidence *= MISSING_PENALTY
-    confidence = round(confidence, 2)
-
-    manual = manual_review or bool(missing) or _is_truthy(case.evidence_conflict)
-
+    gap_list = gaps or []
     return RouteResult(
-        route_mode=mode,
+        kind=kind,
+        rule_id=rule_id,
         reason=reason,
-        urgency_triggered=urgency_triggered,
-        is_special_lesion=is_special,
-        complex_anatomy=complex_anat,
-        severe_comorbidity=severe_comorb,
-        guideline_eligible=(mode is RouteMode.GUIDELINE),
-        missing_critical_fields=missing,
-        confidence=confidence,
-        manual_review_required=manual,
-        ruleset_version=RULESET_VERSION,
+        next_node=next_node,
+        emergency_level=level,
+        mode=mode,
+        evidence_gaps=gap_list,
+        confidence_level=_confidence(gap_list, unknown_decisive),
+        class_output=list(x.labels),
+        cl_taaa_iv=x.taaa_iv,
+        k_identity_conflict="是" if _token(x.q.idmatch) == "不一致" else None,
+        k_diag_conflict=None if x.diag_conflict is None else ("是" if x.diag_conflict else "否"),
+        k_classifiable=_classifiable(x),
+        trace=trace or [],
+    )
+
+
+def route(case: VascCase, measurement: VascMeasurement | None = None) -> RouteResult:
+    """术前路由主入口：G03 → G04 →（G05 | G06 | G07）→ G08 → G09。
+
+    参数：
+        case: V3.1(2) 病例（160 字段）。
+        measurement: 工具 B 的影像量化值；为 ``None`` 时按 B6 回落读 ``CL.AAA_DIAM``，
+            并在 ``evidence_gaps`` 里登记 ``数据源=报告值``（不与量化值混淆）。
+
+    返回：
+        :class:`RouteResult`：出口 / 命中规则 / 缺口清单 / 置信度分级 / 判定轨迹。
+    """
+    x = _Ctx(case, measurement)
+    trace: list[RuleTrace] = []
+
+    if measurement is None and case.cl.aaa_diam is None and case.c.maxd is not None:
+        x.gaps_extra.append("cl.aaa_diam（缺量化值，已回落报告值 c.maxd，修复阈值不可用）")
+
+    # ---- 人工越级：urgency_flag 置位直接进 G05 ----
+    if case.urgency_flag:
+        return _make(
+            x,
+            kind=RouteKind.MODE,
+            rule_id=MANUAL_URGENCY,
+            reason=f"{MANUAL_URGENCY} 医生人工置位 urgency_flag：直接按急症处理，跳过自动判定。",
+            next_node="G05",
+            level="明确危险",
+            mode=RouteMode.EMERGENCY,
+            gaps=_collect_gaps(x, G03_P01, trace),
+            trace=trace,
+        )
+
+    # ---- G03：急诊 ----
+    hit, _ = _run(x, G03_P01, trace)
+    if hit:
+        return _make(
+            x,
+            kind=RouteKind.MODE,
+            rule_id=hit,
+            reason=f"{hit} {RULES[hit].name}：命中急诊条件，进入急诊模式（G05）。",
+            next_node="G05",
+            level=RULES[hit].level,
+            mode=RouteMode.EMERGENCY,
+            gaps=_collect_gaps(x, G03_P01, trace),
+            trace=trace,
+        )
+
+    hit, unknown = _run(x, G03_P02, trace)
+    if hit:
+        return _make(
+            x,
+            kind=RouteKind.REVIEW,
+            rule_id=hit,
+            reason=f"{hit} {RULES[hit].name}：需人工临床复核，不能当作无急症。",
+            next_node="人工复核",
+            level="未触发",
+            gaps=_collect_gaps(x, G03_P02, trace),
+            unknown_decisive=unknown,
+            trace=trace,
+        )
+
+    hit, _ = _run(x, G03_P03, trace)
+    if hit:
+        return _make(
+            x,
+            kind=RouteKind.VERIFY,
+            rule_id=hit,
+            reason=f"{hit} {RULES[hit].name}：资料冲突或筛查不完整，先核实再判定。",
+            next_node="资料核实",
+            level="未触发",
+            gaps=_collect_gaps(x, G03_P03, trace),
+            trace=trace,
+        )
+
+    release = RULES["G03.R15"].func(x)
+    trace.append(RuleTrace("G03.R15", release, "G06"))
+    if release is not True:
+        return _make(
+            x,
+            kind=RouteKind.VERIFY,
+            rule_id=FALLBACK_VERIFY,
+            reason=(
+                f"{FALLBACK_VERIFY} 急诊 P01–P03 均未命中，但存在未判定项（UNKNOWN）："
+                "资料不足不下结论，转资料核实。"
+            ),
+            next_node="资料核实",
+            level="未触发",
+            gaps=_collect_gaps(x, G03_P01 + G03_P02 + G03_P03, trace),
+            unknown_decisive=True,
+            trace=trace,
+        )
+
+    # ---- G04：复杂度 ----
+    for rid in G04_BLOCKING:
+        v = RULES[rid].func(x)
+        x.g04_blocking.append(v)
+        trace.append(RuleTrace(rid, v, "G06"))
+        if v is True:
+            return _finish_mode(x, "G06", RouteMode.COMPLEX, rid, trace)
+
+    # 遗传/炎症线索：命中即复杂；UNKNOWN 不算命中、也不阻断放行（规格明文）
+    for rid in G04_EXTRA:
+        v = RULES[rid].func(x)
+        trace.append(RuleTrace(rid, v, "G06"))
+        if v is True:
+            return _finish_mode(x, "G06", RouteMode.COMPLEX, rid, trace)
+
+    v13 = RULES["G04.R13"].func(x)
+    trace.append(RuleTrace("G04.R13", v13, "资料核实"))
+    if v13 is True:
+        return _make(
+            x,
+            kind=RouteKind.VERIFY,
+            rule_id="G04.R13",
+            reason=f"G04.R13 {RULES['G04.R13'].name}：转资料核实。",
+            next_node="资料核实",
+            level="未触发",
+            gaps=_collect_gaps(x, (*G04_BLOCKING, *G04_EXTRA, "G04.R13"), trace),
+            trace=trace,
+        )
+
+    v14 = RULES["G04.R14"].func(x)
+    trace.append(RuleTrace("G04.R14", v14, "G07"))
+    if v14 is True:
+        return _finish_mode(x, "G07", RouteMode.GUIDELINE, "G04.R14", trace)
+
+    return _make(
+        x,
+        kind=RouteKind.VERIFY,
+        rule_id=FALLBACK_VERIFY,
+        reason=(
+            f"{FALLBACK_VERIFY} 复杂（G04.R01–R12）与低复杂（G04.R14）均无法确认，"
+            "资料不足不下结论，转资料核实。"
+        ),
+        next_node="资料核实",
+        level="未触发",
+        gaps=_collect_gaps(x, (*G04_BLOCKING, *G04_EXTRA, "G04.R13", "G04.R14"), trace),
+        unknown_decisive=True,
+        trace=trace,
+    )
+
+
+def _finish_mode(
+    x: _Ctx, next_node: NextNode, mode: RouteMode, rule_id: str, trace: list[RuleTrace]
+) -> RouteResult:
+    """进入模式后继续跑 G08/G09：产出病种标签、处理冲突与回流。"""
+    for rid in G08_RULES:
+        v = RULES[rid].func(x)
+        trace.append(RuleTrace(rid, v, "G06"))
+        if rid == "G08.R08":
+            # CL.TAAA_IV 是判定产物：算法在这里一次性固化，随 RouteResult 下去，
+            # 不让下游工具自己重算（那会变成第二处判据）。
+            x.taaa_iv = _taaa_grade(v)
+        if v is True and LABEL_BY_RULE[rid] not in x.labels:
+            x.labels.append(LABEL_BY_RULE[rid])
+
+    if RULES["G08.R10"].func(x) is True and "D5" not in x.labels:
+        x.labels.append("D5")
+        trace.append(RuleTrace("G08.R10", True, "G06"))
+    if RULES["G08.R11"].func(x) is True:
+        trace.append(RuleTrace("G08.R11", True, "G06"))
+
+    conflict = RULES["G08.R09"].func(x)
+    x.diag_conflict = bool(conflict)
+    trace.append(RuleTrace("G08.R09", conflict, "人工复核"))
+
+    # G09.R01 回流优先于模式（优先级 G03 回流 > G06）
+    if RULES["G09.R01"].func(x) is True:
+        trace.append(RuleTrace("G09.R01", True, "G05"))
+        return _make(
+            x,
+            kind=RouteKind.MODE,
+            rule_id="G09.R01",
+            reason="G09.R01 分类期间出现新的危险证据：立即回流 G03/G05，不得因分类进行中而延迟。",
+            next_node="G05",
+            level="明确危险",
+            mode=RouteMode.EMERGENCY,
+            gaps=_collect_gaps(x, ("G09.R01",), trace),
+            trace=trace,
+        )
+
+    # G09.R02：身份/来源冲突 → 隔离不可信记录，转资料核实（排在 R03 之前）
+    if RULES["G09.R02"].func(x) is True:
+        trace.append(RuleTrace("G09.R02", True, "资料核实"))
+        return _make(
+            x,
+            kind=RouteKind.VERIFY,
+            rule_id="G09.R02",
+            reason="G09.R02 身份或来源冲突：隔离不可信记录，先核实再分类（保留其他已确认警报）。",
+            next_node="资料核实",
+            level="未触发",
+            gaps=_collect_gaps(x, ("G09.R02",), trace),
+            unknown_decisive=True,
+            trace=trace,
+        )
+
+    # G09.R04 是正常出口：无新急症 + 无冲突 + 至少一个可信标签
+    trace.append(RuleTrace("G09.R04", RULES["G09.R04"].func(x), "G06"))
+
+    if x.diag_conflict:
+        trace.append(RuleTrace("G09.R03", True, "人工复核"))
+        return _make(
+            x,
+            kind=RouteKind.REVIEW,
+            rule_id="G09.R03",
+            reason=f"G09.R03 病种标签冲突（{'/'.join(x.labels)}）：不得自动择一，需人工复核。",
+            next_node="人工复核",
+            level="未触发",
+            gaps=_collect_gaps(x, ("G08.R09", "G09.R03"), trace),
+            trace=trace,
+        )
+
+    return _make(
+        x,
+        kind=RouteKind.MODE,
+        rule_id=rule_id,
+        reason=f"{rule_id} {RULES[rule_id].name}：进入{mode.value}；病种标签 {x.labels or '未形成'}。",
+        next_node=next_node,
+        level="未触发",
+        mode=mode,
+        gaps=_collect_gaps(x, (*G08_RULES, "G04.R14"), trace),
         trace=trace,
     )
 
 
 __all__ = [
-    "ACCESS_DIAMETER_THRESHOLD_MM",
-    "AFFIRMATIVE_VALUE",
-    "BASE_CONFIDENCE",
-    "COMPLEX_ANATOMY_LEVELS",
-    "COMPLEX_PRIOR_REPAIR",
-    "GUIDELINE_CATEGORIES",
-    "MISSING_PENALTY",
-    "NECK_ANGLE_THRESHOLD_DEG",
-    "NECK_LENGTH_THRESHOLD_MM",
-    "NECK_THROMBUS_CALC_THRESHOLD_PCT",
-    "POSTOP_COMPLICATION_KEYWORDS",
-    "SPECIAL_SUBTYPE_KEYWORDS",
+    "FALLBACK_VERIFY",
+    "G03_P01",
+    "G03_P02",
+    "G03_P03",
+    "G03_P04",
+    "G04_BLOCKING",
+    "G04_EXTRA",
+    "G08_RULES",
+    "LABEL_BY_RULE",
+    "MANUAL_URGENCY",
+    "OUTCOME_PRIORITY",
+    "RULES",
+    "RouteKind",
     "RouteResult",
-    "StepTrace",
-    "collect_missing_critical_fields",
+    "RuleSpec",
+    "RuleTrace",
+    "TaaaGrade",
     "route",
 ]

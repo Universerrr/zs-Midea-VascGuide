@@ -6,9 +6,14 @@
     指南章节 → 推荐序号 → DOI。
 
 输入契约（``SPEC.consumes``）：
-    ``case.disease_category``  病种 —— 决定查哪一族条目
-    ``case.anatomy_level``     解剖分型 —— 决定条目子集
-    ``case.max_diameter_mm``   主动脉最大径 —— 决定 A01（小型）/ A02（较大）档位
+    ``case.cl.diag_multi``       病种标签 —— 决定查哪一族条目
+    ``case.c.maxd``              主动脉最大径（CTA 报告提取值）—— 决定 A01（小型）/
+                                 A02（较大）档位。**不是** ``cl.aaa_diam``：后者是
+                                 工具 B 的影像量化值，用报告值才能保证总有输入
+                                 （B6 回落口径）
+    ``route_result.cl_taaa_iv``  解剖分型 —— 决定条目子集。取值 符合 / 疑似 /
+                                 不符合 / 不可评价。「不可评价」必须单独处理：
+                                 资料不足 ≠ 不是 Ⅳ 型，不能按「否」选条目
 
 输出契约：
     ``tuple[GuidelineEntry, ...]``，按相关度降序。每条至少含四个属性：
@@ -34,11 +39,17 @@
        ``10.1016/j.ejvs.2023.11.002``）。
     4. 条目库需要「结构化入库 + 检索接口」，而不是运行时读 Excel：
        ``docs/`` 是口径原件，运行时依赖它会让审计无法复现（文件会被改）。
-    5. **已知缺口（待口径裁定，勿擅自补）**：``consumes`` 未含
-       ``iliac_diameter_mm``，而设计表第 9 条要求髂瘤 40mm 单独分层。
-       该阈值当前无处落地——补齐前不要在本工具里硬编码 40mm，
-       也不要把直径判定搬回 ``router.py``（``05_说明与待确认`` 第 17 条与
-       ``03_P1-P8判定映射`` 的 P7 行对此**自相矛盾**，须先裁定）。
+    5. **已知缺口（待口径裁定，勿擅自补）**：``consumes`` 未含 ``CL.ILIAC_DIAM``，
+       而设计表第 9 条要求髂瘤 40mm 单独分层。该值在 V3.1(2) 里已有落点
+       （``case.cl.iliac_diam``），但「40mm 是否单列一档、算不算 ESVS 原文阈值」
+       尚未裁定——补齐前不要在本工具里硬编码 40mm，也不要把直径判定搬回
+       ``router.py``（``05_说明与待确认`` 第 17 条与 ``03_P1-P8判定映射`` 的
+       P7 行对此**自相矛盾**，须先裁定）。
+    6. 解剖分型 ``CL.TAAA_IV`` 是**判定产物**（不进 ``VascCase``），已由
+       ``RouteResult.cl_taaa_iv`` 带出（2026-10-26 裁定，与 ``K.*`` 回填同路）。
+       本工具**从 ``request.route_result`` 读**，不得从 ``c.aorta`` + ``c.maxd``
+       重算——那是第二处判据。取「不可评价」时按资料不足处理：宁可少给条目，
+       也不要按「不是 Ⅳ 型」错选子集。
 """
 
 from __future__ import annotations
@@ -52,7 +63,11 @@ __all__ = ["SPEC", "run"]
 SPEC = ToolSpec(
     key="guideline_engine",
     label="工具A · 指南引擎",
-    consumes=("case.disease_category", "case.anatomy_level", "case.max_diameter_mm"),
+    consumes=(
+        "case.cl.diag_multi",
+        "case.c.maxd",
+        "route_result.cl_taaa_iv",
+    ),
     produces="指南推荐条目（并入 FinalRecommendation）",
     depends_on=(),
     blocked_reason=(
@@ -66,8 +81,8 @@ def run(request: ToolRequest) -> Any:
     """查条目库，返回本病例命中的指南条目。
 
     参数：
-        request: 至少需 ``case.disease_category`` / ``case.anatomy_level`` /
-            ``case.max_diameter_mm``。
+        request: 病种取 ``request.case.cl.diag_multi``、直径取
+            ``request.case.c.maxd``、解剖分型取 ``request.route_result.cl_taaa_iv``。
 
     返回：
         ``tuple[GuidelineEntry, ...]``，无命中时为空元组。

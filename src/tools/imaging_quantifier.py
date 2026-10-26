@@ -1,8 +1,8 @@
 """工具B · 影像量化器 —— CTA 影像 → VascMeasurement（容积 / 各节段直径 / 钙化）。
 
 定位：
-    解剖测量的**真值来源**。``VascCase`` 里的 ``neck_length_mm`` / ``neck_angle_deg`` /
-    ``access_diameter_mm`` 只是「门控用的浅层读数」（设计表 ``05_说明与待确认`` 第 8 条），
+    解剖测量的**真值来源**。``VascCase`` 里的 ``n.neck_len`` / ``n.neck_angle`` /
+    ``cl.iliac_diam`` 只是「门控用的浅层读数」（设计表 ``05_说明与待确认`` 第 8 条），
     精密量化属于本工具，产物写回旁路模型 ``VascMeasurement``，**不回写 VascCase**。
 
 输入契约：

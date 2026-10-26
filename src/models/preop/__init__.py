@@ -7,6 +7,7 @@
     AnatomyScore         解剖评分器 C 的产物      （assessment.py）
     RiskAssessment       风险评估器 E 的产物      （assessment.py）
     FinalRecommendation  决策产物（聚合输出层）     （recommendation.py）
+    RouteMode            路由模式三值（FinalRecommendation 的取值域）
 
 数据流（关键）：
     VascCase 被多方读取 → 各路工具产物各自独立成模型，**不回写 VascCase**。
@@ -24,36 +25,44 @@
                           ▼
               FinalRecommendation（决策产物）
 
-共享枚举见 src/models/enums.py。
+共享枚举已各归其消费者：``RouteMode`` 在本包 ``recommendation.py``，
+``FieldWriter`` 在 ``src/models/audit.py``。
 """
 
 from .assessment import AnatomyScore, RiskAssessment
 from .case import (
-    AUDIT_FIELDS,
-    CRITICAL_FACT_FIELDS,
-    ENUM_FACT_FIELDS,
-    ONE_DECIMAL_FIELDS,
+    DOMAIN_FIELD_COUNTS,
+    TOTAL_FIELD_COUNT,
+    UNCERTAIN_TOKENS,
     VascCase,
     apply_route_result,
     derive,
+    is_uncertain,
 )
 from .measurement import CenterlinePoint, VascMeasurement
-from .recommendation import DecisionStep, EvidenceItem, FinalRecommendation, ToolFinding
+from .recommendation import (
+    DecisionStep,
+    EvidenceItem,
+    FinalRecommendation,
+    RouteMode,
+    ToolFinding,
+)
 
 __all__ = [
-    "AUDIT_FIELDS",
-    "CRITICAL_FACT_FIELDS",
-    "ENUM_FACT_FIELDS",
-    "ONE_DECIMAL_FIELDS",
+    "DOMAIN_FIELD_COUNTS",
+    "TOTAL_FIELD_COUNT",
+    "UNCERTAIN_TOKENS",
     "AnatomyScore",
     "CenterlinePoint",
     "DecisionStep",
     "EvidenceItem",
     "FinalRecommendation",
     "RiskAssessment",
+    "RouteMode",
     "ToolFinding",
     "VascCase",
     "VascMeasurement",
     "apply_route_result",
     "derive",
+    "is_uncertain",
 ]

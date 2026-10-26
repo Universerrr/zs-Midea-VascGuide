@@ -1,8 +1,9 @@
 """输出层节点 —— 把判定结果聚合为 :class:`FinalRecommendation`（决策产物）。
 
 本层做五件事（全部**机械可验证**，无一处自由裁量）：
-    ① ``trace → decision_path``：``StepTrace`` 与 ``DecisionStep`` 字段 1:1 对应，
-       逐条直转，**含被否决项**（审计要求：不得只留命中项）；
+    ① ``trace → decision_path``：``RuleTrace`` → ``DecisionStep``，**含被否决项**
+       （审计要求：不得只留命中项）。三值结果原样保留 —— ``None`` 是「未判定」，
+       转成 ``False`` 会把「资料不足」伪装成「已排除」；
     ② ``ruleset_version``：直接取自 :class:`RouteResult` 的复合版本串；
     ③ ``input_snapshot_hash``：取自输入层算好的输入快照哈希；
     ④ ``evidence_chain``：路由结论的依据 + ``VascCase.field_evidence`` 里每个
@@ -57,7 +58,7 @@ from ...models.preop.recommendation import (
     FinalRecommendation,
     ToolFinding,
 )
-from ...rules.router import RouteResult, StepTrace
+from ...rules.router import RULES, RouteKind, RouteResult, RuleTrace, _read_path
 from ..execution_layer.registry import SPEC_BY_KEY
 from ..state import PreopState
 
@@ -171,34 +172,34 @@ def build_tool_findings(tool_outputs: Mapping[str, Any]) -> list[ToolFinding]:
     return findings
 
 
-def _to_decision_steps(trace: Sequence[StepTrace]) -> list[DecisionStep]:
-    """``StepTrace`` → ``DecisionStep``：逐条直转，**保留全部被否决步骤**。
+def _to_decision_steps(trace: Sequence[RuleTrace]) -> list[DecisionStep]:
+    """``RuleTrace`` → ``DecisionStep``：**保留全部被否决步骤**，三值结果原样保留。
 
-    两个字段的对应关系是 1:1（order / condition / result / rule_ref / note），
-    无需任何映射表。``note`` 为空串时转 ``None``，避免出现「有 note 字段但内容为空」。
+    映射是机械的（但不再 1:1，因为 ``RuleTrace`` 只有三格）：
+
+    ============  =====================================
+    DecisionStep   来源
+    ============  =====================================
+    order          轨迹中的位置（从 1 起）
+    condition      ``RULES[rule_id].name``（规则名）
+    result         ``verdict``（True / False / None 三值）
+    rule_ref       ``rule_id``
+    note           ``RULES[rule_id].source``（V3.1(2) 源单元格）
+    ============  =====================================
     """
-    return [
-        DecisionStep(
-            order=step.order,
-            condition=step.condition,
-            result=step.result,
-            rule_ref=step.rule_ref,
-            note=step.note or None,
+    steps: list[DecisionStep] = []
+    for index, entry in enumerate(trace, start=1):
+        spec = RULES.get(entry.rule_id)
+        steps.append(
+            DecisionStep(
+                order=index,
+                condition=spec.name if spec else entry.rule_id,
+                result=entry.verdict,
+                rule_ref=entry.rule_id,
+                note=spec.source if spec else None,
+            )
         )
-        for step in trace
-    ]
-
-
-def _decisive_step(trace: Sequence[StepTrace]) -> StepTrace | None:
-    """取**最终命中**的那一步。
-
-    流水线是「自上而下、命中即短路」，故最后一个 ``result=True`` 的步骤就是
-    决定最终模式的步骤（P0a/P0b 是预处理登记步，若后续全不命中才会成为末项）。
-    """
-    for step in reversed(trace):
-        if step.result:
-            return step
-    return None
+    return steps
 
 
 def _build_evidence(case: VascCase, result: RouteResult) -> list[EvidenceItem]:
@@ -208,11 +209,11 @@ def _build_evidence(case: VascCase, result: RouteResult) -> list[EvidenceItem]:
     """
     items: list[EvidenceItem] = []
 
-    decisive = _decisive_step(result.trace)
+    mode_text = result.mode.value if result.mode else result.next_node
     items.append(
         EvidenceItem(
-            statement=f"路由结论：{result.route_mode.value}；依据：{result.reason}",
-            rule_ref=decisive.rule_ref if decisive else None,
+            statement=f"路由结论：{mode_text}；依据：{result.reason}",
+            rule_ref=result.rule_id,
         )
     )
 
@@ -221,7 +222,7 @@ def _build_evidence(case: VascCase, result: RouteResult) -> list[EvidenceItem]:
         items.append(
             EvidenceItem(
                 statement=(
-                    f"字段 {field_name} = {_render(getattr(case, field_name, None))}"
+                    f"字段 {field_name} = {_render(_read_path(case, field_name))}"
                     f"（写入者：{provenance.writer.value}）"
                 ),
                 source=provenance.source_quote,
@@ -246,12 +247,12 @@ def output_node(state: PreopState) -> dict[str, Any]:
 
     recommendation = FinalRecommendation(
         case_id=case.case_id,
-        route_mode=result.route_mode,
+        route_mode=result.mode,
         # 留白一：等临床口径（见模块文档）。
         primary_recommendation=PRIMARY_RECOMMENDATION_PLACEHOLDER,
         treatment_options=[],
-        confidence=result.confidence,
-        manual_review_required=result.manual_review_required,
+        confidence_level=result.confidence_level,
+        manual_review_required=result.kind is RouteKind.REVIEW,
         evidence_chain=_build_evidence(case, result),
         decision_path=_to_decision_steps(result.trace),
         # 工具产物 → 呈现条目；未跑的工具不出现在这里（不编造「跑了但没结果」）。

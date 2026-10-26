@@ -1,548 +1,651 @@
-"""VascCase —— 术前输入层数据模型。
+"""V3.1(2) 术前字段模型 —— **160 字段 / 14 个按域子模型**。
 
-定位（核心）：
-    VascCase = LLM 从病历与 CTA 报告**一次抽取**出的「术前输入事实全集」。
-    - 路由读取其中一部分（判定层字段）；
-    - 后续影像量化 / 解剖评分 / 风险评估 / 指南引擎也各读取其中一部分；
-    - **工具算出的产物不回写本模型**（分别归 VascMeasurement / AnatomyScore /
-      RiskAssessment / FinalRecommendation）。
+口径（详见映射表 `11_字段模型底稿` 与 `12_工程决策`）::
 
-两层设计（必须遵守）：
-    事实层（fact）  ：LLM 抽取，可缺失，**不得推理**，须带原文出处。
-    判定层（det）   ：确定性代码计算，布尔/列表，**可复现**。
-    → 路由只读判定层，不读原文。
+    170（V3.1(2) 原文 169 + 补入 1 个 N.ACCESS_TORTUOSITY）
+      − 7  判定产物：G03.P01–P04、N.COMPLEX_STATUS、R.CLINICAL_AORTIC_SUSPECT、CL.TAAA_IV
+      − 3  物化派生：L.HB_DELTA、V.NEWS2_SCORE、V.NEWS2_SINGLE3
+      = 160
 
-来源：`.workbuddy/spec/VascCase字段设计表.xlsx` · Sheet `01_字段总表`（51 个临床字段）。
-      另有 2 个审计留痕辅助字段（``field_evidence`` / ``urgency_flag_audit``），
-      见 :data:`AUDIT_FIELDS`，不计入 51 个临床字段。
-治理红线：本模型只做数据承载与校验，**不得引入任何 LLM 客户端**。
+**落点纪律（W12）**：14 个子模型类与组装类 :class:`VascCase` 全部写在**本文件**，
+不新建 ``v31/`` 子包；导入路径 ``from src.models.preop import VascCase`` 全程不变。
+
+三条语义约定（写规则时照此实现）
+--------------------------------
+1. **缺失 ≠ 阴性**：未提及一律 ``None``。禁止用 ``False`` / ``"无"`` 表达「没记录」。
+2. **不确定值**是「有值但值本身不确定」（可疑 / 疑似 / 未评价 / 不可评价 / 未知…），
+   由 :data:`UNCERTAIN_TOKENS` 显式枚举；判定层只能把它算成 UNKNOWN，**永不产生成立/不成立**。
+3. **有阈值的判断存原值**（颈长、Hb、SBP、eGFR…），阈值留在规则层；
+   只有「本身无阈值」的事实才用布尔 / 三态枚举。反例 ``S.PAIN_SEVERE_SCREEN`` 保留但**仅展示**。
+
+非域字段（不计入 160）
+----------------------
+``case_id``（系统身份）、``urgency_flag``（人工覆盖通道）、``urgency_flag_audit``（留痕）、
+``field_evidence``（字段级证据链）挂在 :class:`VascCase` 上，属于模型级的横切属性。
 """
 
 from __future__ import annotations
 
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..audit import FieldProvenance, UrgencyFlagAudit
-from ..enums import (
-    AnatomyLevel,
-    CKDStage,
-    DiagnosisCertainty,
-    DiseaseCategory,
-    EndoleakType,
-    HeartFailureNYHA,
-    InfectionEvidence,
-    LesionMorphology,
-    MalignancyStatus,
-    PainAttribution,
-    PriorRepair,
-    RouteMode,
-    RuptureStatus,
-    Sex,
-    SymptomAAA,
-    TemporalStatus,
-    Tortuosity,
-    YesNoUnknown,
-    strip_enum_annotation,
-)
 
-if TYPE_CHECKING:
-    # 仅供类型标注使用：运行时改为**函数内延迟导入**，以打破
-    # models ← rules ← models 的循环引用（rules 也 TYPE_CHECKING 本模块）。
+if TYPE_CHECKING:  # 仅类型检查用，运行期延迟导入（见 derive()）
     from ...rules.router import RouteResult
 
-# 关键字段集：其缺失将触发「复杂模式 + 置信度×0.5」（依据表2 O25）。
-# 注意：只包含**事实层**字段——判定层由代码派生，必然存在，不可能缺失。
-CRITICAL_FACT_FIELDS: tuple[str, ...] = (
-    "sex",
-    "temporal_status",
-    "symptom_aaa_related",
-    "rupture_status",
-    "prior_repair",
-    "disease_category",
-)
+# ===========================================================================
+# 复用的取值别名（字段专属取值直接写 Literal，跨字段复用的提为别名 —— W4）
+# ===========================================================================
+Tri = Literal["是", "否", "未知"]
+"""通用三态：是与否之外必须有「未知」，不得缺省为否。"""
 
-# 审计留痕辅助字段（跨层结构，**不计入**设计表的 51 个临床字段）。
-AUDIT_FIELDS: tuple[str, ...] = ("field_evidence", "urgency_flag_audit")
+Involved = Literal["明确受累", "未受累", "可疑", "不可评价"]
+"""分支开口受累（N.RENAL_R / RENAL_L / SMA / CA 共用）。"""
 
-# 设计表标注「数字（1位小数）」的字段 —— 落库前统一归一化。
-ONE_DECIMAL_FIELDS: tuple[str, ...] = (
-    "max_diameter_mm",
-    "iliac_diameter_mm",
-    "growth_rate_mm_per_year",
-    "neck_length_mm",
-    "access_diameter_mm",
-)
+LesionGrade = Literal["明确", "可疑", "阴性", "不可评价"]
+"""病变有无四态（CL.PAU / IMH / IAAD 共用）。"""
 
-# 枚举型字段（含 list 型 disease_category）—— 落库前去掉设计表的括号注释。
-# 说明：anatomy_level / lesion_morphology 由各自的归一化校验器处理，故不在此列。
-ENUM_FACT_FIELDS: tuple[str, ...] = (
-    "sex",
-    "disease_category",
-    "temporal_status",
-    "diagnosis_certainty",
-    "symptom_aaa_related",
-    "pain_cause_attributed",
-    "rupture_status",
-    "hemodynamic_instability",
-    "active_hemorrhage",
-    "acute_limb_ischemia",
-    "visceral_malperfusion",
-    "septic_shock",
-    "tortuosity",
-    "prior_repair",
-    "endoleak_type",
-    "infection_evidence",
-    "inflammatory_evidence",
-    "genetic_syndrome",
-    "malignancy",
-    "heart_failure_nyha",
-    "copd",
-    "ckd_stage",
-    "cad",
-    "complex_surgery_history",
-    "evidence_conflict",
-    "route_mode",
-)
+CtaGrade = Literal["明确", "可疑", "未见", "不可评价"]
+"""CTA 影像征象四态（C.EXTRAV / HEMATOMA / WALL / CONTAIN / AEF_SIGN 共用）。"""
+
+Label = Literal["D1", "D2", "D3", "D4", "D5", "D6", "D7", "Ⅳ型TAAA扩展"]
+"""病种标签（G08 / K.CLASS_OUTPUT 共用）。"""
 
 
-def _quantize(value: object, places: int) -> object:
-    """按指定小数位归一化数值（ROUND_HALF_UP，非银行家舍入）。
+# ===========================================================================
+# 域基类
+# ===========================================================================
+class _StrictDomain(BaseModel):
+    """14 个域子模型的共同基类：**禁止未知字段**。
 
-    - ``None`` 原样返回（保留「缺失」语义，不得填充默认值）；
-    - 不可解析值原样返回，交给 ``Field`` 约束报错，不在此处吞掉异常。
+    为什么必须有：pydantic 默认静默忽略多余键。抽取层把 ``n.neck_len`` 拼成
+    ``n.neck_length`` 时，不会报错，只会**丢事实**——比报错危险得多，因为整条
+    判定链会拿 ``None`` 继续跑，最后安静地给出一个「资料不足」的结论。
+    加上 ``extra="forbid"`` 后，拼错立刻 ValidationError。
+
+    放在基类上而不是逐个类声明，是为了让「严格」只有一个真源：新增域时想忘都忘不掉。
     """
-    if value is None:
-        return None
-    try:
-        quantum = Decimal(1).scaleb(-places)
-        return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
-    except (InvalidOperation, ArithmeticError, ValueError):
-        return value
+
+    model_config = ConfigDict(extra="forbid")
 
 
+# ===========================================================================
+# P. 患者与就诊（4）
+# ===========================================================================
+class PatientDomain(_StrictDomain):
+    """P. 患者身份与本次就诊（4 字段）。"""
+
+    id: str | None = None  # 患者唯一标识（院内主索引；不得输出姓名）
+    visit: str | None = None  # 本次就诊号（episode 唯一键）
+    age: int | None = None  # 就诊年龄（≥0）
+    sex: Literal["男", "女", "其他记录", "未知"] | None = None  # 记录的性别
+
+
+# ===========================================================================
+# T. 时间（1）
+# ===========================================================================
+class TimeDomain(_StrictDomain):
+    """T. 决策时间（1 字段）。"""
+
+    now: str | None = None  # 决策时间（ISO 8601：YYYY-MM-DDThh:mm:ss±hh:mm）
+
+
+# ===========================================================================
+# D. 原始来源与引用（11）
+# ===========================================================================
+class SourceDomain(_StrictDomain):
+    """D. 原始来源与引用（11 字段）。只存证据指针，不存正文的临床结论。"""
+
+    note: str | None = None  # 病历原文证据（文书ID + 段落定位）
+    vital: list[str] | None = None  # 生命体征记录组（事件列表）
+    lab: list[str] | None = None  # 检验原始记录组（样本ID + 结果列表）
+    cta: str | None = None  # CTA DICOM 索引（StudyUID + SeriesUID，不存影像）
+    report: str | None = None  # 影像报告原文（报告ID + 段落定位）
+    surg: list[str] | None = None  # 主动脉既往治疗（无/EVAR/OSR/未知）
+    med: list[str] | None = None  # 当前用药（名称 + 剂量 + 时间）
+    intervention: list[str] | None = None  # 复苏与支持记录（类型 + 时间 + 剂量）
+    dx: Literal["肯定", "疑似", "已排除", "既往"] | None = None  # 已知主动脉疾病
+    allergy: Literal["有", "无明确记录", "未知"] | None = None  # 造影剂相关反应史
+    dx_context: Literal["确认", "既往已修复", "疑似", "无相关记录", "未知"] | None = (
+        None  # AAA 证据来源与确定度（确认/既往已修复/疑似/无相关记录/未知）
+    )
+
+
+# ===========================================================================
+# Q. 证据质量（16）
+# ===========================================================================
+class EvidenceDomain(_StrictDomain):
+    """Q. 证据质量与冲突（16 字段）。
+
+    ⚠️ ``value_status`` 只是**逐项展示派生**，判定层不读（D3 裁定）：
+    状态的真源是各字段自身的枚举，不是这张 map。
+    """
+
+    idmatch: Literal["一致", "不一致", "无法证明"] | None = None  # 患者-检查身份一致
+    visitmatch: Literal["本次", "既往", "外院", "他人", "不一致", "未知"] | None = (
+        None  # 本次就诊关联（本次/既往/外院/他人/不一致）
+    )
+    time: Literal["有效", "错序", "缺失", "冲突"] | None = None  # 时间戳可靠性
+    unit: Literal["有效", "可转换", "冲突", "无单位"] | None = None  # 单位核对
+    neg: Literal["肯定", "否定", "不确定", "未述及"] | None = None  # 否定状态
+    history: Literal["当前", "既往", "计划", "无法判别"] | None = None  # 既往与当前
+    experiencer: Literal["本人当前", "本人既往", "家族", "他人", "未知"] | None = (
+        None  # 信息归属者（本人当前/本人既往/家族/他人）
+    )
+    conflict: list[Literal["无", "数值", "身份", "语义", "时间"]] | None = None  # 多来源冲突
+    cta_phase: Literal["动脉期", "平扫", "其他", "未知"] | None = (
+        None  # CTA 增强时相（动脉期才可评价某些征象）
+    )
+    cta_quality: Literal["可评价", "局部可评价", "不可评价"] | None = None  # 影像整体可评价性
+    datasource: str | None = None  # 每项事实的证据指针（Q.DATASOURCE）
+    value_status: Literal["阳性", "阴性", "可疑", "未知", "未检查", "不可评价", "冲突"] | None = (
+        None  # 逐项值状态：仅展示派生，判定层不读（D3 裁定）
+    )
+    current_assess: Literal["本次已评估", "未评估", "仅历史", "未知"] | None = (
+        None  # 本次急症筛查的时间口径（本次已评估/仅历史）
+    )
+    cta_cover: Literal["完整", "局部", "未覆盖", "未知"] | None = None  # 病变与周围组织覆盖
+    cta_enhance: Literal["适当", "不足", "无动脉期", "未知"] | None = None  # 动脉期增强质量
+    report_vs_algo: Literal["一致", "冲突", "仅报告", "仅算法", "均无", "未知"] | None = (
+        None  # 影像报告与算法结论是否一致
+    )
+
+
+# ===========================================================================
+# S. 症状与查体（18）
+# ===========================================================================
+class SymptomDomain(_StrictDomain):
+    """S. 症状与查体（18 字段）。"""
+
+    pain_present: Literal["是", "否", "可疑", "未知"] | None = None  # 当前疼痛存在
+    pain_site: (
+        list[Literal["上腹", "脐周", "下腹", "侧腹", "腰", "背", "胸", "腹股沟", "其他"]] | None
+    ) = None  # 疼痛部位（可多选）
+    pain_onset: Literal["突然", "逐渐", "不详"] | None = None  # 疼痛起病方式
+    pain_start: str | None = None  # 疼痛开始时间（绝对/相对 + 时间锚点）
+    pain_duration: float | None = None  # 疼痛持续时间（小时，≥0）
+    pain_severity: int | None = None  # 疼痛强度 NRS 0–10（主观原词归 D.NOTE）
+    pain_trend: Literal["持续", "加重", "缓解", "间歇", "复发", "未知"] | None = (
+        None  # 疼痛变化趋势
+    )
+    pain_radiate: list[str] | None = None  # 疼痛放射部位
+    pain_attrib: Literal["明确相关", "怀疑相关", "明确其他原因", "未判断"] | None = (
+        None  # 医师判断疼痛与 AAA 的相关性（未判断 ≠ 无关）
+    )
+    syncope: Literal["肯定", "否定", "可疑", "未知"] | None = None  # 晕厥或短暂意识丧失
+    gi_bleed: list[Literal["呕血", "黑便", "便血", "无", "未知"]] | None = (
+        None  # 当前消化道出血表现（可多选，「无」为已知阴性）
+    )
+    limb: list[Literal["痛", "苍白", "发凉", "麻木", "无力", "运动障碍", "无", "未知"]] | None = (
+        None  # 急性肢体缺血症状（可多选，「无」为已知阴性）
+    )
+    pulse_deficit: Literal["有", "减弱", "缺失", "无法评价", "未查"] | None = (
+        None  # 外周搏动检查结果
+    )
+    infection: list[Literal["存在", "无", "可疑", "未知"]] | None = None  # 感染症状与证据
+    abd_tender: Literal["阳性", "阴性", "未查", "不可靠"] | None = None  # 腹部触痛/搏动性肿块
+    pain_current: Literal["当前新发", "本次进展", "长期不变", "明确无", "未知"] | None = (
+        None  # 疼痛是否属本次新发/进展（未提及 ≠ 无）
+    )
+    aaa_tender: Literal["明确阳性", "阴性", "未查", "不确定"] | None = None  # AAA 部位触痛
+    pain_severe_screen: bool | None = None  # 疼痛是否达明显严重（**仅展示，判定不读**）
+
+
+# ===========================================================================
+# V. 生命体征（17）
+# ===========================================================================
+class VitalDomain(_StrictDomain):
+    """V. 生命体征（17 字段）。NEWS2 总分为物化派生，不在此处（见 NodeAudit）。"""
+
+    sbp: float | None = None  # 收缩压 mmHg
+    dbp: float | None = None  # 舒张压 mmHg
+    hr: float | None = None  # 心率 次/分
+    rr: float | None = None  # 呼吸频率 次/分
+    spo2: float | None = None  # 脉氧 %
+    oxygen: Literal["是", "否", "未知"] | None = None  # 是否补充氧气
+    spo2_scale: Literal["Scale1", "Scale2经确认", "未定"] | None = None  # NEWS2 血氧量表
+    temp: float | None = None  # 体温 ℃
+    acvpu: Literal["A", "C", "V", "P", "U", "无法评价"] | None = None  # 意识 ACVPU
+    conscious_change: Literal["新发下降", "无新变化", "基线未知"] | None = (
+        None  # 意识变化（新发下降才参与急症判据）
+    )
+    perfusion: list[Literal["阳性", "阴性", "未查"]] | None = None  # 低灌注表现
+    urine: float | None = None  # 尿量 ml/h
+    vaso: list[str] | None = None  # 血管活性药（用药列表）
+    resus: list[str] | None = None  # 复苏相关干预（时间 + 治疗量）
+    sbp_prev: float | None = None  # 先前可比收缩压 mmHg
+    sbp_min: float | None = None  # 就诊期最低收缩压 mmHg
+    hr_prev: float | None = None  # 先前可比心率 次/分
+
+
+# ===========================================================================
+# L. 实验室（11）
+# ===========================================================================
+class LabDomain(_StrictDomain):
+    """L. 实验室（11 字段）。Hb 变化量 L.HB_DELTA 为物化派生，不在此处。"""
+
+    hb: float | None = None  # 当前血红蛋白 g/L
+    hb_ref_low: float | None = None  # Hb 实验室参考下限 g/L
+    hb_prev: float | None = None  # 既往可比血红蛋白 g/L
+    hb_comparable: bool | None = None  # 两次 Hb 是否有足够可比性（抽取层事实）
+    hb_confound: bool | None = None  # Hb 变化有无已知治疗/采样干扰（抽取层事实）
+    lact: float | None = None  # 乳酸 mmol/L
+    lact_uln: float | None = None  # 乳酸参考上限 mmol/L
+    creat: float | None = None  # 肌酐 µmol/L（**不用于反算 eGFR**）
+    inr: float | None = None  # INR
+    plt: float | None = None  # 血小板 ×10⁹/L
+    blood_trans: Literal["存在", "无记录", "未知"] | None = None  # 输血与采血关系
+
+
+# ===========================================================================
+# C. CTA 与影像（19）
+# ===========================================================================
+class CtaDomain(_StrictDomain):
+    """C. CTA 报告与影像征象（19 字段）。
+
+    ⚠️ ``maxd`` 是**报告文字里读到的最大外径**，与量化值 ``CL.AAA_DIAM`` 不是一回事：
+    前者只用于交叉校验（不一致 → ``Q.CONFLICT`` → G09），**修复阈值只认后者**。
+    """
+
+    aorta: list[str] | None = None  # 主动脉病变存在及部位（部位 + 病变）
+    maxd: float | None = None  # 报告最大外径 mm（不可测 → None）
+    extrav: CtaGrade | None = None  # 血管外造影剂外溢
+    hematoma: CtaGrade | None = None  # 主动脉周围/腹膜后血肿
+    wall: CtaGrade | None = None  # 主动脉壁完整性
+    contain: CtaGrade | None = None  # 包裹性破裂征象
+    stranding: Literal["有", "无", "可疑", "不可评价"] | None = None  # 周围脂肪模糊
+    rup_context: Literal["有关", "无关", "不确定"] | None = None  # 影像破裂关联性
+    branch: dict[str, str] | None = None  # 分支灌注（部位 → 通畅/狭窄/闭塞/可疑/不可评价）
+    graft: Literal["有", "无", "可疑", "未知"] | None = None  # 已有主动脉移植物
+    endoleak: Literal["I", "II", "III", "其他", "可疑", "未评价"] | None = None  # 术后内漏可疑
+    graft_fail: list[Literal["明确", "可疑", "未见", "不可评价"]] | None = None  # 移植物结构异常
+    aef_sign: CtaGrade | None = None  # 主动脉肠瘘相关影像线索
+    image_location: Literal["完整", "缺失"] | None = None  # 影像证据定位
+    extrav_contig: Literal["明确连续", "可疑", "不连续", "未评价"] | None = None  # 外溢与管腔连续
+    hematoma_adj: Literal["明确相邻", "可疑", "不相邻", "未评价"] | None = None  # 血肿紧邻病变
+    hematoma_type: str | None = None  # 血肿位置 + 密度（结构化描述）
+    rupture_report: Literal["明确破裂", "疑似破裂", "未提及", "明确未见"] | None = (
+        None  # 医师报告的破裂诊断（「明确破裂」即阳性触发）
+    )
+    source_kind: Literal["正式报告", "专家确认", "算法候选", "无", "未知"] | None = (
+        None  # CTA 征象证据类型（正式报告/专家确认/算法候选）
+    )
+
+
+# ===========================================================================
+# N. 解剖与病生理（27）
+# ===========================================================================
+class AnatomyDomain(_StrictDomain):
+    """N. 解剖、合并症与病因状态（27 字段）。N.COMPLEX_STATUS 为判定产物，不在此处。"""
+
+    cta_status: Literal["完整", "部分", "缺失", "冲突"] | None = None  # 判断复杂解剖的 CTA
+    neck_len: float | None = None  # 肾下瘤颈长度 mm
+    renal_r: Involved | None = None  # 右肾动脉开口受累
+    renal_l: Involved | None = None  # 左肾动脉开口受累
+    sma: Involved | None = None  # SMA 开口受累
+    ca: Involved | None = None  # 腹腔干开口受累
+    thoracic: Literal["是", "否", "不可评价"] | None = None  # 是否明显累及降胸主动脉
+    neck_d: float | None = None  # 近端瘤颈最大直径 mm
+    neck_angle: float | None = None  # 近端瘤颈角度 度（0–180）
+    seal_ifu: Literal["符合", "不符", "未核验", "未选型号"] | None = None  # 近端密封区 IFU
+    iliac_bilat: Literal["双侧", "单侧", "无", "不详"] | None = None  # 双侧髂动脉瘤/重要累及
+    iia_left: Literal["通畅", "闭塞", "严重狭窄", "未知"] | None = None  # 左内髂灌注
+    iia_right: Literal["通畅", "闭塞", "严重狭窄", "未知"] | None = None  # 右内髂灌注
+    access_occlusion: Literal["双侧闭塞", "单侧闭塞", "未见闭塞", "未知"] | None = (
+        None  # 双侧常规髂股通路是否存在闭塞
+    )
+    access_tortuosity: Literal["双侧严重迂曲", "单侧严重迂曲", "未见严重迂曲", "未知"] | None = (
+        None  # 双侧髂动脉入路迂曲（V3.1(2) 补入，路由暂不消费）
+    )
+    genetic_ctx: Literal["确诊", "疑似遗传背景", "无已知阳性线索", "未评价", "证据冲突"] | None = (
+        None  # 遗传背景主状态（由 GEN.* 明细派生；不新增 D8，作病因修饰）
+    )
+    inflammatory_ctx: (
+        Literal["临床确认", "影像高度提示", "可疑", "无当前支持证据", "未评价", "冲突"] | None
+    ) = None  # 炎症性 AAA 主状态（由 INF.* 派生；单纯 CRP/ESR 高不触发）
+    infection_ctx: Literal["医师明确", "高度怀疑", "仅非特异征象", "无相关征象", "未知"] | None = (
+        None  # 感染性主动脉疾病主状态（与炎症性 AAA 分开，不互相覆盖）
+    )
+    fistula_ctx: Literal["明确", "疑似", "未见", "未知"] | None = None  # 主动脉相关瘘
+    prev_repair: Literal["EVAR", "OSR", "其他", "无", "未知"] | None = None  # 既往修复
+    endoleak_type: Literal["I", "II", "III", "IV", "V", "疑似", "无", "未知"] | None = (
+        None  # 本次内漏类型（Ⅰ/Ⅱ/Ⅲ/Ⅳ/Ⅴ，与 C.ENDOLEAK 分工：此处为分类口径）
+    )
+    sac_growth: float | None = None  # 瘤囊增长 mm（**仅在可比时填写**，不可比 → None）
+    graft_major: Literal["组件分离", "移位", "明显闭塞", "无", "疑似", "未知"] | None = (
+        None  # 移植物结构重大异常（组件分离/移位/明显闭塞）
+    )
+    egfr: float | None = None  # 本次 eGFR（直读化验单，不由肌酐反算）
+    dialysis: Tri | None = None  # 当前维持透析
+    heart_class: Literal["I", "II", "III", "IV", "未评价"] | None = None  # NYHA 心功能分级
+    resp_support: Literal["无", "长期吸氧", "无创通气", "有创通气", "未知"] | None = (
+        None  # 基线呼吸支持依赖
+    )
+
+
+# ===========================================================================
+# GEN. 遗传证据明细（5）—— 证据明细层，规则不直接读，供 N.GENETIC_CTX 派生
+# ===========================================================================
+class GeneticDomain(_StrictDomain):
+    """GEN. 遗传证据明细（5 字段）。三层结构：证据明细 → 主状态 → 规则。"""
+
+    syndrome_type: (
+        Literal["Marfan", "Loeys-Dietz", "血管型EDS", "其他确诊综合征", "疑似", "不详"] | None
+    ) = None  # 已记录的具体遗传综合征名称
+    aaa_age_onset: int | None = None  # 首次确诊 AAA 年龄（0–120）
+    family_aneurysm: Literal["阳性", "明确无相关史", "未询问", "不详"] | None = (
+        None  # 家族中是否有动脉瘤或主动脉夹层（「未询问」≠ 阴性）
+    )
+    syndromic_features: list[str] | None = None  # 提示单基因综合征的体征
+    variant_class: (
+        Literal["致病", "可能致病", "意义未明(VUS)", "良性或可能良性", "未检测"] | None
+    ) = None  # 已发现的遗传变异及致病性（VUS 不等同致病）
+
+
+# ===========================================================================
+# INF. 炎症证据明细（6）—— 同上，供 N.INFLAMMATORY_CTX 派生
+# ===========================================================================
+class InflammatoryDomain(_StrictDomain):
+    """INF. 炎症性 AAA 证据明细（6 字段）。"""
+
+    mantle_sign: Literal["明确存在", "可疑", "未见", "无法评价"] | None = None  # 瘤周套袖征
+    wall_fibrosis: Literal["明确", "可疑", "未见", "不可评价"] | None = None  # 瘤壁增厚/纤维化
+    organ_involvement: (
+        list[
+            Literal[
+                "输尿管包绕",
+                "肾积水",
+                "十二指肠受累",
+                "下腔静脉或左肾静脉受累",
+                "无",
+                "未知",
+            ]
+        ]
+        | None
+    ) = None  # 周围结构受累（输尿管包绕/肾积水/十二指肠等）
+    inflamm_markers: str | None = None  # CRP/ESR 数值 + 参考上限 + 采样时间（源表拼写为 INFLAMM_）
+    symptom_pattern: Literal["持续/反复腹背痛", "体重下降", "无", "未知"] | None = (
+        None  # 慢性腹背侧痛及体重下降（炎症性 AAA 的支持线索）
+    )
+    aaa_true_diam: float | None = None  # 排除瘤周炎症与壁水肿后的真实直径 mm（ESVS Rec 145）
+
+
+# ===========================================================================
+# CL. 病种分类（18）
+# ===========================================================================
+class ClassifyDomain(_StrictDomain):
+    """CL. 病种分类标签（18 字段）。CL.TAAA_IV 为判定产物，不在此处。"""
+
+    aorta_location: list[Literal["腹主动脉", "髂动脉", "胸腹主动脉", "无", "未知"]] | None = (
+        None  # 病变血管部位（可多选）
+    )
+    aaa_diam: float | None = None  # 腹主动脉最大外径 mm（**修复阈值只认此量化值**）
+    aaa_reported: Literal["确认", "疑似", "否定", "未述及"] | None = (
+        None  # 医生/影像报告是否明确诊断 AAA（与 C.MAXD 报告值配套）
+    )
+    aaa_rupture: Literal["明确", "疑似", "未见相关证据", "无法评价"] | None = (
+        None  # 破裂或疑似破裂状态（CL. 侧分类口径，与 C.RUPTURE_REPORT 分工）
+    )
+    symptom_aaa: (
+        Literal["医师确认相关", "医师怀疑相关", "明确归因其他", "未评价", "无当前症状"] | None
+    ) = None  # 腹背痛等症状能否归因于 AAA（未评价 ≠ 无症状）
+    infection: (
+        Literal[
+            "原生感染明确",
+            "原生感染疑似",
+            "移植物感染明确",
+            "移植物感染疑似",
+            "无证据",
+            "未评价",
+        ]
+        | None
+    ) = None  # 原生主动脉或移植物感染状态
+    fistula: Literal["主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似", "否", "未知"] | None = (
+        None  # 主动脉相关瘘征象（主动脉肠瘘/腔静脉瘘）
+    )
+    pau: LesionGrade | None = None  # 穿透性主动脉溃疡
+    imh: LesionGrade | None = None  # 主动脉壁内血肿
+    iaad: LesionGrade | None = None  # 孤立性腹主动脉夹层
+    saccular: Literal["明确", "疑似", "否", "未知"] | None = None  # 囊状主动脉瘤
+    pseudo: Literal["明确", "疑似", "否", "未知"] | None = None  # 假性动脉瘤
+    iliac_site: list[Literal["左侧", "右侧", "CIA", "IIA", "EIA", "疑似", "无"]] | None = (
+        None  # 髂动脉瘤侧别与部位
+    )
+    iliac_diam: dict[str, float] | None = None  # 髂动脉各段外径（侧别 → mm）
+    prev_evor: Literal["EVAR", "OSR", "其他", "无", "未知"] | None = (
+        None  # 既往 EVAR 或 OSR 史（「无」为明确阴性）
+    )
+    post_reason: (
+        Literal[
+            "内漏",
+            "瘤囊变化",
+            "感染",
+            "再狭窄或闭塞",
+            "假性动脉瘤",
+            "常规随访",
+            "其他",
+            "不详",
+        ]
+        | None
+    ) = None  # 此次就诊是否评估术后并发症（无既往修复时为空，不算缺口）
+    diag_quality: Literal["确认", "疑似", "未评价", "矛盾"] | None = None  # 标签证据等级
+    diag_multi: list[Label] | None = None  # 本次疾病多标签集合
+
+
+# ===========================================================================
+# K. 分类检查（5）—— 由 route() 内部算出并回填（W11）
+# ===========================================================================
+class CheckDomain(_StrictDomain):
+    """K. 分类期检查（5 字段）。
+
+    ``new_urgent`` 是**入参**（分类期间是否出现新危险证据，由调用方置位）；
+    其余 4 个由 ``route()`` 内部算出，经 :func:`apply_route_result` 回填，供审计复核。
+    """
+
+    new_urgent: Tri | None = None  # 分类期间是否出现新危险证据（route() 入参，由调用方置位）
+    identity_conflict: Tri | None = None  # 参与分类的关键数据是否归属冲突（route() 算出后回填）
+    diag_conflict: Tri | None = None  # 病种标签间是否存在实质冲突（route() 算出后回填）
+    classifiable: Literal["确定", "疑似", "不能分类"] | None = (
+        None  # 是否已形成至少一个病种候选标签（route() 算出后回填）
+    )
+    class_output: list[Label] | None = None  # 待交付病种标签集合
+
+
+# ===========================================================================
+# R. 结论（2）
+# ===========================================================================
+class ResultDomain(_StrictDomain):
+    """R. 路由结论（2 字段）。R.CLINICAL_AORTIC_SUSPECT 为判定产物，不在此处。"""
+
+    aortic_emergency: Literal["明确危险", "高度疑似", "不能排除", "未触发", "冲突"] | None = (
+        None  # 主动脉急症风险分级（route() 算出后回填）
+    )
+    next: Literal["G05", "G06", "G07", "人工复核", "资料核实"] | None = None  # 下一节点
+
+
+# ===========================================================================
+# 组装
+# ===========================================================================
 class VascCase(BaseModel):
-    """术前输入层：LLM 抽取的病例事实 + 确定性派生的判定标记。"""
+    """V3.1(2) 术前病例 —— 160 个路由字段（14 个域子模型）+ 4 个非域字段。
 
-    model_config = ConfigDict(
-        extra="forbid",  # 拒绝未声明字段，防止抽取器写入脏数据
-        validate_assignment=True,  # 赋值时重跑校验，保证派生逻辑可挂载
-        use_enum_values=False,  # 保留枚举对象，便于类型安全
-    )
+    访问形式：``case.n.neck_len`` / ``case.cl.aaa_diam`` / ``case.p.age``。
 
-    # ==================================================================
-    # 元数据
-    # ==================================================================
-    case_id: str = Field(
-        ...,
-        description="病例唯一标识（系统生成，不可变）；用于全链路 Checkpoint 审计追溯。",
-    )
-    source_note: str | None = Field(
-        default=None,
-        description="原文摘要（证据层）。保留证据出处；**不得作为路由判断依据**。",
-    )
+    ⚠️ 本模型**只管输入**：工具产物（VascMeasurement / AnatomyScore /
+    RiskAssessment / FinalRecommendation）各自独立成模型，**不回写** VascCase。
+    """
 
-    # ==================================================================
-    # 事实层 · 人口学（来源：LLM 抽取）
-    # ==================================================================
-    age: int | None = Field(
-        default=None,
-        ge=0,
-        le=120,
-        description="年龄（岁）。影响修复评估分层。",
-    )
-    sex: Sex | None = Field(
-        default=None,
-        description="性别。阈值区分关键（男 55mm / 女 50mm）；未知不得默认男。",
-    )
+    case_id: str = Field(description="系统病例号（审计身份，与 P.ID 患者标识不同）")
 
-    # ==================================================================
-    # 事实层 · 疾病与时态
-    # ==================================================================
-    disease_category: list[DiseaseCategory] | None = Field(
-        default=None,
-        description="一级病种（**list**）。O29 要求保留全部标签，不得只留一个。",
-    )
-    lesion_subtype: str | None = Field(
-        default=None,
-        description="二级病种（如：小型肾下AAA / 炎症性AAA / Ia型内漏）。",
-    )
-    temporal_status: TemporalStatus | None = Field(
-        default=None,
-        description="时态。关键：既往破裂 ≠ 当前破裂（表2 T27）。",
-    )
-    diagnosis_certainty: DiagnosisCertainty | None = Field(
-        default=None,
-        description="诊断确定性。疑似高危不得因未确诊而延误。",
-    )
+    model_config = ConfigDict(extra="forbid")
+    """禁止未知字段：抽取层拼错字段名必须立刻报错，不能静默丢弃（否则等于丢事实）。"""
 
-    # ==================================================================
-    # 事实层 · 症状
-    # ==================================================================
-    symptom_aaa_related: SymptomAAA | None = Field(
-        default=None,
-        description="AAA 归因性症状。需与否定/他因区分。",
-    )
-    symptom_type: str | None = Field(
-        default=None,
-        description="症状类型（腹痛 / 腰背痛 / 压痛 / 远端栓塞 / 压迫症状…）。",
-    )
-    pain_cause_attributed: PainAttribution | None = Field(
-        default=None,
-        description="疼痛归因是否已核实（是（归因AAA）/ 否 / 未核实）。"
-        "「否认腹痛」不足以证明无症状（O03）。",
-    )
+    p: PatientDomain = Field(default_factory=PatientDomain)
+    t: TimeDomain = Field(default_factory=TimeDomain)
+    d: SourceDomain = Field(default_factory=SourceDomain)
+    q: EvidenceDomain = Field(default_factory=EvidenceDomain)
+    s: SymptomDomain = Field(default_factory=SymptomDomain)
+    v: VitalDomain = Field(default_factory=VitalDomain)
+    lab: LabDomain = Field(default_factory=LabDomain)
+    c: CtaDomain = Field(default_factory=CtaDomain)
+    n: AnatomyDomain = Field(default_factory=AnatomyDomain)
+    gen: GeneticDomain = Field(default_factory=GeneticDomain)
+    inf: InflammatoryDomain = Field(default_factory=InflammatoryDomain)
+    cl: ClassifyDomain = Field(default_factory=ClassifyDomain)
+    k: CheckDomain = Field(default_factory=CheckDomain)
+    r: ResultDomain = Field(default_factory=ResultDomain)
 
-    # ==================================================================
-    # 事实层 · 急症客观征象
-    # ==================================================================
-    rupture_status: RuptureStatus | None = Field(
-        default=None,
-        description="破裂状态。「排除破裂」→未破裂，不触发急诊（表2 T26/T33）。",
-    )
-    hemodynamic_instability: YesNoUnknown | None = Field(
-        default=None,
-        description="循环不稳（休克/低血压/晕厥）。需排除非主动脉原因。",
-    )
-    active_hemorrhage: YesNoUnknown | None = Field(
-        default=None,
-        description="活动性出血（造影剂外渗/大出血）。须确认来源为主动脉。",
-    )
-    acute_limb_ischemia: YesNoUnknown | None = Field(
-        default=None,
-        description="急性肢体缺血。仅急性；慢性跛行不触发。",
-    )
-    visceral_malperfusion: YesNoUnknown | None = Field(
-        default=None,
-        description="重要器官灌注障碍（肠系膜/肾/脊髓缺血）。",
-    )
-    septic_shock: YesNoUnknown | None = Field(
-        default=None,
-        description="脓毒性休克。感染性病种伴急性失代偿。",
-    )
-
-    # ==================================================================
-    # 事实层 · 测量（门控用浅层数值；精密测量由 B 影像量化器产出）
-    # ==================================================================
-    max_diameter_mm: float | None = Field(
-        default=None,
-        ge=0,
-        description="主动脉瘤体最大直径（mm，1位小数）。AAA 阈值 55/50mm。",
-    )
-    iliac_diameter_mm: float | None = Field(
-        default=None,
-        ge=0,
-        description="髂动脉瘤体最大直径（mm，1位小数）。阈值 40mm，与 AAA 不同。",
-    )
-    growth_rate_mm_per_year: float | None = Field(
-        default=None,
-        description="年增长率（mm/年）。≥10 触发复杂（R004）。须同方法测量或复核。",
-    )
-    lesion_morphology: LesionMorphology | None = Field(
-        default=None,
-        description="瘤体形态（梭形 / 囊状 / 不规则 / 未描述）。形态异常独立于直径阈值。",
-    )
-
-    # ==================================================================
-    # 事实层 · 解剖（工程阈值门控；精密测量由 B 产出）
-    # ==================================================================
-    neck_length_mm: float | None = Field(
-        default=None,
-        ge=0,
-        description="近端瘤颈长度（mm）。<15 触发复杂（O15）。",
-    )
-    neck_angle_deg: float | None = Field(
-        default=None,
-        ge=0,
-        le=180,
-        description="瘤颈成角（度）。>45 触发复杂（O16）。",
-    )
-    access_diameter_mm: float | None = Field(
-        default=None,
-        ge=0,
-        description="入路最小直径（mm）。<7 触发复杂（O17）。",
-    )
-    anatomy_level: AnatomyLevel | None = Field(
-        default=None,
-        description="解剖分型（肾下 / 短颈肾下 / 近肾 / 旁肾 / 近内脏 / IV型TAAA）。"
-        "自由文本由校验器归一化；未识别直接报错。",
-    )
-    neck_thrombus_calc_pct: int | None = Field(
-        default=None,
-        ge=0,
-        le=100,
-        description="瘤颈血栓/钙化占比（%）。>50 触发复杂（O18）。",
-    )
-    tortuosity: Tortuosity | None = Field(
-        default=None,
-        description="迂曲 / 极度成角（>90°）（有 / 无 / 未描述）。O19。",
-    )
-
-    # ==================================================================
-    # 事实层 · 治疗史与术后
-    # ==================================================================
-    prior_repair: PriorRepair | None = Field(
-        default=None,
-        description="既往主动脉修复史。术后与术前走不同路径，不可混淆。",
-    )
-    postop_complication: str | None = Field(
-        default=None,
-        description="术后并发症（内漏类型 / 瘤囊增大 / 支架移位 / 闭塞 / 吻合口瘤 / 感染 / 瘘…）。",
-    )
-    endoleak_type: EndoleakType | None = Field(
-        default=None,
-        description="内漏类型。Ⅰ/Ⅲ型高危；稳定Ⅱ型可走指南（表2 T10）。",
-    )
-
-    # ==================================================================
-    # 事实层 · 病因与特殊病变
-    # ==================================================================
-    infection_evidence: InfectionEvidence | None = Field(
-        default=None,
-        description="感染证据（有 / 无 / 疑似 / 未提及）。仅发热/菌血症不足以确诊；"
-        "「疑似」不得当作「有」。O21。",
-    )
-    inflammatory_evidence: YesNoUnknown | None = Field(
-        default=None,
-        description="炎症证据。感染性与非感染性炎症不可混。",
-    )
-    special_lesion_type: str | None = Field(
-        default=None,
-        description="特殊病变类型（PAU / IMH / IAAD / 假性动脉瘤 / 主动脉肠瘘 / 主动脉腔静脉瘘…）。",
-    )
-    genetic_syndrome: YesNoUnknown | None = Field(
-        default=None,
-        description="遗传/结缔组织病（Marfan/LDS/vEDS 等）。不套用一般 AAA 择期阈值。",
-    )
-    malignancy: MalignancyStatus | None = Field(
-        default=None,
-        description="合并恶性肿瘤（有（活动性）/ 无 / 既往已愈 / 未提及）。影响治疗优先级；"
-        "仅「有（活动性）」触发 O21 特殊病变。",
-    )
-
-    # ==================================================================
-    # 事实层 · 合并症
-    # ==================================================================
-    heart_failure_nyha: HeartFailureNYHA | None = Field(
-        default=None,
-        description="心衰分级。NYHA≥III 触发复杂（O11）。",
-    )
-    copd: YesNoUnknown | None = Field(
-        default=None,
-        description="COPD。明确合并即触发复杂（O12）。",
-    )
-    ckd_stage: CKDStage | None = Field(
-        default=None,
-        description="CKD 分期。≥3 触发复杂（O13）；孤立一次肌酐异常不能确诊。",
-    )
-    cad: YesNoUnknown | None = Field(
-        default=None,
-        description="冠心病 CAD。已确诊并存即触发复杂（O14）。",
-    )
-    complex_surgery_history: YesNoUnknown | None = Field(
-        default=None,
-        description="复杂手术/多次再干预史（FEVAR/BEVAR/redo）。O23。",
-    )
-
-    # ==================================================================
-    # 事实层 · 一致性
-    # ==================================================================
-    evidence_conflict: YesNoUnknown | None = Field(
-        default=None,
-        description="证据冲突标记（指南与影像等关键证据结论矛盾）。O24。人工可覆写。",
-    )
-
-    # ==================================================================
-    # 判定层（确定性代码派生 —— 详见 derive() ；当前为占位）
-    # 说明：这些字段由事实层计算得出，**禁止 LLM 直接写入**。
-    # ==================================================================
+    # ---- 非域字段（不计入 160）----
     urgency_flag: bool = Field(
         default=False,
-        description="临床指定急症标志（人工/系统显式置位）。独立于自动判定；置位即最高优先。O01。",
-    )
-    # --- 以下字段待 derive() 实现后由 validator 自动填充 ---
-    urgency_triggered: bool | None = Field(
-        default=None,
-        description="[派生] 急诊触发 = urgency_flag ∨ 破裂 ∨ 症状性 ∨ 休克 ∨ 出血 ∨ 急性缺血 ∨ 灌注障碍 ∨ 脓毒症。",
-    )
-    is_special_lesion: bool | None = Field(
-        default=None,
-        description="[派生] 特殊病变标记（感染/炎症/PAU/IMH/IAAD/假性/囊状/遗传/恶性）。O21。",
-    )
-    complex_anatomy: bool | None = Field(
-        default=None,
-        description="[派生] 复杂解剖标记（颈长<15 ∨ 成角>45 ∨ 入路<7 ∨ 近肾/旁肾 ∨ 血栓钙化>50 ∨ 迂曲）。",
-    )
-    severe_comorbidity: bool | None = Field(
-        default=None,
-        description="[派生] 严重合并症标记（NYHA≥III ∨ COPD ∨ CKD≥3 ∨ CAD）。",
-    )
-    guideline_eligible: bool | None = Field(
-        default=None,
-        description="[派生] 指南模式适用（急诊/复杂均已排除 ∧ 资料齐全 ∧ 低复杂度）。O26, O27。",
-    )
-    missing_critical_fields: list[str] = Field(
-        default_factory=list,
-        description="[派生] 关键字段缺失清单（见 CRITICAL_FACT_FIELDS）。非空即触发复杂 + 置信度×0.5。O25。",
-    )
-
-    # ==================================================================
-    # 输出层（确定性代码派生）
-    # ==================================================================
-    confidence: float | None = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        description="[派生] 置信度（0.00~1.00）。关键字段缺失时 ×0.5。医学判断仍需人工审核。",
-    )
-    manual_review_required: bool | None = Field(
-        default=None,
-        description="[派生] 需人工复核（缺失/冲突/无法识别 时置真）。O24, O25。",
-    )
-    route_mode: RouteMode | None = Field(
-        default=None,
-        description="[派生] 最终路由模式。优先级：急诊 > 复杂 > 指南。",
-    )
-
-    # ==================================================================
-    # 审计留痕（跨层辅助结构；**不计入**设计表的 51 个临床字段）
-    # 依据：设计表「审计留痕」列 + 交接文档第六节。
-    # ==================================================================
-    field_evidence: dict[str, FieldProvenance] = Field(
-        default_factory=dict,
-        description="事实层逐字段证据链：字段名 → 原文出处 / 写入者 / 置信度 / 覆写痕迹。"
-        "判定层与输出层的留痕分别由 RouteResult.trace 与 FinalRecommendation 承载。",
+        description="人工置位：医生主动标记「本次必须按急症处理」（可越级进 G05）。",
     )
     urgency_flag_audit: UrgencyFlagAudit | None = Field(
-        default=None,
-        description="urgency_flag 的置位留痕（置位者 + 时间戳 + 理由）。O01 审计要求。",
+        default=None, description="urgency_flag 的置位留痕（置位者 + 时间 + 理由）。"
+    )
+    field_evidence: dict[str, FieldProvenance] = Field(
+        default_factory=dict, description="字段级证据链（键为域字段点路径，如 n.neck_len）。"
     )
 
-    # ==================================================================
-    # 校验
-    # ==================================================================
-    @field_validator("age")
     @classmethod
-    def _check_age_plausible(cls, v: int | None) -> int | None:
-        """年龄合理性（额外护栏；Field 已限制 0~120）。"""
-        if v is not None and v < 18:
-            raise ValueError("age 小于 18：本系统面向成人主动脉瘤，请核实抽取结果。")
-        return v
-
-    @field_validator(*ENUM_FACT_FIELDS, mode="before")
-    @classmethod
-    def _strip_enum_annotation(cls, v: object) -> object:
-        """容忍「设计表原文」写法：``有（活动性）`` → 枚举核心取值 ``有``。
-
-        抽取层可能直接照抄设计表 / 表2 的带注释写法；若不归一化，合法取值会被
-        pydantic 判为非法（可用性缺陷）。本步是**纯格式归一化**，不做临床推断。
-        """
-        if isinstance(v, list):
-            return [strip_enum_annotation(x) if isinstance(x, str) else x for x in v]
-        if isinstance(v, str):
-            return strip_enum_annotation(v)
-        return v
-
-    @field_validator("anatomy_level", mode="before")
-    @classmethod
-    def _normalize_anatomy_level(cls, v: object) -> object:
-        """自由文本 → :class:`AnatomyLevel`（表1 取值）。未识别直接报错，不得猜测。"""
-        if v is None or isinstance(v, AnatomyLevel):
-            return v
-        return AnatomyLevel.normalize(str(v))
-
-    @field_validator("lesion_morphology", mode="before")
-    @classmethod
-    def _normalize_lesion_morphology(cls, v: object) -> object:
-        """自由文本 → :class:`LesionMorphology`。未识别直接报错，不得猜测。"""
-        if v is None or isinstance(v, LesionMorphology):
-            return v
-        return LesionMorphology.normalize(str(v))
-
-    @field_validator(*ONE_DECIMAL_FIELDS, mode="before")
-    @classmethod
-    def _quantize_one_decimal(cls, v: object) -> object:
-        """设计表「数字（1位小数）」：落库前归一化（ROUND_HALF_UP）。"""
-        return _quantize(v, 1)
-
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def _quantize_confidence(cls, v: object) -> object:
-        """设计表「数字（2位小数）」：置信度归一化。"""
-        return _quantize(v, 2)
-
-    @field_validator("field_evidence")
-    @classmethod
-    def _check_field_evidence_keys(
-        cls, v: dict[str, FieldProvenance]
-    ) -> dict[str, FieldProvenance]:
-        """证据链只允许挂在已声明字段上，防止写入幽灵字段（审计完整性）。"""
-        unknown = sorted(set(v) - set(cls.model_fields))
-        if unknown:
-            raise ValueError(f"field_evidence 含未声明字段 {unknown}；证据链不得挂幽灵字段。")
-        return v
+    def domain_field_names(cls) -> dict[str, list[str]]:
+        """返回 ``{域键: [字段名…]}``，供计数断言与字段参与度探针使用。"""
+        return {
+            "p": list(PatientDomain.model_fields),
+            "t": list(TimeDomain.model_fields),
+            "d": list(SourceDomain.model_fields),
+            "q": list(EvidenceDomain.model_fields),
+            "s": list(SymptomDomain.model_fields),
+            "v": list(VitalDomain.model_fields),
+            "lab": list(LabDomain.model_fields),
+            "c": list(CtaDomain.model_fields),
+            "n": list(AnatomyDomain.model_fields),
+            "gen": list(GeneticDomain.model_fields),
+            "inf": list(InflammatoryDomain.model_fields),
+            "cl": list(ClassifyDomain.model_fields),
+            "k": list(CheckDomain.model_fields),
+            "r": list(ResultDomain.model_fields),
+        }
 
 
+# 各域字段数（与 V3.1(2) 一一对应；改动必须同步映射表 11 表）
+DOMAIN_FIELD_COUNTS: dict[str, int] = {
+    "p": 4,
+    "t": 1,
+    "d": 11,
+    "q": 16,
+    "s": 18,
+    "v": 17,
+    "lab": 11,
+    "c": 19,
+    "n": 27,
+    "gen": 5,
+    "inf": 6,
+    "cl": 18,
+    "k": 5,
+    "r": 2,
+}
+TOTAL_FIELD_COUNT = sum(DOMAIN_FIELD_COUNTS.values())  # = 160
+
+
+def _check_field_counts() -> None:
+    """导入期自检：域字段数与声明值必须一致（防止改字段忘了改计数）。"""
+    actual = {k: len(v) for k, v in VascCase.domain_field_names().items()}
+    if actual != DOMAIN_FIELD_COUNTS:
+        diff = {
+            k: (DOMAIN_FIELD_COUNTS.get(k), n)
+            for k, n in actual.items()
+            if DOMAIN_FIELD_COUNTS.get(k) != n
+        }
+        raise RuntimeError(f"域字段数与 DOMAIN_FIELD_COUNTS 不一致：{diff}")
+    if sum(actual.values()) != TOTAL_FIELD_COUNT:
+        raise RuntimeError(f"字段总数应为 {TOTAL_FIELD_COUNT}，实际 {sum(actual.values())}")
+
+
+_check_field_counts()
+
+
+# ===========================================================================
+# 不确定值白名单（F4）—— 「有值但值本身不确定」，判定层只能算成 UNKNOWN
+# ===========================================================================
+UNCERTAIN_TOKENS: frozenset[str] = frozenset(
+    {
+        "可疑",
+        "疑似",
+        "未评价",
+        "不可评价",
+        "未检查",
+        "未描述",
+        "无法评价",
+        "无法证明",
+        "不确定",
+        "未知",
+        "不详",
+        "未核验",
+        "未选型号",
+        "未提及",
+        "证据冲突",
+        "冲突",
+    }
+)
+"""显式枚举的「不确定取值」。**禁止按关键词自动推断**（同一个「无」在不同字段语义相反）。
+
+本集合只收「本身就不确定」的词；``未见`` / ``无`` / ``阴性`` / ``未受累`` / ``未触发``
+都是**确定的阴性结论**，不在其中——混进来会把已知阴性误判成 UNKNOWN。
+"""
+
+
+def is_uncertain(value: object) -> bool:
+    """判断一个字段值是否属于「不确定」。``None`` 也算不确定（缺失）。"""
+    if value is None:
+        return True
+    token = getattr(value, "value", value)
+    return isinstance(token, str) and token in UNCERTAIN_TOKENS
+
+
+# ===========================================================================
+# 判定结果回填（不重新判定，只搬运）
+# ===========================================================================
 def apply_route_result(case: VascCase, result: RouteResult) -> VascCase:
-    """把 ``RouteResult`` 回填到 ``case`` 的判定层与输出层字段（**就地**）。
+    """把 :class:`~src.rules.router.RouteResult` 的结论回填到 ``case``（**就地**）。
 
-    ⚠️ 纯确定性、无副作用之外的写操作，禁止引入任何 LLM 客户端（审计红线）。
-    ⚠️ 本函数只做「搬运」：不重新判定、不读原文、不改阈值。
+    ⚠️ 只做搬运：不重新判定、不读原文、不改阈值。
+    ⚠️ 为什么独立成公开函数：编排层要「只跑一次 ``route()``，同时回填 case 与产出
+    FinalRecommendation」；抽出来两处共用，避免抄第二份回填代码。
 
-    为什么独立成公开函数（而非藏在 ``derive()`` 里）：
-        编排层（``preop_agent/router_layer``）需要「**只跑一次** ``route()``，
-        然后同时回填 case 与产出 FinalRecommendation」。若回填逻辑只存在于
-        ``derive()``，编排层要么重复调用 ``route()``（一次判定两处执行，有漂移风险），
-        要么自己抄一份回填代码（出现两处真相）。抽出后两处共用同一实现。
-
-    返回：
-        同一个 ``case`` 对象（便于链式调用）。
+    回填范围（只写**模型里存在**的字段）：``r.next`` / ``r.aortic_emergency`` / ``k.*``。
+    **``CL.TAAA_IV`` 不在回填之列** —— 它是判定产物，``VascCase`` 里没有对应字段，
+    只存在于 ``RouteResult.cl_taaa_iv``，由需要它的工具从 ``route_result`` 直接读取。
     """
-    # ---- 回填判定层 ----
-    case.urgency_triggered = result.urgency_triggered
-    case.is_special_lesion = result.is_special_lesion
-    case.complex_anatomy = result.complex_anatomy
-    case.severe_comorbidity = result.severe_comorbidity
-    case.guideline_eligible = result.guideline_eligible
-    case.missing_critical_fields = list(result.missing_critical_fields)
-
-    # ---- 回填输出层 ----
-    case.confidence = result.confidence
-    case.manual_review_required = result.manual_review_required
-    case.route_mode = result.route_mode
-
+    case.r.next = result.next_node
+    case.r.aortic_emergency = result.emergency_level
+    case.k.identity_conflict = result.k_identity_conflict
+    case.k.diag_conflict = result.k_diag_conflict
+    case.k.classifiable = result.k_classifiable
+    case.k.class_output = list(result.class_output) if result.class_output else None
     return case
 
 
 def derive(case: VascCase) -> VascCase:
-    """确定性派生入口：执行 P0a~P8 流水线，回填判定层与输出层字段。
+    """确定性派生入口：跑一遍 ``route()`` 并回填。
 
-    ⚠️ 本函数为**纯确定性代码**，禁止引入任何 LLM 客户端（审计红线）。
-    ⚠️ 真正的判定逻辑位于 ``src/rules/router.py``，此处只做「执行 + 回填」，
-       保证数据模型与规则层解耦（模型管结构，规则管判定）。
-
-    已确认口径：
-        · missing 判定集 = :data:`CRITICAL_FACT_FIELDS`（6 个事实层字段）；
-        · 规则版本号 = 复合版本串（表1 + 表2），见 ``src/rules/version.py``。
-
-    返回：
-        同一个 ``case`` 对象（已就地回填），便于链式调用。
+    ⚠️ 纯确定性代码，禁止引入任何 LLM 客户端（审计红线）。
+    ⚠️ 真正的判定逻辑在 ``src/rules/router.py``，此处只做「执行 + 回填」。
     """
-    # 延迟导入：避免 models ← rules ← models 的循环引用（rules 也 TYPE_CHECKING models）
+    # 延迟导入：避免 models ← rules ← models 的循环引用
     from ...rules.router import route
 
-    result = route(case)
-    return apply_route_result(case, result)
+    return apply_route_result(case, route(case))
 
 
 __all__ = [
-    "AUDIT_FIELDS",
-    "CRITICAL_FACT_FIELDS",
-    "ENUM_FACT_FIELDS",
-    "ONE_DECIMAL_FIELDS",
+    "DOMAIN_FIELD_COUNTS",
+    "TOTAL_FIELD_COUNT",
+    "UNCERTAIN_TOKENS",
     "VascCase",
     "apply_route_result",
     "derive",
+    "is_uncertain",
 ]

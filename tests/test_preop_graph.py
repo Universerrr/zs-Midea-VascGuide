@@ -1,8 +1,9 @@
 """编排层测试 —— 端到端流水线、Checkpoint 往返、以及两条架构守卫。
 
-与另两个测试文件的分工（刻意保持独立，不共享 fixture）：
-    · ``test_preop.py``           —— 路由**走得对不对**（41 项基线，本轮断言零改动）
-    · ``test_model_contract.py``  —— 数据**口径符不符合设计表**（67 项）
+与另几个测试文件的分工（病例基线只从 ``conftest`` 取，不各写一份）：
+    · ``test_preop.py``           —— 路由**走得对不对**（86 项端到端基线）
+    · ``test_model_contract.py``  —— 数据**口径符不符合设计表**（81 项）
+    · ``test_router_branches.py`` —— **54 条规则**逐条命中与三值语义（193 项）
     · ``test_preop_graph.py``（本文件）—— 编排**串得对不对 + 审计**落得住、可回放、
       以及**架构红线是否被机械守住**：
         ① 薄封装守卫（router_layer 不得偷藏任何临床规则）
@@ -13,7 +14,7 @@
 
     uv run pytest tests/test_preop_graph.py -v
 
-用例均以 ``GRAPH-`` 开头构造病例，避免与另两个文件的病例标识混淆。
+用例均以 ``GRAPH-`` 开头构造病例，避免与另几个文件的病例标识混淆。
 """
 
 from __future__ import annotations
@@ -31,24 +32,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import make_case as build_case
 from langgraph.checkpoint.sqlite import SqliteSaver
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from src.models.audit import FieldProvenance, UrgencyFlagAudit
-from src.models.enums import (
-    DiseaseCategory,
-    FieldWriter,
-    PriorRepair,
-    RouteMode,
-    RuptureStatus,
-    Sex,
-    SymptomAAA,
-    TemporalStatus,
-)
+from src.models.audit import FieldProvenance, FieldWriter, UrgencyFlagAudit
 from src.models.preop.assessment import AnatomyScore, RiskAssessment
 from src.models.preop.case import VascCase, derive
 from src.models.preop.measurement import CenterlinePoint, VascMeasurement
-from src.models.preop.recommendation import FinalRecommendation, ToolFinding
+from src.models.preop.recommendation import FinalRecommendation, RouteMode, ToolFinding
 from src.preop_agent import graph as graph_module
 from src.preop_agent.execution_layer import node as exec_node_module
 from src.preop_agent.execution_layer import plan as plan_module
@@ -89,7 +81,7 @@ from src.preop_agent.output_layer.node import (
 )
 from src.preop_agent.router_layer.node import router_node
 from src.preop_agent.state import HASHED_KEYS, _project, stable_hash
-from src.rules.router import route
+from src.rules.router import RULES, RouteKind, RouteResult, route
 from src.tools.base import MissingUpstreamError, ToolRequest, ToolSpec
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -148,24 +140,12 @@ FORBIDDEN_CLINICAL_TOKENS = (
 
 
 def make_case(**overrides: Any) -> VascCase:
-    """构造一个默认走指南模式、无字段缺失的基线病例（标识以 GRAPH- 开头）。"""
-    base: dict[str, Any] = {
-        "case_id": "GRAPH-000",
-        "age": 72,
-        "sex": Sex.MALE,
-        "temporal_status": TemporalStatus.CURRENT,
-        "symptom_aaa_related": SymptomAAA.ABSENT,
-        "rupture_status": RuptureStatus.INTACT,
-        "prior_repair": PriorRepair.NONE,
-        "disease_category": [DiseaseCategory.ASYMPTOMATIC],
-        "max_diameter_mm": 42.0,
-        "neck_length_mm": 25.0,
-        "neck_angle_deg": 20.0,
-        "access_diameter_mm": 9.0,
-        "anatomy_level": "肾下",
-    }
-    base.update(overrides)
-    return VascCase(**base)  # type: ignore[arg-type]
+    """基线病例（标识以 ``GRAPH-`` 开头，与另两个测试文件的病例区分）。
+
+    基线本身定义在 ``conftest.baseline_kwargs()`` —— **只有一份**。这个包装只做
+    两件事：换 ``case_id`` 前缀、透传域级覆盖。
+    """
+    return build_case(case_id=overrides.pop("case_id", "GRAPH-000"), **overrides)
 
 
 def make_rich_case() -> VascCase:
@@ -173,7 +153,7 @@ def make_rich_case() -> VascCase:
     return make_case(
         case_id="GRAPH-RICH",
         field_evidence={
-            "max_diameter_mm": FieldProvenance(
+            "cl.aaa_diam": FieldProvenance(
                 source_quote="CTA 示腹主动脉最大径 42mm。",
                 writer=FieldWriter.LLM,
                 confidence=0.95,
@@ -306,18 +286,22 @@ class TestInputLayer:
         assert update["case_id"] == "GRAPH-000"
         assert len(update["input_snapshot_hash"]) == 64
 
-    def test_normalizes_enum_annotation(self) -> None:
-        """照抄设计表的带括号写法应在输入层被归一化。"""
-        case = make_case(malignancy="有（活动性）")
-        update = input_node({"case": case})  # type: ignore[arg-type]
-        assert update["case"].malignancy.value == "有"
+    def test_rejects_annotation_suffix(self) -> None:
+        """照抄设计表的带括号写法**不再被接受**（V3.1(2) 改用 Literal 严格校验）。
+
+        旧版靠共享枚举的归一化容忍这种东西；新版字段专属枚举直接写中文值，
+        于是「有（活动性）」必须由抽取层归一成「有」——多一道机器检查，
+        少一处「看起来能跑但值不对」的隐患。
+        """
+        with pytest.raises(ValidationError):
+            make_case(cl={"aaa_reported": "确认（影像）"})
 
     def test_does_not_mutate_input_case(self) -> None:
         """输入层必须产出新对象，否则调用方原件会被路由层的回填污染。"""
         original = make_case()
         copied = input_node({"case": original})["case"]  # type: ignore[index]
         assert copied is not original
-        assert original.route_mode is None
+        assert original.r.next is None
 
     def test_snapshot_hash_is_reproducible(self) -> None:
         first = input_node({"case": make_case()})["input_snapshot_hash"]  # type: ignore[index]
@@ -347,26 +331,23 @@ class TestRouterLayerThinWrapper:
         reference_result = route(make_case())
 
         assert wrapped["case"].model_dump() == reference_case.model_dump()
-        assert wrapped["route_result"].route_mode == reference_result.route_mode
+        assert wrapped["route_result"].mode == reference_result.mode
         assert wrapped["route_result"].ruleset_version == reference_result.ruleset_version
-        assert wrapped["route_result"].confidence == reference_result.confidence
-        assert wrapped["route_result"].manual_review_required == (
-            reference_result.manual_review_required
-        )
+        assert wrapped["route_result"].confidence_level == reference_result.confidence_level
+        assert wrapped["route_result"].kind is reference_result.kind
 
         for actual, expected in zip(
             wrapped["route_result"].trace, reference_result.trace, strict=True
         ):
-            assert actual.order == expected.order
-            assert actual.condition == expected.condition
-            assert actual.result == expected.result
-            assert actual.rule_ref == expected.rule_ref
+            assert actual.rule_id == expected.rule_id
+            assert actual.verdict == expected.verdict
+            assert actual.exit == expected.exit
 
     def test_wrapper_reuses_single_route_call(self) -> None:
         """route() 只能被调用一次（一次判定，两处消费）。"""
         update = router_node({"case": make_case()})  # type: ignore[arg-type]
         assert update["route_result"] is not None
-        assert update["case"].route_mode == update["route_result"].route_mode
+        assert update["case"].r.next == update["route_result"].next_node
 
     def test_no_float_thresholds_in_router_layer(self) -> None:
         """薄封装里不得出现任何数值常量（阈值一律留在规则层）。"""
@@ -419,13 +400,20 @@ class TestExecutionLayer:
 
     def test_node_returns_empty_outputs(self) -> None:
         """工具产物不存在，就必须返回空——绝不凭空造评分。"""
-        case = make_case()
-        derive(case)  # 回填 route_mode：未经路由的 case 没有计划，见 plan_for()
-        assert execution_node({"case": case}) == {"tool_outputs": {}}  # type: ignore[arg-type]
+        # 指南模式 → 计划里只有 A/B 两个工具，且都未实现 ⇒ 空产物
+        state = {"case": make_case(), "route_result": route(make_case())}  # type: ignore[arg-type]
+        assert execution_node(state) == {"tool_outputs": {}}  # type: ignore[arg-type]
+
+    def test_non_mode_result_runs_no_tool(self) -> None:
+        """人工复核 / 资料核实不跑任何工具：判定依据不足时算出来的东西不可信。"""
+        case = make_case(n={"neck_len": None})
+        result = route(case)
+        assert result.mode is None
+        assert execution_node({"case": case, "route_result": result}) == {"tool_outputs": {}}  # type: ignore[arg-type]
 
     def test_node_requires_routed_case(self) -> None:
         """未经路由层就给执行层喂 case → 响亮失败，不猜模式。"""
-        with pytest.raises(RuntimeError, match="route_mode"):
+        with pytest.raises(RuntimeError, match="route_result"):
             execution_node({"case": make_case()})  # type: ignore[arg-type]
 
     def test_run_tool_requires_routed_case(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -438,7 +426,7 @@ class TestExecutionLayer:
             blocked_reason=None,
         )
         monkeypatch.setattr(registry_module, "SPEC_BY_KEY", {"guideline_engine": fake})
-        with pytest.raises(RuntimeError, match="route_mode"):
+        with pytest.raises(RuntimeError, match="router_layer"):
             run_tool("guideline_engine", {"case": make_case()})  # type: ignore[arg-type]
 
     def test_node_dispatches_plan_subset_in_dependency_order(
@@ -483,11 +471,11 @@ class TestExecutionLayer:
         monkeypatch.setattr(exec_node_module, "IMPLEMENTED_TOOLS", frozenset(specs))
         monkeypatch.setattr(registry_module, "RUNNER_BY_KEY", {k: fake_runner(k) for k in specs})
 
-        case = make_case(neck_length_mm=10.0)  # 短颈 → 复杂模式
-        derive(case)
-        assert case.route_mode is RouteMode.COMPLEX
+        case = make_case(n={"neck_len": 10.0})  # 短颈 → 复杂模式
+        result = route(case)
+        assert result.mode is RouteMode.COMPLEX
 
-        outputs = execution_node({"case": case})["tool_outputs"]  # type: ignore[arg-type]
+        outputs = execution_node({"case": case, "route_result": result})["tool_outputs"]  # type: ignore[arg-type]
 
         assert calls == ["imaging_quantifier", "anatomy_scorer", "memory_retriever"]
         assert set(outputs) == set(specs)
@@ -539,7 +527,7 @@ class TestModePlans:
                     assert position[dep] < position[key], f"{mode}: {dep} 应排在 {key} 之前"
 
     def test_plan_for_rejects_unrouted_case(self) -> None:
-        with pytest.raises(RuntimeError, match="route_mode"):
+        with pytest.raises(RuntimeError, match="route_result"):
             plan_for(None)
 
     def test_plan_for_unknown_mode_is_loud(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -606,7 +594,13 @@ class TestToolsPackage:
     )
 
     def _request(self) -> ToolRequest:
-        return ToolRequest(case=make_case(), route_mode=RouteMode.GUIDELINE)
+        """工具请求一律由**真路由**产出，不手搓 ``RouteResult``。
+
+        好处是 ``route_result`` 与 ``case`` 天然自洽——手搓能造出「复杂模式 + 无颈长」
+        这种真实路由永远不会给出的组合，测试就会守住一个不存在的世界。
+        """
+        case = make_case()
+        return ToolRequest(case=case, route_result=route(case))
 
     def test_each_tool_module_exports_a_matching_spec(self) -> None:
         for key in self.TOOL_KEYS:
@@ -642,6 +636,36 @@ class TestToolsPackage:
             except Exception as exc:  # noqa: BLE001 - 真实实现可能因输入不足失败，非本测试职责
                 logging.getLogger(__name__).debug("%s 在构造输入下抛错：%r", key, exc)
 
+    def test_consumes_paths_resolve_against_the_models(self) -> None:
+        """``consumes`` 里的路径必须真能解析到，两类前缀各验各的。
+
+        · ``case.<域>.<字段>``  → 必须在 ``VascCase.domain_field_names()`` 里；
+        · ``route_result.<字段>`` → 必须是 ``RouteResult`` 的字段（判定产物走这条）。
+
+        为什么必须有这条：``consumes`` 是**纯声明**——全仓没有任何代码读取它做校验。
+        V3.1(2) 把 ``case.max_diameter_mm`` 改名成 ``c.maxd`` 时，声明会静静过期，
+        直到有人真去实现那个工具才发现（本轮正是这样发现 ``guideline_engine``
+        三条路径全部失效的）。
+
+        校验范围刻意收窄：只有这两种前缀被当作字段路径；描述性条目（``"CTA 影像"``）
+        不校验——强求它可解析等于逼人编一个假字段名。
+        """
+        domains = VascCase.domain_field_names()
+        route_fields = {f.name for f in fields(RouteResult)}
+        problems: list[str] = []
+        for spec in TOOL_REGISTRY:
+            for path in spec.consumes:
+                if path.startswith("case."):
+                    parts = path.split(".")
+                    if len(parts) != 3:
+                        problems.append(f"{spec.key}: {path!r} 应形如 case.<域>.<字段>")
+                    elif parts[2] not in domains.get(parts[1], ()):
+                        problems.append(f"{spec.key}: {path!r} 在 VascCase 中不存在")
+                elif path.startswith("route_result."):
+                    if path.split(".", 1)[1] not in route_fields:
+                        problems.append(f"{spec.key}: {path!r} 在 RouteResult 中不存在")
+        assert not problems, "consumes 声明了不存在的字段路径：" + "；".join(problems)
+
     def test_dependency_chain_is_declared(self) -> None:
         """B → C → E 的硬依赖必须写进 SPEC，而不是靠调用顺序约定。"""
         assert SPEC_BY_KEY["anatomy_scorer"].depends_on == ("imaging_quantifier",)
@@ -652,15 +676,17 @@ class TestToolsPackage:
 
     def test_require_raises_when_upstream_missing(self) -> None:
         """缺上游是错误，不是缺省——不得返回 None 让下游算出一个「正常」结果。"""
-        request = ToolRequest(case=make_case(), route_mode=RouteMode.COMPLEX)
+        case = make_case(n={"neck_len": 10.0})  # 短颈 → 复杂模式
+        request = ToolRequest(case=case, route_result=route(case))
         with pytest.raises(MissingUpstreamError, match="缺少上游工具产物"):
             request.require("imaging_quantifier")
 
     def test_require_returns_upstream_output(self) -> None:
         marker = object()
+        case = make_case(n={"neck_len": 10.0})
         request = ToolRequest(
-            case=make_case(),
-            route_mode=RouteMode.COMPLEX,
+            case=case,
+            route_result=route(case),
             upstream={"imaging_quantifier": marker},
         )
         assert request.require("imaging_quantifier") is marker
@@ -683,11 +709,14 @@ class TestOutputLayer:
         """decision_path 与 trace 必须逐条对应，**含被否决项**。"""
         recommendation, result = self._recommendation()
         assert len(recommendation.decision_path) == len(result.trace)
-        for step, source in zip(recommendation.decision_path, result.trace, strict=True):
-            assert step.order == source.order
-            assert step.condition == source.condition
-            assert step.result == source.result
-            assert step.rule_ref == source.rule_ref
+        for index, (step, source) in enumerate(
+            zip(recommendation.decision_path, result.trace, strict=True), start=1
+        ):
+            assert step.order == index
+            assert step.result is source.verdict
+            assert step.rule_ref == source.rule_id
+            assert step.condition == RULES[source.rule_id].name
+            assert step.note == RULES[source.rule_id].source
 
     def test_rejected_steps_are_preserved(self) -> None:
         """审计要求：不得只留命中项。"""
@@ -702,8 +731,8 @@ class TestOutputLayer:
 
     def test_confidence_and_review_flag_come_from_rules_layer(self) -> None:
         recommendation, result = self._recommendation()
-        assert recommendation.confidence == result.confidence
-        assert recommendation.manual_review_required == result.manual_review_required
+        assert recommendation.confidence_level == result.confidence_level
+        assert recommendation.manual_review_required is (result.kind is RouteKind.REVIEW)
 
     def test_evidence_chain_carries_source_quote(self) -> None:
         recommendation, _ = self._recommendation()
@@ -843,12 +872,12 @@ class TestGraphEndToEnd:
         assert isinstance(recommendation, FinalRecommendation)
         assert recommendation.case_id == "GRAPH-000"
         assert recommendation.route_mode is RouteMode.GUIDELINE
-        assert 0.0 <= recommendation.confidence <= 1.0
+        assert recommendation.confidence_level in {"高", "中", "低"}
         assert recommendation.decision_path
         assert recommendation.evidence_chain
 
     def test_emergency_case_routes_emergency(self) -> None:
-        state = run_preop(make_case(rupture_status=RuptureStatus.CONFIRMED), checkpointer=None)
+        state = run_preop(make_case(c={"rupture_report": "明确破裂"}), checkpointer=None)
         assert state["final_recommendation"].route_mode is RouteMode.EMERGENCY
 
     def test_audit_trail_records_all_four_nodes(self) -> None:
@@ -887,8 +916,8 @@ class TestGraphEndToEnd:
         """图内部对 case 的回填不得污染调用方对象。"""
         case = make_case()
         run_preop(case, checkpointer=None)
-        assert case.route_mode is None
-        assert case.urgency_triggered is None
+        assert case.r.next is None
+        assert case.k.classifiable is None
 
     def test_tool_outputs_empty_reflects_real_gap(self) -> None:
         assert run_preop(make_case(), checkpointer=None)["tool_outputs"] == {}
@@ -913,13 +942,13 @@ class TestCheckpointRoundTrip:
 
         assert isinstance(values["case"], VascCase)
         assert values["case"].case_id == "GRAPH-RICH"
-        assert values["case"].field_evidence["max_diameter_mm"].source_quote.startswith("CTA")
+        assert values["case"].field_evidence["cl.aaa_diam"].source_quote.startswith("CTA")
         assert values["case"].urgency_flag_audit is not None
         assert values["case"].urgency_flag_audit.set_by is FieldWriter.HUMAN
 
         assert len(values["route_result"].trace) > 0
         assert isinstance(values["final_recommendation"], FinalRecommendation)
-        assert values["final_recommendation"].route_mode is values["route_result"].route_mode
+        assert values["final_recommendation"].route_mode is values["route_result"].mode
 
     def test_audit_trail_survives_round_trip(self, tmp_path: Path) -> None:
         db = tmp_path / "checkpoints.sqlite"
@@ -969,7 +998,7 @@ class TestCheckpointRoundTrip:
         with sqlite_checkpointer(db) as saver:
             run_preop(make_case(case_id="GRAPH-A"), checkpointer=saver, thread_id="T-A")
             run_preop(
-                make_case(case_id="GRAPH-B", rupture_status=RuptureStatus.CONFIRMED),
+                make_case(case_id="GRAPH-B", c={"rupture_report": "明确破裂"}),
                 checkpointer=saver,
                 thread_id="T-B",
             )
@@ -1170,7 +1199,7 @@ class TestRunIsolation:
         """
         db = tmp_path / "checkpoints.sqlite"
         original = make_case(case_id="GRAPH-REVISED")
-        revised = make_case(case_id="GRAPH-REVISED", neck_length_mm=12.0)
+        revised = make_case(case_id="GRAPH-REVISED", n={"neck_len": 12.0})
 
         with sqlite_checkpointer(db) as saver:
             first = run_preop(original, checkpointer=saver)

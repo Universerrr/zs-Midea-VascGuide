@@ -25,7 +25,8 @@
     3. ``model_version`` 进审计哈希投影。同一病例在两个模型版本下得出不同
        风险值，是必须能被区分的两个事实。
     4. 风险值**不参与路由判定**（路由已在执行层之前完成）。它只影响输出层的
-       措辞与是否建议 MDT，不得反向修改 ``case.route_mode``。
+       措辞与是否建议 MDT，不得反向修改 ``request.route_result``（它是
+       ``frozen`` dataclass，改不动本身也说明：路由结论只能由路由层产生）。
 """
 
 from __future__ import annotations

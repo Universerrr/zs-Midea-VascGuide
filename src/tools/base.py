@@ -16,9 +16,10 @@
     ==================  =========================  ============================
 
 与编排层的关系：
-    本包只依赖 ``src/models/``；``src/preop_agent/execution_layer/`` 反过来依赖
-    本包。方向固定为 ``models ← tools ← preop_agent``，不构成环。因此
-    :class:`ToolSpec` 定义在这里而不是编排层——工具元信息属于工具契约，
+    本包依赖 ``src/models/`` 与 ``src/rules/``（只为取 :class:`RouteResult` 类型）；
+    ``src/preop_agent/execution_layer/`` 反过来依赖本包。方向固定为
+    ``models/rules ← tools ← preop_agent``，不构成环——``rules`` 侧从不 import 本包。
+    因此 :class:`ToolSpec` 定义在这里而不是编排层——工具元信息属于工具契约，
     不属于调度器。
 
 治理红线：
@@ -37,8 +38,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..models.enums import RouteMode
 from ..models.preop.case import VascCase
+from ..rules.router import RouteResult
 
 __all__ = [
     "MissingUpstreamError",
@@ -82,12 +83,17 @@ class ToolSpec:
 class ToolRequest:
     """一次工具调用的完整输入。
 
+    ``route_result`` 是**路由结论整体**，不只取模式：有的工具需要判定产物
+    （如 ``CL.TAAA_IV`` 解剖分型），而那些产物**不在** ``VascCase`` 里
+    （它们是规则算出来的，不是病例事实）。只传 ``route_mode`` 会让这些工具
+    要么读不到、要么被迫自己重算一遍——后者就是第二处判据。
+
     ``upstream`` 以**工具键**为键，只含本次运行中**已执行完成**的上游产物。
     取值请用 :meth:`require`，不要用 ``.get()`` —— 缺上游是错误，不是缺省。
     """
 
     case: VascCase
-    route_mode: RouteMode
+    route_result: RouteResult
     upstream: Mapping[str, Any] = field(default_factory=dict)
 
     def require(self, key: str) -> Any:

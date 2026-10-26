@@ -112,20 +112,30 @@ def execution_order(
 
 
 def execution_node(state: PreopState) -> dict[str, Any]:
-    """执行层节点：按 ``route_mode`` 取计划 → 拓扑排序 → 逐工具执行。
+    """执行层节点：按路由结论的模式取计划 → 拓扑排序 → 逐工具执行。
 
     参数：
-        state: 至少含 ``case``（``route_mode`` 已由路由层回填）。
+        state: 至少含 ``case`` 与 ``route_result``（模式由后者给出）。
 
     返回：
         含 ``tool_outputs`` 的状态增量，以**工具键**为键；缺项即代表该工具
         未执行（与 ``..state`` 约定一致）。
 
+    非模式出口（人工复核 / 资料核实）**不跑任何工具**：那两个出口的含义就是
+    「判定依据不足，先别算」，此时跑工具等于用不可信输入产出看似正常的产物。
+
     抛出：
-        RuntimeError: ``case.route_mode`` 为 ``None``（未经路由层）。
+        RuntimeError: state 里没有 ``route_result``（未经路由层）。
     """
-    case = state["case"]
-    plan = plan_for(case.route_mode)
+    result = state.get("route_result")
+    if result is None:
+        raise RuntimeError(
+            "execution_layer 需要 state['route_result']：请在 router_layer 之后调用。"
+        )
+    if result.mode is None:
+        # REVIEW / VERIFY：无模式即无计划，返回空产物（不抛错，这是正常路径）。
+        return {"tool_outputs": {}}
+    plan = plan_for(result.mode)
 
     outputs: dict[str, Any] = {}
     for key in execution_order(plan, IMPLEMENTED_TOOLS):

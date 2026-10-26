@@ -46,7 +46,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from ..models.preop.case import VascCase
-from ..rules.router import RouteResult, StepTrace
+from ..rules.router import RouteResult, RuleTrace
 from .execution_layer.node import execution_node
 from .input_layer.node import input_node
 from .output_layer.node import output_node
@@ -134,14 +134,19 @@ def allowed_msgpack_types() -> list[type]:
 
     根集合覆盖三类，再由 :func:`_declared_types` 递归补全其嵌套引用：
         · pydantic 模型（``VascCase`` / 产物模型 / 审计留痕模型）；
-        · dataclass（``RouteResult`` / ``StepTrace`` / ``NodeAudit``）；
-        · 全部枚举（含 ``FieldWriter``，它嵌在 ``FieldProvenance`` 里）。
+        · dataclass（``RouteResult`` / ``RuleTrace`` / ``NodeAudit``）；
+        · 枚举（``RouteMode`` / ``FieldWriter``）。
+
+    枚举**显式列出**，不靠遍历某个模块的 ``vars()``：那种写法会把「凡定义在
+    该模块里的类型」全塞进白名单，包括早已无人引用的死枚举 —— 白名单一旦宽于
+    实际需要，checkpoint 反序列化面就被无谓放大，而缩小它的时机永远等不到。
+    递归展平（:func:`_declared_types`）仍会自动发现嵌在模型字段里的枚举，
+    显式登记只是为了「白名单内容一眼可见」，重复项按全限定名去重。
     """
-    from ..models import enums as enums_module
-    from ..models.audit import FieldProvenance, UrgencyFlagAudit
+    from ..models.audit import FieldProvenance, FieldWriter, UrgencyFlagAudit
     from ..models.preop.assessment import AnatomyScore, RiskAssessment
     from ..models.preop.measurement import VascMeasurement
-    from ..models.preop.recommendation import FinalRecommendation
+    from ..models.preop.recommendation import FinalRecommendation, RouteMode
     from .state import NodeAudit
 
     roots: list[Any] = [
@@ -151,16 +156,13 @@ def allowed_msgpack_types() -> list[type]:
         RiskAssessment,
         FinalRecommendation,
         FieldProvenance,
+        FieldWriter,
         UrgencyFlagAudit,
+        RouteMode,
         RouteResult,
-        StepTrace,
+        RuleTrace,
         NodeAudit,
     ]
-    roots.extend(
-        obj
-        for obj in vars(enums_module).values()
-        if isinstance(obj, type) and getattr(obj, "__module__", "") == enums_module.__name__
-    )
 
     return _declared_types(roots)
 

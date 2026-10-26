@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Final
 
-from ...models.enums import RouteMode
+from ...models.preop.recommendation import RouteMode
 
 __all__ = ["MODE_PLANS", "plan_for"]
 
@@ -63,7 +63,8 @@ def plan_for(mode: RouteMode | None) -> tuple[str, ...]:
     """
     if mode is None:
         raise RuntimeError(
-            "execution_layer 需要已回填 route_mode 的 case：请在 router_layer 之后调用。"
+            "execution_layer 需要已路由出模式的病例（route_result.mode）："
+            "请在 router_layer 之后、且结论为「进入模式」时调用。"
             "（直接构造的 VascCase 该字段为 None，无模式即无计划。）"
         )
     try:
