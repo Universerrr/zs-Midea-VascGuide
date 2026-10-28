@@ -56,6 +56,17 @@ class FieldProvenance(BaseModel):
     说明：
         「写入者」是归责的关键 —— 同一个字段可能由 LLM 抽取、由影像量化器写入，
         或被人工覆写；三者可信度与责任主体完全不同，必须可区分。
+
+    ⚠️ **本模型刻意不含 ``confidence`` 字段**（2026-10-26 删除）。
+    字段级点估计给不出依据：LLM 报的 0.95 与影像算法的 0.95 不是同一种东西，
+    二者乘进同一套公式只会造出「看起来精确的无依据数字」。改由两处表达：
+
+        · **缺什么** —— ``RouteResult.evidence_gaps``（逐项列出未判定的字段）；
+        · **结论有多可信** —— ``FinalRecommendation.confidence_level``（高/中/低，
+          判据可枚举，见 :func:`src.rules.router._confidence`）。
+
+    若将来确要重新引入，须先回答「这个数字的依据是什么、如何校准」，
+    否则不要加回。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -67,12 +78,6 @@ class FieldProvenance(BaseModel):
     writer: FieldWriter = Field(
         ...,
         description="写入者：LLM / 影像量化器 / 人工 / 系统。归责必需。",
-    )
-    confidence: float | None = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        description="该字段的抽取/写入置信度（0.00~1.00）。",
     )
     overwritten_by_human: bool = Field(
         default=False,

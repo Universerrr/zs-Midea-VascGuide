@@ -6,8 +6,9 @@
        转成 ``False`` 会把「资料不足」伪装成「已排除」；
     ② ``ruleset_version``：直接取自 :class:`RouteResult` 的复合版本串；
     ③ ``input_snapshot_hash``：取自输入层算好的输入快照哈希；
-    ④ ``evidence_chain``：路由结论的依据 + ``VascCase.field_evidence`` 里每个
-       带出处的字段（原告原文），使每条建议可回指到具体规则与原文；
+    ④ ``evidence_chain``：三层可逐环核对 —— **结论 → 每条规则的实际判定与它读到的
+       字段值 → ``VascCase.field_evidence`` 里的原文出处**。被否决的规则同样入链
+       （不得只留命中项），否则「为什么排除其他分支」无从复核；
     ⑤ ``tool_findings``：各工具产物的要点摘要（见下节）。
 
 ## 为什么必须读 ``tool_outputs``
@@ -79,6 +80,9 @@ SUMMARY_SKIPPED_FIELDS: Final[frozenset[str]] = frozenset({"case_id"})
 #: 非模型产物（不该发生，但兜底）的摘要截断长度。
 MAX_FALLBACK_SUMMARY_CHARS: Final[int] = 120
 
+#: 三值判定 → 中文。``None`` 必须单独措辞：它是「未判定」，不是「不成立」。
+VERDICT_TEXT: Final[Mapping[bool | None, str]] = {True: "成立", False: "不成立", None: "无法判定"}
+
 #: 主建议占位（**不含任何临床主张**，等临床口径确认后替换）。
 PRIMARY_RECOMMENDATION_PLACEHOLDER: str = (
     "〔待补临床口径〕诊断与治疗方式的主建议尚未定义：需先确认三种路由模式各自的"
@@ -97,13 +101,19 @@ TRANSLATION_BLOCKED_REASON: str = (
 
 
 def _render(value: Any) -> str:
-    """把字段值渲染为人类可读字符串（枚举取中文值，列表串接）。"""
+    """把字段值渲染为人类可读字符串（枚举取中文值，列表/字典展开）。
+
+    空容器要显式说「（空）」：``d.surg = `` 这种右值留白的写法在证据链里
+    会被误读成「漏了」，而它其实是一个已求值但为空的字段。
+    """
     if value is None:
         return "（未提及）"
     if isinstance(value, Enum):
         return str(value.value)
     if isinstance(value, (list, tuple)):
-        return "、".join(_render(v) for v in value)
+        return "、".join(_render(v) for v in value) or "（空）"
+    if isinstance(value, dict):
+        return "、".join(f"{key}={_render(item)}" for key, item in value.items()) or "（空）"
     return str(value)
 
 
@@ -203,9 +213,28 @@ def _to_decision_steps(trace: Sequence[RuleTrace]) -> list[DecisionStep]:
 
 
 def _build_evidence(case: VascCase, result: RouteResult) -> list[EvidenceItem]:
-    """构造证据链：路由结论的依据 + 各带出处字段的原文。
+    """构造证据链：**结论 → 规则 → 字段值 → 原文出处**，四环各自可独立核对。
 
-    证据链的用途是「可追溯」——每条建议都要能回指到规则编号与原文片段。
+    证据链回答的是「这个结论怎么推出来的」，不是「记录有没有被改过」（后者是
+    ``audit_trail`` 的哈希链）。因此它必须做到 **每一环都能被第三个人复算**：
+
+    ==========  ===========================================================
+    环节        内容 / 来源
+    ==========  ===========================================================
+    ① 结论      ``result.reason`` + 命中规则 ``result.rule_id``
+    ② 规则      ``result.trace`` 逐条（**含被否决项**），每条写明判定结果
+                与它读到的字段实际值
+    ③ 字段      字段清单取自 ``RULES[rule_id].fields`` —— 规则自己声明的输入，
+                不在此处另立一份「这条规则读什么」的映射（那是第二处真源）
+    ④ 原文      ``case.field_evidence[path].source_quote``，缺则留空
+    ==========  ===========================================================
+
+    ② 与 ④ 刻意分成两段而不是逐字段嵌套：同一字段可能被多条规则读
+    （如 ``cl.aaa_rupture`` 同时被 ``G08.R01`` / ``G08.R03`` 读），
+    若把原文挂在每条规则下会重复 N 次；单独成段则只出现一次。
+
+    字段值一律经 :func:`_read_path` 现读 ``case``，不缓存在 ``RouteResult`` 里 ——
+    ``case`` 本身就是判定时的输入快照，两处存同一事实只会漂移。
     """
     items: list[EvidenceItem] = []
 
@@ -217,6 +246,31 @@ def _build_evidence(case: VascCase, result: RouteResult) -> list[EvidenceItem]:
         )
     )
 
+    # ② 每条已求值规则一行：判定结果 + 它声明读取的字段实际值
+    for entry in result.trace:
+        spec = RULES.get(entry.rule_id)
+        verdict = VERDICT_TEXT[entry.verdict]
+        if spec is None:
+            # 规则表里查不到（不应发生）——如实标注，不编造字段清单。
+            items.append(
+                EvidenceItem(
+                    statement=f"{entry.rule_id} → {verdict}｜（规则未登记，无法列出读取字段）",
+                    rule_ref=entry.rule_id,
+                )
+            )
+            continue
+        # 不设截断：证据链的价值就是完整可核对，「等共 N 项」会让复算断在半路。
+        # 当前 54 条规则最多读 7 个字段（G03.R10 的 NEWS2 各项），一条一行仍可读。
+        pairs = [f"{path} = {_render(_read_path(case, path))}" for path in spec.fields]
+        detail = "；".join(pairs) if pairs else "（本规则不读模型字段）"
+        items.append(
+            EvidenceItem(
+                statement=f"{entry.rule_id} {spec.name} → {verdict}｜{detail}",
+                rule_ref=entry.rule_id,
+            )
+        )
+
+    # ④ 原文出处：每个带出处的字段单独一条，附写入者（归责必需）
     for field_name in sorted(case.field_evidence):
         provenance = case.field_evidence[field_name]
         items.append(

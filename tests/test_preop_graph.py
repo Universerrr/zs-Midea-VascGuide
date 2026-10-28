@@ -25,7 +25,7 @@ import logging
 import os
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from enum import Enum
 from itertools import pairwise
 from pathlib import Path
@@ -74,6 +74,8 @@ from src.preop_agent.output_layer.node import (
     MAX_SUMMARY_FIELDS,
     PRIMARY_RECOMMENDATION_PLACEHOLDER,
     TRANSLATION_IMPLEMENTED,
+    VERDICT_TEXT,
+    _build_evidence,
     _render,
     _render_scalar,
     build_tool_findings,
@@ -81,7 +83,7 @@ from src.preop_agent.output_layer.node import (
 )
 from src.preop_agent.router_layer.node import router_node
 from src.preop_agent.state import HASHED_KEYS, _project, stable_hash
-from src.rules.router import RULES, RouteKind, RouteResult, route
+from src.rules.router import RULES, RouteKind, RouteResult, RuleTrace, route
 from src.tools.base import MissingUpstreamError, ToolRequest, ToolSpec
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -156,7 +158,6 @@ def make_rich_case() -> VascCase:
             "cl.aaa_diam": FieldProvenance(
                 source_quote="CTA 示腹主动脉最大径 42mm。",
                 writer=FieldWriter.LLM,
-                confidence=0.95,
             )
         },
         urgency_flag_audit=UrgencyFlagAudit(
@@ -738,6 +739,43 @@ class TestOutputLayer:
         recommendation, _ = self._recommendation()
         quotes = [item.source for item in recommendation.evidence_chain if item.source]
         assert "CTA 示腹主动脉最大径 42mm。" in quotes
+
+    def test_evidence_chain_lists_every_evaluated_rule(self) -> None:
+        """每条已求值规则都要在链上 —— 只留命中项就无法复核「为什么排除其他分支」。"""
+        case = make_rich_case()
+        result = route(case)
+        items = _build_evidence(case, result)
+        rule_refs = [item.rule_ref for item in items[1 : 1 + len(result.trace)]]
+        assert rule_refs == [entry.rule_id for entry in result.trace]
+
+    def test_evidence_chain_marks_unregistered_rule_instead_of_inventing_fields(self) -> None:
+        """规则表里查不到时如实标注 —— 编一份字段清单等于伪造依据。"""
+        case = make_rich_case()
+        result = route(case)
+        patched = replace(result, trace=[RuleTrace("X.NOT_A_RULE", True, "G07")])
+        items = _build_evidence(case, patched)
+        # 前两条固定是「结论 + 该规则」；其后可能还有 field_evidence 的原文条目
+        assert [item.rule_ref for item in items[:2]] == [result.rule_id, "X.NOT_A_RULE"]
+        assert "规则未登记" in items[1].statement
+
+    def test_evidence_chain_says_so_when_a_rule_reads_no_fields(self, monkeypatch) -> None:
+        """规则不声明字段时明说，而不是在「｜」后面留白。"""
+        case = make_rich_case()
+        result = route(case)
+        first = result.trace[0].rule_id
+        monkeypatch.setitem(RULES, first, replace(RULES[first], fields=()))
+        items = _build_evidence(case, result)
+        assert "不读模型字段" in items[1].statement
+
+    def test_evidence_chain_keeps_three_valued_verdicts(self) -> None:
+        """UNKNOWN 必须写成「无法判定」，不得与「不成立」混同。"""
+        # 空病例（不是基线）：缺字段 → 规则求值为 UNKNOWN
+        case = VascCase(case_id="EMPTY-EVIDENCE")
+        result = route(case)
+        items = _build_evidence(case, result)
+        joined = " ".join(item.statement for item in items)
+        assert "无法判定" in joined
+        assert VERDICT_TEXT[None] == "无法判定"
 
     def test_clinical_conclusion_is_an_explicit_placeholder(self) -> None:
         """治疗建议口径未定 → 必须是显式占位，不得编造临床主张。"""

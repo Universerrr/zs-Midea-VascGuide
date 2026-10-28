@@ -71,10 +71,10 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 |---|---|
 | **术前数据模型（5 个）** | `VascCase`（**160 字段 / 14 个按域子模型**）、`VascMeasurement`、`AnatomyScore`、`RiskAssessment`、`FinalRecommendation` |
 | **枚举（2 个，各归其位）** | `FieldWriter`（写入者归责，定义在 `audit.py`）、`RouteMode`（路由模式三值，定义在 `recommendation.py`）。事实字段的取值域改用字段级 `Literal`（中文值直写）——V3.1(2) 的「允许值」列一列四义，单个 `StrEnum` 表达不了 |
-| **审计留痕结构** | `FieldProvenance`（字段原文出处 / 写入者 / 置信度）、`UrgencyFlagAudit` |
+| **审计留痕结构** | `FieldProvenance`（字段原文出处 / 写入者 / 是否被人工覆写）、`UrgencyFlagAudit` |
 | **确定性规则层** | `router.py`（V3.1(2) 的 54 条判定规则 + 三值求值）+ `RULESET.md`（规则↔源行对照）+ `version.py`（规则版本），详见「四」 |
 | **编排层（LangGraph）** | 四层节点 `input → router → execution → output` 串成 `StateGraph` 并接 SQLite Checkpoint；每节点自动留痕（节点名 / 起止时间 / 输入输出哈希），审计链可**逐环校验**，详见「五」 |
-| **测试与工具链** | **590 项测试**（86 路由基线 + 81 数据契约 + 107 编排层 + 199 规则分支 + 117 结论自证契约）、`ruff` 无告警、覆盖率 **99%**（`router.py` 99%、`audit.py` 与 `recommendation.py` 100%） |
+| **测试与工具链** | **606 项测试**（86 路由基线 + 81 数据契约 + 111 编排层 + 199 规则分支 + 117 结论自证契约 + 12 CLI 契约）、`ruff` 无告警、覆盖率 **99%**（`router.py` 99%、`audit.py` 与 `recommendation.py` 100%） |
 
 ### ⏳ 尚未开始
 
@@ -107,7 +107,6 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 **④ 其他**
 
 - **术中 / 术后 Agent** —— `intraop_agent/`、`postop_agent/` 目前仅为目录骨架，无实现。
-- **`main.py`** —— 仍为占位入口。
 
 推进顺序遵循「**确定性内核优先**」：先落地数据模型、规则层与编排骨架，
 **LLM 只在最后接入两端的抽取与转译节点**，中间管道保持零 LLM 参与。
@@ -166,12 +165,15 @@ zs-Midea VascGuide/
 │   ├── conftest.py              # ✅ 唯一病例构造入口：baseline_kwargs() + make_case()（域级浅合并）
 │   ├── test_preop.py            # ✅ 86 项路由端到端基线（五出口 / 同桶优先级 / 标签）
 │   ├── test_model_contract.py   # ✅ 81 项数据契约（160 字段 / 不确定值白名单 / 严格模式）
-│   ├── test_preop_graph.py      # ✅ 107 项编排层 + 调度表 + 依赖排序 + Checkpoint 往返 + 架构守卫
+│   ├── test_preop_graph.py      # ✅ 111 项编排层 + 调度表 + 依赖排序 + Checkpoint 往返 + 架构守卫
 │   ├── test_router_branches.py  # ✅ 199 项规则分支（54 条逐条命中 + 三值语义 + 派生量）
-│   └── test_router_note_contract.py # ✅ 117 项结论自证契约（rule_id / reason / gaps / trace）
+│   ├── test_router_note_contract.py # ✅ 117 项结论自证契约（rule_id / reason / gaps / trace）
+│   └── test_main.py             # ✅ 12 项 CLI 契约（错误提示可读性 / JSON 与文本同源 / 副作用边界）
+├── cases/                       # 病例样例（JSON，直接喂给 main.py）
+│   └── example.json             # ✅ 完整病例：走指南模式、零缺口、含 3 条原文出处
 ├── pyproject.toml               # 依赖与项目元数据（唯一"真源"）
 ├── uv.lock                      # 全量精确锁定（含传递依赖，由 uv 生成）
-├── main.py                      # 系统入口（占位）
+├── main.py                      # ✅ 命令行入口（病例 JSON → 结论 + 证据链 + 审计落盘）
 ├── LICENSE                      # MIT
 ├── .gitignore                   # Python 模板
 ├── .python-version              # 解释器版本锁定（3.13.14）
@@ -453,19 +455,43 @@ LangGraph 用 msgpack 序列化状态。对本项目自定义类型（pydantic �
 # 1) 建环境 + 安装全部依赖（≈ npm install）
 uv sync
 
-# 2) 运行占位入口（≈ npm run）
-uv run main.py
+# 2) 跑一个示例病例（≈ npm run）
+uv run python main.py --case cases/example.json
 ```
 
 > - uv 会自动创建 `.venv/` 并按 `uv.lock` **精确安装**，**无需手动 `activate`**；
 > - 首次克隆若尚无 `uv.lock`，执行 `uv sync` 会自动生成。
 
-预期输出：打印项目名称与当前阶段（`skeleton`）。
+预期输出：该病例的出口（指南模式 / `G04.R14`）、置信度、病种标签、资料缺口，
+以及**证据链**（结论 → 每条规则读了哪些字段 → 原文字段出处）与审计留痕（哈希链闭合校验）。
 
-### 跑一次术前流水线（编排层）
+### 用命令行跑病例
 
-`main.py` 仍是占位入口。要实际跑通「病例 → 最终建议 + 可审计落盘」，直接用编排层入口。
-`VascCase` 的 160 个字段**按域分组**，取值用**中文字面量**直写（V3.1(2) 的「允许值」原文）：
+```bash
+uv run python main.py --case cases/example.json        # 结论 + 证据链（默认层）
+uv run python main.py --case cases/example.json -v     # 展开全部规则与全部缺口
+uv run python main.py --case cases/example.json -vv    # 再加完整决策链（含被否决项）
+uv run python main.py --case cases/example.json --json # 机器可读（route_result + final_recommendation）
+uv run python main.py --dump-template > cases/my.json  # 生成 160 字段空模板
+```
+
+| 开关 | 作用 |
+|---|---|
+| `-v` / `-vv` | 递增详细度。默认层只展开**成立**的规则；`-v` 展开全部 49 条（含被否决项）；`-vv` 加 `decision_path` |
+| `--json` | 输出 `route_result` + `final_recommendation` + `audit`，与文本渲染同源 |
+| `--no-persist` | 不写审计库。**仅限试算** —— 正式评估必须落盘，否则事后无法追溯 |
+| `--thread-id` | 指定审计线程（续跑已有运行；默认每次运行新开一条） |
+
+**退出码**：`0` 成功 / `1` 输入或运行错误 / `2` 命令行用法错误。无参数运行时打印帮助并返回 `2`。
+
+> **病例 JSON 是手工填的**：LLM 抽取器（病历原文 → `VascCase`）尚未实现，所以目前
+> 病例由结构化字段直接构造。这不影响跑通 —— `cases/example.json` 就是一份完整病例。
+> 缺字段不会报错，而是被判为 **UNKNOWN** 并汇总进「资料缺口」，逐次补齐即可看到结论变化。
+
+### 在自己的代码里调用（编排层）
+
+需要嵌入自己的程序时，直接调 `run_preop`，`VascCase` 的 160 个字段**按域分组**，
+取值用**中文字面量**直写（V3.1(2) 的「允许值」原文）：
 
 > 域前缀：`p` 人口学 / `t` 时间基准 / `d` 原始文书 / `q` 数据质量 / `s` 症状体征 / `v` 生命体征 /
 > `lab` 化验 / `c` CTA 报告文字 / `n` 解剖（颈·肾·髂·入路）/ `gen` 遗传 / `inf` 炎症 /
@@ -532,15 +558,15 @@ with sqlite_checkpointer() as reopened:
 ### 常用命令（测试 / 检查）
 
 ```bash
-# 跑全部测试（应为 590 passed, 4 skipped）
+# 跑全部测试（应为 606 passed, 4 skipped）
 uv run pytest tests/ -q
 
 # 静态检查（应为 All checks passed）
-uv run ruff check src/ tests/
+uv run ruff check .
 
 # 格式检查（不改文件；加 --diff 可预览改动）
-uv run ruff format --check src/ tests/
-uv run ruff format src/ tests/          # 真正改写文件
+uv run ruff format --check .
+uv run ruff format .                    # 真正改写文件
 
 # 覆盖率（按需，比朴素跑慢约 7 倍，会在仓库根生成 .coverage）
 uv run pytest tests/ --cov --cov-report=term-missing
@@ -557,7 +583,7 @@ uv run pytest tests/ --cov --cov-report=term-missing
 - **覆盖了哪些代码**：`--cov-report=html` 生成 `htmlcov/index.html`，红色行即未被测试执行到的分支。
 
 > ⚠️ **覆盖率 ≠ 测试结果**：前者衡量「代码有多少行被执行到」，后者衡量「每个用例过没过」。
-> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 590 项全绿、覆盖率 99%。
+> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 606 项全绿、覆盖率 99%。
 
 ---
 
