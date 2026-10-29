@@ -1,4 +1,4 @@
-"""术前路由判定流水线 —— V3.1(2) 的 **54 条判定规则**。
+"""术前路由判定流水线 —— V3.1(2) 的 **55 条判定规则**。
 
 对照表见 ``src/rules/RULESET.md``（rule_id ↔ 函数 ↔ 源行）。本模块是规格的**第二真源**：
 ``RULES`` 字典里的 ``source`` 指向 V3.1(2) 的具体单元格，改规则必须同步改表。
@@ -18,7 +18,7 @@
 
 范围
 ----
-只实现 G03(21) / G04(18) / G08(11) / G09(4) = **54 条**。
+只实现 G03(21) / G04(19) / G08(11) / G09(4) = **55 条**。
 G00–G02 的 9 条属「读取资料 / 证据质量 / 事实抽取」，归 LLM 抽取层，不进本模块。
 """
 
@@ -48,6 +48,15 @@ TaaaGrade = Literal["符合", "疑似", "不符合", "不可评价"]
 
 它是**判定产物**（映射表 ``01!163``），不进 ``VascCase``、不进 160 字段清单；
 由 :func:`g08_r08_taaa_iv_label` 算出后随 :class:`RouteResult` 带给下游工具。
+"""
+
+SourceKind = Literal["ESVS原文", "工程安全规则", "其他指南"]
+"""规则来源性质（V3.6 起）。
+
+为什么要有这一层：55 条判定规则里有一部分并非 ESVS 2024 原文，而是工程为
+安全自行拟定的分流规则（另有少数取自 ACC/AHA、NEWS2、KDIGO 等）。不标注
+来源，输出层就无法告诉医生「这条依据是不是指南说的」—— 而这正是临床采纳
+与论文溯源时最需要的一句话。
 """
 
 
@@ -96,6 +105,18 @@ class RouteResult:
     reason: str
     next_node: NextNode
     emergency_level: EmergencyLevel
+    next_nodes: list[str] = field(default_factory=list)
+    """本次结论要走的**全部节点**（有序，恒以 ``next_node`` 打头）。V3.6 起启用。
+
+    规格的「输出／下一节点」列天然是序列 —— ``D3.1.R01`` 写的是
+    「G05 急诊模式**并**进入 D3.2」，两个动作都要做，不是二选一；
+    ``D7.2.R91`` 甚至可以从病种流程反向跳回 ``G03``。单值 ``next_node``
+    表达不了这种「同时/依次走多处」。
+
+    为什么保留 ``next_node``：现有 55 条规则各走一个节点，它是**主出口**；
+    全部改写成序列会让「本次到底去哪」这个主语丢失，输出层无从判断。
+    约定：``len(next_nodes) == 1`` 时与旧语义完全等价。
+    """
     mode: RouteMode | None = None
     evidence_gaps: list[str] = field(default_factory=list)
     confidence_level: ConfidenceLevel = "中"
@@ -267,6 +288,7 @@ class _Ctx:
         self.news2, self.news2_single3 = _news2(self.v)
         self.genetic_ctx = self.n.genetic_ctx or _derive_genetic_ctx(self.gen)
         self.inflammatory_ctx = self.n.inflammatory_ctx or _derive_inflammatory_ctx(self.inf)
+        self.malperfusion, self.malperfusion_organs = _materialize_malperfusion(self)
 
         # ---- 运行时状态（编排层写入，非字段）----
         self.labels: list[str] = []
@@ -368,6 +390,50 @@ def _derive_inflammatory_ctx(inf: object) -> str | None:
     if mantle == "未见" and wall == "未见":
         return "无当前支持证据"
     return None
+
+
+MPF_ORGANS = ("肾", "肠系膜", "下肢", "其他器官")
+"""``C.MALPERFUSION`` 里代表受累器官的取值；其余（无/疑似/未知/证据冲突）是状态词。"""
+
+MPF_UNCERTAIN = ("疑似", "未知", "证据冲突")
+"""``C.MALPERFUSION`` 里「有值但值本身不确定」的取值 —— 只能产出 UNKNOWN。"""
+
+
+def _materialize_malperfusion(x: _Ctx) -> tuple[Verdict, frozenset[str]]:
+    """器官/肢体灌注障碍 → ``(三值, 受累器官集合)``。
+
+    ``C.MALPERFUSION`` 在 V3.6.2 只有定义行（``G04!C39``）、没有规则行，也没有
+    独立的证据明细层（对照 ``GEN.*`` / ``INF.*`` 那种三层结构）。本函数补上
+    这一层：抽取值优先，缺失时保守派生。
+
+    **本函数永不因分支解剖异常推出 ``True``。** 规格 ``G04!C39`` 明令
+    「不能仅凭解剖狭窄自动推断器官缺血」——``C.BRANCH`` 异常只能导致 ``None``
+    （无法排除），不能导致确认。确认通路只有一条：医生在病历里明确记录了
+    器官/肢体灌注障碍，由抽取层写入 ``c.malperfusion``。
+
+    之所以不在派生里判 ``True``：确认器官缺血需要临床阈值（肌酐升高多少、
+    乳酸超上限多少），V3.6.2 一个都没给；``G03.R21`` 还专门写明「单独乳酸升高
+    不诊断」。在此硬编码阈值，等于把未经审核的判据塞进判定层。
+    """
+    raw = x.c.malperfusion
+    if raw is not None:
+        tokens = {_token(t) for t in raw}
+        organs = frozenset(t for t in tokens if isinstance(t, str) and t in MPF_ORGANS)
+        if tokens & set(MPF_UNCERTAIN):
+            return None, organs
+        return (True, organs) if organs else (False, frozenset())
+
+    branches = x.c.branch
+    if not branches:
+        return None, frozenset()
+    vals = {_token(v) for v in branches.values()}
+    if vals & {"可疑", "不可评价"}:
+        return None, frozenset()
+    limb = x.s.limb
+    limb_clear = not limb or all(_token(t) == "无" for t in limb)
+    if all(v == "通畅" for v in vals) and limb_clear:
+        return False, frozenset()
+    return None, frozenset()
 
 
 # ===========================================================================
@@ -696,6 +762,19 @@ def g04_r18_inflammation_vs_infection(x: _Ctx) -> Verdict:
     )
 
 
+def g04_r21_malperfusion(x: _Ctx) -> Verdict:
+    """器官/肢体灌注障碍 → 复杂。
+
+    V3.6.2 只在 ``G04!C39`` 定义了 ``C.MALPERFUSION``，没有对应的规则行。
+    本规则是代码侧补齐的消费端，**来源性质登记为「工程安全规则」**——
+    不得声称它是 ESVS 原文。
+
+    取值来自 :func:`_materialize_malperfusion`：只有医生明确记录才可能为
+    ``True``；分支解剖异常一律 ``None``，不构成复杂因素。
+    """
+    return x.malperfusion
+
+
 # ===========================================================================
 # G08 · 病种分类（11 条）
 # ===========================================================================
@@ -818,7 +897,7 @@ def g09_r04_classify_and_stop(x: _Ctx) -> Verdict:
 
 
 # ===========================================================================
-# 规则登记表（54 条，唯一真源）
+# 规则登记表（55 条，唯一真源）
 # ===========================================================================
 @dataclass(frozen=True)
 class RuleSpec:
@@ -828,6 +907,20 @@ class RuleSpec:
     name: str
     fields: tuple[str, ...] = ()
     level: EmergencyLevel = "明确危险"
+
+
+RULE_SOURCE: dict[str, tuple[SourceKind, str | None]]
+"""规则 → ``(来源性质, ESVS 章节/推荐号)``。定义与校验见 ``RULES`` 之后。
+
+为什么单独一张表、而不是写进 :class:`RuleSpec`：
+    「来源性质」是横切属性 —— 单看某一条规则的参数时，「它是不是指南原文」
+    并不显眼；集中成一张表才能一眼审阅全貌，也才能一眼看出工程规则占多少。
+    这与既有的 ``LABEL_BY_RULE`` 是同一种做法。
+
+为什么必须登记到条：不标来源，「本结论基于 ESVS 2024」就是失实的 ——
+而临床采纳与论文写作恰好都要用这句话。标成 ``ESVS原文`` 却给不出章节，
+等同于空口引用，故一并断言。
+"""
 
 
 LABEL_BY_RULE: dict[str, str] = {
@@ -1107,6 +1200,13 @@ RULES: dict[str, RuleSpec] = {
         "炎症与感染的鉴别",
         ("n.inflammatory_ctx", "n.infection_ctx"),
     ),
+    "G04.R21": RuleSpec(
+        g04_r21_malperfusion,
+        "G04!39",
+        "G06",
+        "器官或肢体灌注障碍",
+        ("c.malperfusion", "c.branch", "s.limb"),
+    ),
     # ---- G08（11）----
     "G08.R01": RuleSpec(
         g08_r01_d1_asymptomatic,
@@ -1204,7 +1304,124 @@ RULES: dict[str, RuleSpec] = {
     ),
 }
 
-assert len(RULES) == 54, f"V3.1(2) 有 54 条判定规则，实际 {len(RULES)}"
+assert len(RULES) == 55, f"V3.1(2) 有 55 条判定规则，实际 {len(RULES)}"
+
+PENDING_RULES: frozenset[str] = frozenset(
+    {
+        "G04.R19",
+        "G04.R20",
+        "G08.R12",
+        "G08.R13",
+        "G08.R14",
+        "G08.R15",
+        "G09.R05",
+        "G09.R06",
+        "G09.R07",
+        "G09.R08",
+        "G09.R09",
+    }
+)
+"""V3.6.2 规格有、当前尚未实现的判定层规则（11 条）。
+
+为什么显式登记而不是留空：``test_ids_are_contiguous`` 用「已实现 + 待实现」拼出
+完整编号，缺号会立刻失败——它守的是「别漏实现」，不是「别缺号」。把缺口写成
+常量，缺口就从「看不见的空白」变成「看得见的清单」。
+
+实现一条：从本集合删一条、往 ``RULES`` 加一条，总数不变。
+G00–G02 的 9 条不在此列——它们归 LLM 抽取层，不进本模块。
+
+当前总数 55 + 11 = 66 = 规格判定层 65 + 工程补充 1（``G04.R21``）。
+"""
+
+assert len(RULES) + len(PENDING_RULES) == 66, (
+    f"规格判定层 65 条 + 工程补充 1 条 = 66，实际 {len(RULES)} + {len(PENDING_RULES)}"
+)
+
+# ===========================================================================
+# 规则来源性质登记（V3.6 起）—— 全 55 条，一条不少
+# ===========================================================================
+RULE_SOURCE = {
+    # ---- G03 急诊分诊（21）：ESVS 6 / 工程 13 / 其他 2 ----
+    "G03.R01": ("ESVS原文", "§6.1"),
+    "G03.R02": ("ESVS原文", "§6.1"),
+    "G03.R03": ("ESVS原文", "§6.1"),
+    "G03.R04": ("ESVS原文", "§6"),
+    "G03.R05": ("ESVS原文", "§6"),
+    "G03.R06": ("工程安全规则", None),
+    "G03.R07": ("工程安全规则", None),
+    "G03.R08": ("工程安全规则", None),
+    "G03.R09": ("工程安全规则", None),
+    "G03.R10": ("其他指南", None),  # NEWS2 评分标准，非 AAA 诊断指南
+    "G03.R11": ("工程安全规则", None),
+    "G03.R12": ("工程安全规则", None),
+    "G03.R13": ("工程安全规则", None),
+    "G03.R14": ("工程安全规则", None),
+    "G03.R15": ("工程安全规则", None),
+    "G03.R16": ("工程安全规则", None),
+    "G03.R17": ("工程安全规则", None),
+    "G03.R18": ("工程安全规则", None),
+    "G03.R19": ("工程安全规则", None),
+    "G03.R20": ("ESVS原文", "§6"),
+    "G03.R21": ("其他指南", None),  # 检验参考区间，非破裂诊断阈值
+    # ---- G04 复杂度（18）：ESVS 14 / 工程 4 ----
+    "G04.R01": ("ESVS原文", "§8.1"),
+    "G04.R02": ("ESVS原文", "§8.1"),
+    "G04.R03": ("ESVS原文", "§8.1"),
+    "G04.R04": ("ESVS原文", "§8.1"),
+    "G04.R05": ("ESVS原文", "§8.1"),
+    "G04.R06": ("ESVS原文", "§8.1"),
+    "G04.R07": ("ESVS原文", "§10"),
+    "G04.R08": ("ESVS原文", "§8.1"),
+    "G04.R09": ("ESVS原文", "§9"),
+    "G04.R10": ("工程安全规则", None),
+    "G04.R11": ("ESVS原文", "§7"),
+    "G04.R12": ("工程安全规则", None),  # KDIGO 为其中一部分，主体是工程安全触发
+    "G04.R13": ("工程安全规则", None),
+    "G04.R14": ("工程安全规则", None),
+    "G04.R15": ("ESVS原文", "§10.5 Rec154–155"),
+    "G04.R16": ("ESVS原文", "§10.2 Rec145–146"),
+    "G04.R17": ("ESVS原文", "Rec154"),
+    "G04.R18": ("ESVS原文", "§10.1–10.2"),
+    "G04.R21": ("工程安全规则", None),
+    # ---- G08 病种分类（11）：ESVS 9 / 工程 1 / 其他 1 ----
+    "G08.R01": ("ESVS原文", "§2"),
+    "G08.R02": ("其他指南", None),  # ACC/AHA 2022
+    "G08.R03": ("ESVS原文", "§6"),
+    "G08.R04": ("ESVS原文", "§10"),
+    "G08.R05": ("ESVS原文", "§10"),
+    "G08.R06": ("ESVS原文", "§7"),
+    "G08.R07": ("ESVS原文", "§9"),
+    "G08.R08": ("ESVS原文", "§8.1"),
+    "G08.R09": ("工程安全规则", None),  # VascGuide 临床标签设计规则
+    "G08.R10": ("ESVS原文", "§10.2 Rec145–146"),
+    "G08.R11": ("ESVS原文", "§10.5 Rec154–155"),
+    # ---- G09 分类收尾（4）：工程 4 ----
+    "G09.R01": ("工程安全规则", None),
+    "G09.R02": ("工程安全规则", None),
+    "G09.R03": ("工程安全规则", None),  # 临床标签一致性规则
+    "G09.R04": ("工程安全规则", None),  # V1.1 既有分类体系
+}
+"""55 条规则的来源性质与 ESVS 章节（V3.6 表「备注／依据」列的口径）。
+
+当前分布：ESVS 原文 29 / 工程安全规则 22 / 其他指南 3。
+值得知道的是：**G03 急诊 21 条里只有 6 条是 ESVS 原文**，其余 13 条是
+工程为安全自行拟定的分流规则 —— 写论文或做临床采纳时不能笼统声称
+「全部基于 ESVS 2024」。
+"""
+
+_unregistered = set(RULES) - set(RULE_SOURCE)
+if _unregistered:
+    raise RuntimeError(f"以下规则未登记来源性质：{sorted(_unregistered)}")
+
+_stray = set(RULE_SOURCE) - set(RULES)
+if _stray:
+    raise RuntimeError(f"RULE_SOURCE 里有不存在的规则：{sorted(_stray)}")
+
+_empty_section = [rid for rid, (kind, sec) in RULE_SOURCE.items() if kind == "ESVS原文" and not sec]
+if _empty_section:
+    raise RuntimeError(
+        f"以下规则标为 ESVS原文 却未给章节（声称取自指南就必须指得出章节）：{_empty_section}"
+    )
 
 # G03 优先级桶（P01–P04 是分组，不是规则，不进 RULES）
 G03_P01 = (
@@ -1225,6 +1442,16 @@ G03_P01 = (
 G03_P02 = ("G03.R11", "G03.R17", "G03.R18", "G03.R19", "G03.R21")
 G03_P03 = ("G03.R13", "G03.R14")
 G03_P04 = ("G03.R15",)
+
+D3_EMERGENCY_RULES: frozenset[str] = frozenset(
+    {"G03.R01", "G03.R02", "G03.R03", "G03.R04", "G03.R05", "G03.R06", "G03.R07", "G03.R12"}
+)
+"""命中即预置 ``D3`` 病种标签的急诊规则 —— 这些描述的都是破裂／疑似破裂路径。
+
+为什么在 G03 就预置标签：急诊模式**不跑 G08**（分类需要完整资料），若不预置，
+``class_output`` 为空，下游工具A 拿不到病种入口 —— D3 病种流程永远启动不了。
+预置只回答「该走哪条病种路径」，**不改变路由出口本身**（出口仍是 G05）。
+"""
 G04_BLOCKING = (
     "G04.R01",
     "G04.R02",
@@ -1240,8 +1467,12 @@ G04_BLOCKING = (
     "G04.R12",
 )
 """阻断型：命中即判复杂；其 UNKNOWN 也不是放行理由（交给 R13 兜）。"""
-G04_EXTRA = ("G04.R15", "G04.R16", "G04.R17", "G04.R18")
-"""加分型：遗传/炎症线索。命中→复杂；其 UNKNOWN **不阻断** G07 放行。"""
+G04_EXTRA = ("G04.R15", "G04.R16", "G04.R17", "G04.R18", "G04.R21")
+"""加分型：遗传/炎症/灌注线索。命中→复杂；其 UNKNOWN **不阻断** G07 放行。
+
+``G04.R21`` 是本条唯一一条**代码侧补齐**的规则（V3.6.2 只有 ``G04!C39`` 字段行、
+没有规则行），来源性质登记为「工程安全规则」，不得计入 ESVS 原文。
+"""
 G08_RULES = (
     "G08.R01",
     "G08.R02",
@@ -1326,6 +1557,8 @@ def _make(
     gaps: list[str] | None = None,
     unknown_decisive: bool = False,
     trace: list[RuleTrace] | None = None,
+    next_nodes: list[str] | None = None,
+    class_output: list[str] | None = None,
 ) -> RouteResult:
     gap_list = gaps or []
     return RouteResult(
@@ -1333,11 +1566,13 @@ def _make(
         rule_id=rule_id,
         reason=reason,
         next_node=next_node,
+        # 只走一处时自动退化为一元序列，调用方无需判空。
+        next_nodes=next_nodes or [next_node],
         emergency_level=level,
         mode=mode,
         evidence_gaps=gap_list,
         confidence_level=_confidence(gap_list, unknown_decisive),
-        class_output=list(x.labels),
+        class_output=list(class_output) if class_output is not None else list(x.labels),
         cl_taaa_iv=x.taaa_iv,
         k_identity_conflict="是" if _token(x.q.idmatch) == "不一致" else None,
         k_diag_conflict=None if x.diag_conflict is None else ("是" if x.diag_conflict else "否"),
@@ -1388,6 +1623,7 @@ def route(case: VascCase, measurement: VascMeasurement | None = None) -> RouteRe
             next_node="G05",
             level=RULES[hit].level,
             mode=RouteMode.EMERGENCY,
+            class_output=["D3"] if hit in D3_EMERGENCY_RULES else None,
             gaps=_collect_gaps(x, G03_P01, trace),
             trace=trace,
         )
@@ -1570,6 +1806,27 @@ def _finish_mode(
     )
 
 
+# ===========================================================================
+# 三值原语的公开别名 —— 供 ``src/tools/`` 复用同一套判定语言
+# ===========================================================================
+# 「规则主导」不等于「规则实现只能有一份」：三值语义是全系统共用的**判定语言**，
+# 工具A 的病种规则必须与 G03–G09 用同一套 Kleene 求值 —— 否则同一个「疑似」
+# 在两个层会被解释成两种结果，而审计时无从判断哪个对。
+#
+# 下面的赋值**不是第二份实现**：只是给同一批函数对象再起一个公开名字，
+# 让 ``src/tools/`` 不必 import 下划线私名。改语义仍然只改上面那一处。
+and_ = _and
+or_ = _or
+not_ = _not
+eq = _eq
+has = _has
+absent = _absent
+ge = _ge
+between = _between
+token = _token
+is_uncertain_token = _is_uncertain_token
+
+
 __all__ = [
     "FALLBACK_VERIFY",
     "G03_P01",
@@ -1582,11 +1839,25 @@ __all__ = [
     "LABEL_BY_RULE",
     "MANUAL_URGENCY",
     "OUTCOME_PRIORITY",
+    "PENDING_RULES",
     "RULES",
+    "RULE_SOURCE",
     "RouteKind",
     "RouteResult",
     "RuleSpec",
     "RuleTrace",
+    "SourceKind",
     "TaaaGrade",
+    "Verdict",
+    "absent",
+    "and_",
+    "between",
+    "eq",
+    "ge",
+    "has",
+    "is_uncertain_token",
+    "not_",
+    "or_",
     "route",
+    "token",
 ]

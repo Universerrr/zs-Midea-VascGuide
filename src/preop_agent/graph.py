@@ -147,6 +147,7 @@ def allowed_msgpack_types() -> list[type]:
     from ..models.preop.assessment import AnatomyScore, RiskAssessment
     from ..models.preop.measurement import VascMeasurement
     from ..models.preop.recommendation import FinalRecommendation, RouteMode
+    from ..tools.guideline_engine.state import GuidelineEntry, GuidelineReport, NodeOutcome
     from .state import NodeAudit
 
     roots: list[Any] = [
@@ -162,6 +163,9 @@ def allowed_msgpack_types() -> list[type]:
         RouteResult,
         RuleTrace,
         NodeAudit,
+        GuidelineEntry,
+        GuidelineReport,
+        NodeOutcome,
     ]
 
     return _declared_types(roots)

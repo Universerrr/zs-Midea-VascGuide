@@ -243,7 +243,7 @@ class LabDomain(_StrictDomain):
 # C. CTA 与影像（19）
 # ===========================================================================
 class CtaDomain(_StrictDomain):
-    """C. CTA 报告与影像征象（19 字段）。
+    """C. CTA 报告与影像征象（20 字段）。
 
     ⚠️ ``maxd`` 是**报告文字里读到的最大外径**，与量化值 ``CL.AAA_DIAM`` 不是一回事：
     前者只用于交叉校验（不一致 → ``Q.CONFLICT`` → G09），**修复阈值只认后者**。
@@ -258,6 +258,9 @@ class CtaDomain(_StrictDomain):
     stranding: Literal["有", "无", "可疑", "不可评价"] | None = None  # 周围脂肪模糊
     rup_context: Literal["有关", "无关", "不确定"] | None = None  # 影像破裂关联性
     branch: dict[str, str] | None = None  # 分支灌注（部位 → 通畅/狭窄/闭塞/可疑/不可评价）
+    malperfusion: (
+        list[Literal["肾", "肠系膜", "下肢", "其他器官", "无", "疑似", "未知", "证据冲突"]] | None
+    ) = None  # 器官/肢体灌注障碍（C.MALPERFUSION）；分支解剖异常不得单独确认，见 router 物化
     graft: Literal["有", "无", "可疑", "未知"] | None = None  # 已有主动脉移植物
     endoleak: Literal["I", "II", "III", "其他", "可疑", "未评价"] | None = None  # 术后内漏可疑
     graft_fail: list[Literal["明确", "可疑", "未见", "不可评价"]] | None = None  # 移植物结构异常
@@ -469,7 +472,7 @@ class ResultDomain(_StrictDomain):
 # 组装
 # ===========================================================================
 class VascCase(BaseModel):
-    """V3.1(2) 术前病例 —— 160 个路由字段（14 个域子模型）+ 4 个非域字段。
+    """V3.1(2) 术前病例 —— 161 个路由字段（14 个域子模型）+ 4 个非域字段。
 
     访问形式：``case.n.neck_len`` / ``case.cl.aaa_diam`` / ``case.p.age``。
 
@@ -539,7 +542,7 @@ DOMAIN_FIELD_COUNTS: dict[str, int] = {
     "s": 18,
     "v": 17,
     "lab": 11,
-    "c": 19,
+    "c": 20,
     "n": 27,
     "gen": 5,
     "inf": 6,
@@ -547,7 +550,7 @@ DOMAIN_FIELD_COUNTS: dict[str, int] = {
     "k": 5,
     "r": 2,
 }
-TOTAL_FIELD_COUNT = sum(DOMAIN_FIELD_COUNTS.values())  # = 160
+TOTAL_FIELD_COUNT = sum(DOMAIN_FIELD_COUNTS.values())  # = 161
 
 
 def _check_field_counts() -> None:

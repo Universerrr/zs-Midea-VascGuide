@@ -30,6 +30,8 @@ from src.rules.router import (
     G08_RULES,
     LABEL_BY_RULE,
     OUTCOME_PRIORITY,
+    PENDING_RULES,
+    RULE_SOURCE,
     RULES,
     RouteKind,
     _and,
@@ -53,19 +55,24 @@ def verdict_of(rule_id: str, **overrides: object) -> bool | None:
 # 一、注册表守卫
 # ===========================================================================
 class TestRuleRegistry:
-    def test_rule_count_is_54(self) -> None:
-        assert len(RULES) == 54
+    def test_rule_count_is_55(self) -> None:
+        assert len(RULES) == 55
 
     @pytest.mark.parametrize(
-        ("domain", "expected"), [("G03", 21), ("G04", 18), ("G08", 11), ("G09", 4)]
+        ("domain", "expected"), [("G03", 21), ("G04", 19), ("G08", 11), ("G09", 4)]
     )
     def test_rule_count_per_domain(self, domain: str, expected: int) -> None:
         assert sum(1 for rid in RULES if rid.startswith(f"{domain}.")) == expected
 
     def test_ids_are_contiguous(self) -> None:
-        """编号必须连续：缺号通常意味着规格里有条规则被漏实现。"""
+        """编号必须连续：缺号通常意味着规格里有条规则被漏实现。
+
+        判据是「已实现 + ``PENDING_RULES``」的并集——``PENDING_RULES`` 显式登记
+        规格有、代码暂缺的条目，所以缺口不能靠留白蒙混，只能靠删清单来消除。
+        """
         for domain in ("G03", "G04", "G08", "G09"):
-            got = sorted(int(rid.split(".R")[1]) for rid in RULES if rid.startswith(f"{domain}."))
+            ids = {rid for rid in (*RULES, *PENDING_RULES) if rid.startswith(f"{domain}.")}
+            got = sorted(int(rid.split(".R")[1]) for rid in ids)
             assert got == list(range(1, len(got) + 1)), f"{domain} 编号不连续：{got}"
 
     def test_every_rule_declares_a_source_cell(self) -> None:
@@ -112,6 +119,65 @@ class TestRuleRegistry:
         covered |= {"G09.R01", "G09.R02", "G09.R03", "G09.R04"}
         missing = sorted(set(RULES) - covered)
         assert not missing, f"未进任何桶：{missing}"
+
+
+class TestRuleSourceRegistry:
+    """规则来源性质登记（V3.6 起）—— 它决定「本结论是不是指南说的」。"""
+
+    def test_every_rule_is_registered(self) -> None:
+        assert set(RULE_SOURCE) == set(RULES)
+
+    def test_every_rule_uses_a_known_source_kind(self) -> None:
+        allowed = {"ESVS原文", "工程安全规则", "其他指南"}
+        bad = {rid: kind for rid, (kind, _) in RULE_SOURCE.items() if kind not in allowed}
+        assert not bad, bad
+
+    def test_esvs_rules_cite_a_section(self) -> None:
+        """声称取自 ESVS 就必须指得出章节，否则与工程规则无异。"""
+        bad = [rid for rid, (kind, sec) in RULE_SOURCE.items() if kind == "ESVS原文" and not sec]
+        assert not bad, bad
+
+    def test_non_esvs_rules_carry_no_section(self) -> None:
+        """反向也要守：工程规则挂一个章节号，等于给自拟规则盖章成指南原文。"""
+        bad = [rid for rid, (kind, sec) in RULE_SOURCE.items() if kind != "ESVS原文" and sec]
+        assert not bad, bad
+
+    def test_source_kind_distribution_matches_v36(self) -> None:
+        """数字取自 V3.6 表「备注／依据」列。改动等于改规格，必须同步这里。"""
+        tally = {"ESVS原文": 0, "工程安全规则": 0, "其他指南": 0}
+        for kind, _ in RULE_SOURCE.values():
+            tally[kind] += 1
+        assert tally == {"ESVS原文": 29, "工程安全规则": 23, "其他指南": 3}
+
+    def test_emergency_tier_is_mostly_engineering_rules(self) -> None:
+        """G03 急诊层只有 6 条是 ESVS 原文 —— 这条断言的意义是防止有人
+        日后把工程规则改标成指南原文，让论文里的说法悄悄变得「更有依据」。"""
+        g03 = {rid: RULE_SOURCE[rid][0] for rid in RULE_SOURCE if rid.startswith("G03.")}
+        assert sum(1 for k in g03.values() if k == "ESVS原文") == 6
+
+
+class TestNextNodesContract:
+    """``next_nodes``：本次结论要走的全部节点（V3.6 起）。"""
+
+    def test_next_nodes_always_starts_with_the_primary_exit(self) -> None:
+        """主出口必须是序列的第一个 —— 否则「本次去哪」与「还要去哪」会打架。"""
+        for overrides in ({}, {"c": {"rupture_report": "明确破裂"}}, {"n": {"neck_len": 8.0}}):
+            result = route(make_case(**overrides))
+            assert result.next_nodes, overrides
+            assert result.next_nodes[0] == result.next_node
+
+    def test_single_exit_rules_degrade_to_a_one_element_sequence(self) -> None:
+        """现有 54 条各走一处，序列长度必须是 1（多出来的元素只能是编造的）。"""
+        for overrides in ({}, {"c": {"rupture_report": "明确破裂"}}):
+            assert len(route(make_case(**overrides)).next_nodes) == 1
+
+    def test_next_nodes_covers_triage_result(self) -> None:
+        """回归：急诊 + 病种流程并存时（V3.6 D3.1.R01「G05 并进入 D3.2」）
+        ``next_nodes`` 要能表达两个动作，而不是丢一个。此处先守住「不丢主出口」，
+        D3.x 落地后再把多节点用例补进来。"""
+        result = route(make_case(c={"rupture_report": "明确破裂"}))
+        assert result.next_node == "G05"
+        assert result.next_nodes == ["G05"]
 
 
 # ===========================================================================
@@ -279,6 +345,7 @@ HITS: list[tuple[str, dict[str, object]]] = [
     ("G04.R16", {"n": {"inflammatory_ctx": "影像高度提示"}}),
     ("G04.R17", {"gen": {"aaa_age_onset": 45}}),
     ("G04.R18", {"n": {"inflammatory_ctx": "可疑", "infection_ctx": "高度怀疑"}}),
+    ("G04.R21", {"c": {"malperfusion": ["下肢"]}}),
     # ---- G08 分类（11，R09 另行测试）----
     ("G08.R01", {}),
     ("G08.R02", {"cl": {"symptom_aaa": "医师确认相关"}}),
@@ -647,6 +714,65 @@ class TestDerivedStates:
         """抽取层给了主状态就以它为准，不再拿明细覆写。"""
         ctx = _Ctx(make_case(n={"genetic_ctx": "未评价"}, gen={"syndrome_type": "Marfan"}))
         assert ctx.genetic_ctx == "未评价"
+
+    # ---- C.MALPERFUSION（V3.6.2 唯一没有规则行的字段，走派生物化通路）----
+    def test_malperfusion_extracted_organ_is_true(self) -> None:
+        assert _Ctx(make_case(c={"malperfusion": ["下肢"]})).malperfusion is True
+
+    def test_malperfusion_extracted_negative_is_false(self) -> None:
+        assert _Ctx(make_case(c={"malperfusion": ["无"]})).malperfusion is False
+
+    def test_malperfusion_extracted_uncertain_is_unknown(self) -> None:
+        """「疑似」是「有值但值本身不确定」→ 只能 UNKNOWN，不能当阳性。"""
+        assert _Ctx(make_case(c={"malperfusion": ["疑似"]})).malperfusion is None
+
+    def test_malperfusion_conflict_is_unknown(self) -> None:
+        assert _Ctx(make_case(c={"malperfusion": ["下肢", "证据冲突"]})).malperfusion is None
+
+    def test_malperfusion_organs_are_carried(self) -> None:
+        ctx = _Ctx(make_case(c={"malperfusion": ["肾", "下肢"]}))
+        assert ctx.malperfusion_organs == frozenset({"肾", "下肢"})
+
+    def test_malperfusion_branch_occlusion_alone_is_never_true(self) -> None:
+        """规格 G04!C39 明文：不能仅凭解剖狭窄自动推断器官缺血。
+
+        这条断言是方案乙的护栏——日后谁把派生改成「闭塞即阳性」，它会先红。
+        """
+        ctx = _Ctx(make_case(c={"malperfusion": None, "branch": {"SMA": "闭塞"}}))
+        assert ctx.malperfusion is None
+
+    def test_malperfusion_all_patent_without_symptoms_is_false(self) -> None:
+        ctx = _Ctx(
+            make_case(
+                c={"malperfusion": None, "branch": {"SMA": "通畅", "CA": "通畅"}},
+                s={"limb": ["无"]},
+            )
+        )
+        assert ctx.malperfusion is False
+
+    def test_malperfusion_missing_branch_data_is_unknown(self) -> None:
+        ctx = _Ctx(make_case(c={"malperfusion": None, "branch": {}}))
+        assert ctx.malperfusion is None
+
+    def test_malperfusion_unevaluable_branch_is_unknown(self) -> None:
+        """「不可评价」不是「通畅」—— 影像没覆盖到的分支不能当阴性用。"""
+        ctx = _Ctx(
+            make_case(
+                c={"malperfusion": None, "branch": {"SMA": "不可评价", "CA": "通畅"}},
+                s={"limb": ["无"]},
+            )
+        )
+        assert ctx.malperfusion is None
+
+    def test_malperfusion_limb_signs_block_the_negative_derivation(self) -> None:
+        """分支通畅但有肢体症状 → 不能判「无」：症状不是影像能解释完的。"""
+        ctx = _Ctx(
+            make_case(
+                c={"malperfusion": None, "branch": {"CIA": "通畅"}},
+                s={"limb": ["苍白"]},
+            )
+        )
+        assert ctx.malperfusion is None
 
 
 # ===========================================================================

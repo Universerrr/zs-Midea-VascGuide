@@ -54,12 +54,15 @@ class PreopState(TypedDict, total=False):
     字段推进顺序（与四层节点一一对应）::
 
         case ──input_layer──▶ case(已归一化) ──router_layer──▶ route_result
-             ──execution_layer──▶ tool_outputs ──output_layer──▶ final_recommendation
+             ──execution_layer──▶ tool_outputs + tool_skips ──output_layer──▶ final_recommendation
 
     设计要点：
         · ``audit_trail`` 使用 ``operator.add`` reducer —— 每个节点**追加**自己的
           审计记录，LangGraph 负责合并；节点无需读取既有轨迹，天然避免读写竞争。
         · ``tool_outputs`` 以工具名为键，缺项即代表该工具未执行（见 execution_layer）。
+        · ``tool_skips`` 是 ``tool_outputs`` 的**原因面**：只记 ``BEST_EFFORT``
+          工具的失败（急诊「不等待非必要分析」）。缺项 + 无 skip = 该工具不在
+          本模式计划内。三者语义互不重叠，故不合并成一个 dict。
         · ``input_snapshot_hash`` 由 input_layer 在**路由回填之前**计算 —— 那时
           ``case`` 还是纯粹的输入事实，哈希才有「输入快照」的意义（回填后 case 会被
           写入派生字段，再哈希就不是输入了）。
@@ -70,6 +73,7 @@ class PreopState(TypedDict, total=False):
     input_snapshot_hash: str
     route_result: RouteResult
     tool_outputs: dict[str, Any]
+    tool_skips: dict[str, str]
     final_recommendation: FinalRecommendation
     audit_trail: Annotated[list[NodeAudit], operator.add]
 
@@ -112,6 +116,7 @@ HASHED_KEYS: tuple[str, ...] = (
     "case_id",
     "route_result",
     "tool_outputs",
+    "tool_skips",
     "final_recommendation",
 )
 

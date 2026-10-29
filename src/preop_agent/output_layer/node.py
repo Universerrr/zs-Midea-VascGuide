@@ -26,18 +26,25 @@
     ``tool_findings``  = **测量产物**（影像/评分/检索各算出了什么）。
     两者不互相复制 —— 同一条内容出现在两处，日后改一处就会不一致。
 
-## 明确的两个留白（等外部输入，非本层能自行决定）
+## 两个留白（等外部输入，非本层能自行决定）
 
-**留白一：诊断与治疗方式建议。**
-    ``primary_recommendation`` / ``treatment_options`` 目前是显式占位
-    （见 :data:`PRIMARY_RECOMMENDATION_PLACEHOLDER`），**不含任何临床主张**。
-    原因：设计表只管「路由」，管不到「治疗建议措辞」；三模式各自的标准处置路径
-    属临床口径，必须由临床侧确认。**在口径确认前，宁可为空，不可编造。**
+**留白一（已部分落地）：主建议改为机械装配。**
+    ``primary_recommendation`` 不再是占位符，而是把既有结论排成一句话
+    （见 :func:`_build_primary_recommendation`）：:
+
+        急诊模式 · 破裂／疑似破裂 AAA：EVAR 候选（IFU 待核验，术者确认）；待补 6 项关键资料
+
+    **它仍不含任何临床主张**：只重排 ``route_result`` 与 ``tool_outputs`` 里
+    已有的内容，本层不引入任何「如果 A 则建议 B」的分支。
+
+    ``treatment_options`` 仍为空——方案清单的粒度是「具体术式（入路/器械/型号）」，
+    工具A 目前只给到「EVAR 候选 / 评估 OSR」这一层，留空是如实反映粒度而非遗漏。
 
 **留白二：LLM 输出转译。**
     ``translated_text`` 保持 ``None``（见 :data:`TRANSLATION_BLOCKED_REASON`）。
     该字段属于「LLM 只出现在两处」红线中的第二处（输出转译），但它的价值是
-    **措辞润色**，前提是先有确定的结论文本可润色；留白一的文案未定，转译也就无处落脚。
+    **措辞润色**，前提是主建议的措辞已由临床确认；当前文案是机械拼接，
+    还没有到"需要润色"的状态。
 
 治理红线：
     本层是**聚合与转写**，不是判定。不得在此引入任何新的判定分支或阈值——
@@ -83,11 +90,25 @@ MAX_FALLBACK_SUMMARY_CHARS: Final[int] = 120
 #: 三值判定 → 中文。``None`` 必须单独措辞：它是「未判定」，不是「不成立」。
 VERDICT_TEXT: Final[Mapping[bool | None, str]] = {True: "成立", False: "不成立", None: "无法判定"}
 
-#: 主建议占位（**不含任何临床主张**，等临床口径确认后替换）。
+#: 主建议的兜底文本 —— 仅在**既无模式也无工具结论**时出现。
+#: 正常情况下主建议由 :func:`_build_primary_recommendation` 装配。
 PRIMARY_RECOMMENDATION_PLACEHOLDER: str = (
-    "〔待补临床口径〕诊断与治疗方式的主建议尚未定义：需先确认三种路由模式各自的"
-    "标准处置路径，确认后替换本占位文本。在此之前本字段不作为临床依据。"
+    "〔无法给出结论〕本次运行既未进入任何路由模式，也没有病种流程产物。"
+    "请检查路由层输出与工具执行记录，不要据本字段做任何临床判断。"
 )
+
+#: 病种标签 → 中文名。**逐字取自规格 G08**「D1无症状AAA；D2症状性未破裂AAA；
+#: D3破裂/疑似破裂AAA；D4感染/相关瘘；D5 PAU/IMH/IAAD/囊状/假性/炎症性病变；
+#: D6术后并发症；D7髂动脉瘤」，不另行命名。
+DISEASE_LABELS: Final[dict[str, str]] = {
+    "D1": "无症状 AAA",
+    "D2": "症状性未破裂 AAA",
+    "D3": "破裂／疑似破裂 AAA",
+    "D4": "感染／相关瘘",
+    "D5": "PAU／IMH／IAAD／囊状／假性／炎症性病变",
+    "D6": "术后并发症",
+    "D7": "髂动脉瘤",
+}
 
 #: LLM 输出转译是否已实现（当前为 ``False``）。
 TRANSLATION_IMPLEMENTED: bool = False
@@ -95,8 +116,8 @@ TRANSLATION_IMPLEMENTED: bool = False
 #: 输出转译未实现的原因。
 TRANSLATION_BLOCKED_REASON: str = (
     "LLM 输出转译未实现：转译只做措辞润色、不改结论，其输入应是**已确定的结论文本**。"
-    "当前 primary_recommendation / treatment_options 尚未定稿（见留白一），"
-    "无内容可转译，贸然接入只会产生无依据的表述。"
+    "当前 primary_recommendation 是机械装配的（模式 · 病种 · 终点 · 待补数），"
+    "措辞尚未经临床确认；在此之上做润色会掩盖「哪些话是系统拼的、哪些是模型写的」。"
 )
 
 
@@ -135,10 +156,51 @@ def _field_label(name: str, description: str | None) -> str:
     return (description or "").strip().rstrip("。；;") or name
 
 
+def _summarize_guideline_report(product: Any) -> str | None:
+    """工具A 的产物按「终点 → 路径 → 命中规则 → 缺口数」渲染。
+
+    为什么用鸭子类型而不是 ``isinstance``：``output_layer`` 不该 import ``src.tools``
+    ——工具层是可替换的，编排层只认产物形状。``path`` / ``terminal`` / ``entries``
+    这三个属性同时出现的类型，目前只有 ``GuidelineReport``。
+
+    不这么做的后果是本轮实测到的：整份报告被 ``repr()`` 截成一行，
+    术式方向（``terminal``）和缺口全部看不见。
+    """
+    path = getattr(product, "path", None)
+    entries = getattr(product, "entries", None)
+    gaps = getattr(product, "gaps", None)
+    if not isinstance(path, tuple) or not isinstance(entries, tuple) or not isinstance(gaps, tuple):
+        return None
+
+    parts = [
+        f"终点 = {getattr(product, 'terminal', None) or '未给出'}",
+        f"路径 = {' → '.join(path) or '未进入节点'}",
+    ]
+    hits = [
+        entry.rule_id
+        for entry in entries
+        if getattr(entry, "verdict", None) is True and hasattr(entry, "rule_id")
+    ]
+    if hits:
+        parts.append(f"命中 = {'、'.join(hits)}")
+    if gaps:
+        # 列前两条明细：只说「缺口 6 项」等于把待补资料藏起来，
+        # 而 G05 明确要求输出「待补关键资料」。
+        head = "；".join(gaps[:2])
+        more = f" 等 {len(gaps)} 项" if len(gaps) > 2 else ""
+        parts.append(f"缺口 = {head}{more}")
+    else:
+        parts.append("缺口 = 无")
+    return "；".join(parts)
+
+
 def _summarize_product(product: Any) -> str:
     """把一个工具产物机械渲染成「字段 = 值；…」摘要（不改数、不推断）。"""
     if product is None:
         return "（无产出）"
+    guideline = _summarize_guideline_report(product)
+    if guideline is not None:
+        return guideline
     if not isinstance(product, BaseModel):
         text = repr(product)
         if len(text) <= MAX_FALLBACK_SUMMARY_CHARS:
@@ -286,6 +348,67 @@ def _build_evidence(case: VascCase, result: RouteResult) -> list[EvidenceItem]:
     return items
 
 
+def _build_primary_recommendation(result: RouteResult, tool_outputs: Mapping[str, Any]) -> str:
+    """把已判出的结论排成**一句话** —— 只重排，不新增判断。
+
+    构成：``<模式> · <病种>：<工具A 终点>；待补 N 项关键资料``
+
+    三段的来源都是既有结构：``route_result.mode`` / ``class_output`` /
+    ``tool_outputs['guideline_engine'].terminal``。本函数**不含任何**
+    「如果 A 则建议 B」的分支——那属于判定层，写在这里就是第二处真源。
+
+    为什么必须做这一步：``route_result`` 和 ``tool_outputs`` 都是结构化对象，
+    医生打开 CLI 看到的是字段名和枚举值。把结论排成一句话是**呈现**，不是判定
+    ——这与 ``_summarize_product`` 对数值摘要做的事性质相同。
+
+    为什么 ``translated_text`` 仍是 ``None``：本函数产出的是**事实排列**，
+    不是润色。LLM 转译要落在"已定稿的结论文本"上，而这里的措辞仍需临床确认。
+    """
+    if result.kind is RouteKind.REVIEW:
+        return f"人工复核：{result.reason}"
+    if result.kind is RouteKind.VERIFY:
+        return f"资料核实：{result.reason}"
+
+    head = result.mode.value if result.mode is not None else "未定模式"
+    diseases = (
+        "、".join(DISEASE_LABELS.get(tag, tag) for tag in result.class_output) or "病种未分类"
+    )
+
+    report = tool_outputs.get("guideline_engine")
+    terminal = getattr(report, "terminal", None)
+    gaps = getattr(report, "gaps", ()) or ()
+
+    if not terminal:
+        return f"{head} · {diseases}：病种流程未给出结论"
+    tail = f"{terminal}；待补 {len(gaps)} 项关键资料" if gaps else str(terminal)
+    return f"{head} · {diseases}：{tail}"
+
+
+def _build_treatment_options(tool_outputs: Mapping[str, Any]) -> list[str]:
+    """把工具A 的术式候选渲染成治疗方案清单。
+
+    澄清一个容易搞错的粒度问题：本字段**不该**到「EVAR，经右股动脉，用 XX 型号」
+    这一层。规格有 5 处明文禁止工具A 走到器械型号（``D1.3.R03``「不在本节点选
+    具体型号」、``D1.3.R06``「不确定具体 SKU」、``D1.3.R90``「不批准具体术式或
+    器械适配」、``D7.3.R01``「不选品牌/SKU」、``D7.3.R04``「不批准最终器械/术式
+    方案」）——那属于手术规划，不在本系统范围内。
+
+    规格要求的形态由 ``D1.3.R91`` 给出：「分别列出 EVAR/OSR 的**可行候选**、
+    **条件性候选**和**排除原因**」。所以清单每项是「术式：状态（原因）」而不是
+    一串术式名——后者会把「候选方向」伪装成「已定方案」。
+
+    渲染交给候选对象自己的 ``render()``：本层不 import ``src.tools``（工具层可
+    替换），也不自己拼串（措辞两处维护必然漂移）。
+    """
+    report = tool_outputs.get("guideline_engine")
+    candidates = getattr(report, "candidates", ()) or ()
+    return [
+        candidate.render()
+        for candidate in candidates
+        if callable(getattr(candidate, "render", None))
+    ]
+
+
 def output_node(state: PreopState) -> dict[str, Any]:
     """输出层节点：聚合出 :class:`FinalRecommendation`。
 
@@ -302,9 +425,13 @@ def output_node(state: PreopState) -> dict[str, Any]:
     recommendation = FinalRecommendation(
         case_id=case.case_id,
         route_mode=result.mode,
-        # 留白一：等临床口径（见模块文档）。
-        primary_recommendation=PRIMARY_RECOMMENDATION_PLACEHOLDER,
-        treatment_options=[],
+        # 呈现：把既有结论排成一句话（不新增判断，见 _build_primary_recommendation）。
+        primary_recommendation=_build_primary_recommendation(
+            result, state.get("tool_outputs") or {}
+        ),
+        # 治疗方案清单 = 工具A 的术式候选（EVAR/OSR 两列 × 候选状态）。
+        # 不是「具体术式」：规格禁止工具A 走到器械型号，见 _build_treatment_options。
+        treatment_options=_build_treatment_options(state.get("tool_outputs") or {}),
         confidence_level=result.confidence_level,
         manual_review_required=result.kind is RouteKind.REVIEW,
         evidence_chain=_build_evidence(case, result),
@@ -313,7 +440,7 @@ def output_node(state: PreopState) -> dict[str, Any]:
         tool_findings=build_tool_findings(state.get("tool_outputs") or {}),
         ruleset_version=result.ruleset_version,
         input_snapshot_hash=state.get("input_snapshot_hash"),
-        # 留白二：等留白一定稿后再接 LLM 转译。
+        # 留白二：等主建议措辞经临床确认后再接 LLM 转译。
         translated_text=None,
     )
 

@@ -46,11 +46,11 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 
 **落地结果**：
 
-- **字段**：`case.py` 就地重建为 **160 字段 / 14 个按域子模型**（`case.n.neck_len`），手写不生成。
+- **字段**：`case.py` 就地重建为 **161 字段 / 14 个按域子模型**（`case.n.neck_len`），手写不生成。
   口径：170（169 + 补入 `N.ACCESS_TORTUOSITY`）− 7 判定产物 − 3 物化派生 = 160。
   域子模型共用一个 `_StrictDomain` 基类（`extra="forbid"`）：抽取层拼错字段名会立刻报错，
   而不是静默丢事实。
-- **规则**：`router.py` 就地重写为 **54 条判定规则**（G03 21 + G04 18 + G08 11 + G09 4）。
+- **规则**：`router.py` 就地重写为 **55 条判定规则**（G03 21 + G04 19 + G08 11 + G09 4）。
   G00–G02 的 9 条属「读取资料 / 证据质量 / 事实抽取」，归 LLM 抽取层，不进路由。
   `RULESET.md` 逐条登记 `rule_id ↔ 函数 ↔ V3.1(2) 源行`，测试守着两边不漂移。
 - **为什么要写进代码而不是数据表**：V3.1(2) 的判据是自然语言（「允许值」列一列四义、
@@ -62,19 +62,19 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 - **两个非规则标识**：`MANUAL.URGENCY`（医生置位 `urgency_flag` 越级）与
   `FALLBACK.VERIFY`（没有任何规则能判定 → 资料核实）。兜底不借 `G03.R15` / `G04.R14` 的 id，
   否则 `RULESET.md` 的出口列会说谎。
-- **验收标准**（不再是「测试全绿」这一条）：54 条规则的三态用例、160 字段契约断言、
+- **验收标准**（不再是「测试全绿」这一条）：55 条规则的三态用例、161 字段契约断言、
   架构守卫（判定层禁 LLM / 审计哈希链闭合 / 进哈希模型无时间戳）。
 
 ### ✅ 已完成
 
 | 模块 | 内容 |
 |---|---|
-| **术前数据模型（5 个）** | `VascCase`（**160 字段 / 14 个按域子模型**）、`VascMeasurement`、`AnatomyScore`、`RiskAssessment`、`FinalRecommendation` |
+| **术前数据模型（5 个）** | `VascCase`（**161 字段 / 14 个按域子模型**）、`VascMeasurement`、`AnatomyScore`、`RiskAssessment`、`FinalRecommendation` |
 | **枚举（2 个，各归其位）** | `FieldWriter`（写入者归责，定义在 `audit.py`）、`RouteMode`（路由模式三值，定义在 `recommendation.py`）。事实字段的取值域改用字段级 `Literal`（中文值直写）——V3.1(2) 的「允许值」列一列四义，单个 `StrEnum` 表达不了 |
 | **审计留痕结构** | `FieldProvenance`（字段原文出处 / 写入者 / 是否被人工覆写）、`UrgencyFlagAudit` |
-| **确定性规则层** | `router.py`（V3.1(2) 的 54 条判定规则 + 三值求值）+ `RULESET.md`（规则↔源行对照）+ `version.py`（规则版本），详见「四」 |
+| **确定性规则层** | `router.py`（V3.1(2) 的 55 条判定规则 + 三值求值）+ `RULESET.md`（规则↔源行对照）+ `version.py`（规则版本），详见「四」 |
 | **编排层（LangGraph）** | 四层节点 `input → router → execution → output` 串成 `StateGraph` 并接 SQLite Checkpoint；每节点自动留痕（节点名 / 起止时间 / 输入输出哈希），审计链可**逐环校验**，详见「五」 |
-| **测试与工具链** | **606 项测试**（86 路由基线 + 81 数据契约 + 111 编排层 + 199 规则分支 + 117 结论自证契约 + 12 CLI 契约）、`ruff` 无告警、覆盖率 **99%**（`router.py` 99%、`audit.py` 与 `recommendation.py` 100%） |
+| **测试与工具链** | **697 项测试**（86 路由基线 + 84 数据契约 + 114 编排层 + 220 规则分支 + 121 结论自证契约 + 12 CLI + 60 工具A）、`ruff` 无告警、覆盖率 **99%**（`router.py` 99%、`audit.py` 与 `recommendation.py` 100%） |
 
 ### ⏳ 尚未开始
 
@@ -83,19 +83,22 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 
 **① 等外部资源（技术缺口）**
 
-- **5 个确定性工具全部未实现**（实现位置 `src/tools/<tool>.py`，一工具一文件）。每个工具都在
+- **工具A 已实现 D3 分支；B/C/D/E 仍未实现**（实现位置 `src/tools/<tool>.py`；工具A 是 `src/tools/guideline_engine/` 包）。未实现的工具都在
   自己的 `SPEC` 里写明了**具体缺什么**：指南引擎缺「接入哪部指南 + 条目结构化方式」、
   影像量化器缺「CTA 数据 + 分割与中心线算法」、解剖评分器与风险计算器缺「临床量表与模型系数」、
   记忆检索器缺「历史病例库与检索索引」。
-  因此 `tool_outputs` 当前恒为空 —— **宁可空着，也不凭空造评分**。
+  因此 `tool_outputs` 目前只含工具A 一项 —— **其余宁可空着，也不凭空造评分**。
   执行层已按路由模式调度（`execution_layer/plan.py` 的 `MODE_PLANS`）：
   **急诊 ∅ / 指南 A+B / 复杂全量**，三者是包含关系，不是并列关系。
 
 **② 等临床口径（内容缺口）**
 
-- **诊断与治疗方式建议**：`FinalRecommendation.primary_recommendation` 当前是**显式占位文本**，
-  `treatment_options` 为空列表。设计表只定义「路由」，不定义「治疗建议措辞」；
-  三种路由模式各自的标准处置路径属临床口径，须由临床侧确认后填入。
+- **治疗方案清单的粒度上限**：`FinalRecommendation.treatment_options` 的每项是
+  「术式：候选状态（原因）」，如 `EVAR：条件性候选（IFU 未核验）`。**不会**到
+  「EVAR，经右股动脉，用 XX 型号」——规格有 5 处明文禁止工具A 走到器械选型
+  （`D1.3.R03/R06/R90`、`D7.3.R01/R04`），那属于手术规划，不在本系统范围。
+  形态由 `D1.3.R91` 定义：「分别列出 EVAR/OSR 的**可行候选**、**条件性候选**和**排除原因**」。
+  `primary_recommendation` 同为**机械装配**既有结论，不含任何治疗主张。
 
 **③ 等评估集（能力缺口）**
 
@@ -124,19 +127,27 @@ zs-Midea VascGuide/
 │   │   ├── __init__.py          # ✅ 统一导出（模型 + 枚举 + 审计结构）
 │   │   ├── audit.py             # ✅ 审计留痕结构（FieldProvenance / UrgencyFlagAudit）+ FieldWriter
 │   │   ├── preop/               # ✅ 术前模型包（含 __init__.py 聚合导出）
-│   │   │   ├── case.py          # ✅ VascCase（160 字段 / 14 个域子模型）+ derive() + apply_route_result()
+│   │   │   ├── case.py          # ✅ VascCase（161 字段 / 14 个域子模型）+ derive() + apply_route_result()
 │   │   │   ├── measurement.py   # ✅ VascMeasurement + CenterlinePoint（仅模型，无计算）
 │   │   │   ├── assessment.py    # ✅ AnatomyScore + RiskAssessment（仅模型，无计算）
 │   │   │   └── recommendation.py   # ✅ FinalRecommendation + EvidenceItem + DecisionStep + ToolFinding + RouteMode
 │   │   ├── intraop.py           # IntraOpIntent（预留，空占位）
 │   │   └── postop.py            # PostOpCase / FollowUpPlan / FollowUpStatus（预留，空占位）
 │   ├── rules/                   # ✅ 确定性规则层（详见「四」；无 __init__.py）
-│   │   ├── router.py            # ✅ 路由判定流水线（V3.1(2)：54 条判定规则 + 三值求值）
-│   │   ├── version.py           # ✅ 规则版本号（RULESET_VERSION = v312@v3.1.2，进哈希）
-│   │   └── RULESET.md           # ✅ 54 条规则 ↔ 函数名 ↔ V3.1(2) 源行 对照表（防规格漂移）
-│   ├── tools/                   # ✅ 5 个确定性工具（一工具一文件，全部未实现）
+│   │   ├── router.py            # ✅ 路由判定流水线（V3.1(2)：55 条判定规则 + 三值求值）
+│   │   ├── version.py           # ✅ 规则版本号（RULESET_VERSION = v362@v3.6.2，进哈希）
+│   │   └── RULESET.md           # ✅ 55 条规则 ↔ 函数名 ↔ V3.1(2) 源行 对照表（防规格漂移）
+│   ├── tools/                   # ✅ 5 个确定性工具（一工具一模块，全部未实现）
 │   │   ├── base.py              # ✅ ToolSpec / ToolRequest / MissingUpstreamError
-│   │   ├── guideline_engine.py  # 工具A · 指南引擎（阻塞：指南条目库）
+│   │   ├── guideline_engine/    # ✅ 工具A · 指南引擎（21 节点 / 172 条中已实现 3 / 17）
+│   │   │   ├── __init__.py      # ✅ 公开接口：只 re-export SPEC / run（零逻辑）
+│   │   │   ├── spec.py          # ✅ ToolSpec 实例（单列以避免 __init__ ↔ engine 循环导入）
+│   │   │   ├── engine.py        # ✅ 节点遍历（深度优先 + 去重）+ 出口汇总
+│   │   │   ├── state.py         # ✅ GuidelineState / NodeOutcome / GuidelineReport
+│   │   │   ├── registry.py      # ✅ 规格 21 sheet / 172 条 与 已实现规模 的对照
+│   │   │   └── nodes/           # 病种节点（按规格 sheet 分文件）
+│   │   │       ├── common.py    # ✅ 优先级求值（P0→P3）+ 缺口 + 出户口径
+│   │   │       └── d3_ruptured.py # ✅ D3.1–D3.3（20 条中实现 17 条）
 │   │   ├── imaging_quantifier.py # 工具B · 影像量化器（阻塞：CTA 数据 + 分割算法）
 │   │   ├── anatomy_scorer.py    # 工具C · 解剖评分器（阻塞：评分量表）
 │   │   ├── memory_retriever.py  # 工具D · 记忆检索器（阻塞：历史病例库）
@@ -164,10 +175,11 @@ zs-Midea VascGuide/
 ├── tests/                       # 测试（无 __init__.py，见「八、开发约定」）
 │   ├── conftest.py              # ✅ 唯一病例构造入口：baseline_kwargs() + make_case()（域级浅合并）
 │   ├── test_preop.py            # ✅ 86 项路由端到端基线（五出口 / 同桶优先级 / 标签）
-│   ├── test_model_contract.py   # ✅ 81 项数据契约（160 字段 / 不确定值白名单 / 严格模式）
+│   ├── test_model_contract.py   # ✅ 84 项数据契约（161 字段 / 不确定值白名单 / 严格模式）
 │   ├── test_preop_graph.py      # ✅ 111 项编排层 + 调度表 + 依赖排序 + Checkpoint 往返 + 架构守卫
-│   ├── test_router_branches.py  # ✅ 199 项规则分支（54 条逐条命中 + 三值语义 + 派生量）
-│   ├── test_router_note_contract.py # ✅ 117 项结论自证契约（rule_id / reason / gaps / trace）
+│   ├── test_router_branches.py  # ✅ 220 项规则分支（55 条逐条命中 + 三值语义 + 派生量）
+│   ├── test_router_note_contract.py # ✅ 121 项结论自证契约（rule_id / reason / gaps / trace）
+│   ├── test_guideline_engine.py # ✅ 60 项工具A 契约（D3 判据复用 / 术式候选 / 粒度红线 / 不越权 / 缺口可见）
 │   └── test_main.py             # ✅ 12 项 CLI 契约（错误提示可读性 / JSON 与文本同源 / 副作用边界）
 ├── cases/                       # 病例样例（JSON，直接喂给 main.py）
 │   └── example.json             # ✅ 完整病例：走指南模式、零缺口、含 3 条原文出处
@@ -210,9 +222,9 @@ zs-Midea VascGuide/
 
 | 文件 | 职责 | 状态 |
 |---|---|---|
-| `router.py` | 路由判定流水线（纯函数，无副作用、无 IO、无全局状态） | ✅ V3.1(2) 的 54 条判定规则（G03 21 / G04 18 / G08 11 / G09 4） |
-| `version.py` | 规则版本号注册表（审计必需，进哈希） | ✅ `RULESET_VERSION = v312@v3.1.2` |
-| `RULESET.md` | 54 条规则 ↔ 函数名 ↔ V3.1(2) 源行 的对照表 | ✅ 与代码逐条对应（测试守着） |
+| `router.py` | 路由判定流水线（纯函数，无副作用、无 IO、无全局状态） | ✅ V3.1(2) 的 55 条判定规则（G03 21 / G04 19 / G08 11 / G09 4） |
+| `version.py` | 规则版本号注册表（审计必需，进哈希） | ✅ `RULESET_VERSION = v362@v3.6.2` |
+| `RULESET.md` | 55 条规则 ↔ 函数名 ↔ V3.1(2) 源行 的对照表 | ✅ 与代码逐条对应（测试守着） |
 
 ### 2. 路由做什么（以及不做什么）
 
@@ -295,7 +307,7 @@ uv run python -c "from src.rules.version import RULESET_VERSION, RULESET_CHANGEL
 | `execution_layer/plan.py` | `MODE_PLANS`：三模式各跑哪些工具（**唯一真源**） |
 | `execution_layer/registry.py` | `TOOL_REGISTRY` / `SPEC_BY_KEY` / `run_tool()` 分派 |
 | `execution_layer/node.py` | `execution_order()` 拓扑排序 + `execution_node()` 按模式调度 |
-| `tools/<tool>.py` | 5 个确定性工具的实现位置（一工具一文件，当前全部未实现） |
+| `tools/<tool>.py` | 5 个确定性工具的实现位置（一工具一模块；工具A 为包且已实现 D3 分支，B/C/D/E 未实现） |
 | `output_layer/node.py` | 聚合 `FinalRecommendation`，并把 `tool_outputs` 渲染为 `tool_findings` |
 
 ### 2. 图与状态
@@ -432,9 +444,9 @@ LangGraph 用 msgpack 序列化状态。对本项目自定义类型（pydantic �
 
 | 留白 | 位置 | 当前状态 |
 |---|---|---|
-| 诊疗方式建议 | `output_layer` 的 `primary_recommendation` / `treatment_options` | 显式占位文本，**不含任何临床主张** |
+| 治疗方案清单 | `output_layer` 的 `treatment_options` | 已产出「术式：候选状态（原因）」；**粒度上限**由规格 5 处禁止条款决定，不是待办 |
 | LLM 输出转译 | `FinalRecommendation.translated_text` | 保持 `None` |
-| 5 个确定性工具 | `src/tools/<tool>.py` 的 `SPEC.blocked_reason` | `tool_outputs` 恒为空，每个工具写明阻塞原因 |
+| B/C/D/E 四个工具 | `src/tools/<tool>.py` 的 `SPEC.blocked_reason` | 每个工具写明阻塞原因；工具A 已实现，故 `tool_outputs` 含 `guideline_engine` |
 
 **为什么宁可留白**：这三处一旦填上，就等于往代码里引入了一批**新的「规则内容」**
 （评分口径、建议文案）。按本项目的变更纪律，那必须新增一张版本表并注册进
@@ -472,7 +484,7 @@ uv run python main.py --case cases/example.json        # 结论 + 证据链（�
 uv run python main.py --case cases/example.json -v     # 展开全部规则与全部缺口
 uv run python main.py --case cases/example.json -vv    # 再加完整决策链（含被否决项）
 uv run python main.py --case cases/example.json --json # 机器可读（route_result + final_recommendation）
-uv run python main.py --dump-template > cases/my.json  # 生成 160 字段空模板
+uv run python main.py --dump-template > cases/my.json  # 生成 161 字段空模板
 ```
 
 | 开关 | 作用 |
@@ -490,7 +502,7 @@ uv run python main.py --dump-template > cases/my.json  # 生成 160 字段空模
 
 ### 在自己的代码里调用（编排层）
 
-需要嵌入自己的程序时，直接调 `run_preop`，`VascCase` 的 160 个字段**按域分组**，
+需要嵌入自己的程序时，直接调 `run_preop`，`VascCase` 的 161 个字段**按域分组**，
 取值用**中文字面量**直写（V3.1(2) 的「允许值」原文）：
 
 > 域前缀：`p` 人口学 / `t` 时间基准 / `d` 原始文书 / `q` 数据质量 / `s` 症状体征 / `v` 生命体征 /
@@ -534,7 +546,7 @@ print(state["audit_persisted"])  # True
 > **这个出口不是故障**：上例刻意只填关键域，缺的 32 项（破裂征象、疼痛细节、Hb 系列等）被判为
 > **UNKNOWN 而不是「阴性」**，汇总进 `evidence_gaps` 后走「资料核实」—— 这正是「未提及 ≠ 无」的兑现：
 > 宁可让人去补资料，也不允许缺项悄悄算作阴性。
-> 字段补齐后同一套代码即落到「指南模式」：以 `tests/conftest.py` 的 `baseline_kwargs()`（160 字段全有值的
+> 字段补齐后同一套代码即落到「指南模式」：以 `tests/conftest.py` 的 `baseline_kwargs()`（161 字段全有值的
 > 基线）为例，`route_mode` 为 **指南模式**、命中规则 `G04.R14`、`decision_path` 49 步（含被否决项）。
 
 换一个**独立连接**读回同一份 state —— 这就是「全程可审计」的兑现：
@@ -558,7 +570,7 @@ with sqlite_checkpointer() as reopened:
 ### 常用命令（测试 / 检查）
 
 ```bash
-# 跑全部测试（应为 606 passed, 4 skipped）
+# 跑全部测试（应为 693 passed, 4 skipped）
 uv run pytest tests/ -q
 
 # 静态检查（应为 All checks passed）
@@ -583,7 +595,7 @@ uv run pytest tests/ --cov --cov-report=term-missing
 - **覆盖了哪些代码**：`--cov-report=html` 生成 `htmlcov/index.html`，红色行即未被测试执行到的分支。
 
 > ⚠️ **覆盖率 ≠ 测试结果**：前者衡量「代码有多少行被执行到」，后者衡量「每个用例过没过」。
-> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 606 项全绿、覆盖率 99%。
+> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 693 项全绿、覆盖率 99%。
 
 ---
 

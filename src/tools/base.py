@@ -1,14 +1,14 @@
 """5 个确定性工具的公共契约 —— :class:`ToolSpec` 与 :class:`ToolRequest`。
 
 定位：
-    ``src/tools/`` 是 5 个**确定性算子**的唯一实现位置，一工具一文件。它们是
+    ``src/tools/`` 是 5 个**确定性算子**的唯一实现位置，一工具一模块。它们是
     「输入 → 产物」的纯计算，由代码写死调用（性质等同 ``import math``），
     **不是**交给 LLM 自行决定是否调用的 tool。
 
     ==================  =========================  ============================
     键                  实现模块                    产物承载
     ==================  =========================  ============================
-    guideline_engine    guideline_engine.py        指南条目（并入 FinalRecommendation）
+    guideline_engine    guideline_engine/          指南条目（并入 FinalRecommendation）
     imaging_quantifier  imaging_quantifier.py      VascMeasurement
     anatomy_scorer      anatomy_scorer.py           AnatomyScore
     memory_retriever    memory_retriever.py         历史相似病例（并入 FinalRecommendation）

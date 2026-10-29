@@ -1,4 +1,4 @@
-"""数据模型契约测试 —— V3.1(2) 的 **160 个字段**是否被如实建模。
+"""数据模型契约测试 —— V3.1(2) 的 **161 个字段**是否被如实建模。
 
 与 v1.x（51 个平铺字段）的关键差别：
 
@@ -36,6 +36,7 @@ from src.models.preop.case import (
     is_uncertain,
 )
 from src.models.preop.recommendation import RouteMode
+from src.rules.version import RULESET_CHANGELOG, RULESET_VERSION, SPEC_VERSION
 
 # 旧版（v1.x）的平铺字段名。V3.1(2) 重写时**直接删除、不留过渡态**，这里列出来做反查：
 # 任何一个重新出现在 VascCase 顶层，都是「同一事实两份真源」回流。
@@ -155,8 +156,8 @@ def _fields_without_comment() -> list[tuple[str, str]]:
 # 一、字段清单
 # ===========================================================================
 class TestFieldInventory:
-    def test_total_is_160(self) -> None:
-        assert TOTAL_FIELD_COUNT == 160
+    def test_total_is_161(self) -> None:
+        assert TOTAL_FIELD_COUNT == 161
 
     def test_domain_counts_match_declaration(self) -> None:
         """独立数一遍：自检表说多少，实际就得是多少。"""
@@ -183,7 +184,7 @@ class TestFieldInventory:
     def test_every_field_is_documented(self) -> None:
         """每个字段都要有一句话说明，且必须**写在源码里**。
 
-        为什么用行内注释而不是 ``Field(description=...)``：160 个字段逐个包一层
+        为什么用行内注释而不是 ``Field(description=...)``：161 个字段逐个包一层
         ``Field`` 会把文件撑成两倍长，而当前阶段注释的唯一消费者是**读代码的人**。
         代价是运行时读不到（``model_json_schema()`` 里没有），所以这里用 AST 直接
         读源码兜住：将来要接 UI 表单或抽取层 prompt 自动生成时，得先升级成
@@ -193,7 +194,7 @@ class TestFieldInventory:
         assert not missing, f"缺说明：{missing}"
 
     def test_documented_field_count_matches_model(self) -> None:
-        """注释检查本身不能失效：解析出来的字段数必须等于 160。"""
+        """注释检查本身不能失效：解析出来的字段数必须等于 161。"""
         assert len(_fields_without_comment()) <= TOTAL_FIELD_COUNT
         assert len(_all_domain_fields_in_source()) == TOTAL_FIELD_COUNT
 
@@ -424,3 +425,26 @@ class TestDomainNaming:
     def test_inflammation_markers_spelling_matches_spec(self) -> None:
         """源表 G04!37 写的是 ``INF.INFLAMM_MARKERS``（两个 M 后直接下划线）。"""
         assert "inflamm_markers" in _domain_models()["inf"].model_fields
+
+
+# ===========================================================================
+# 九、规则版本契约
+# ===========================================================================
+class TestVersionContract:
+    """版本串进审计哈希，历史结论靠它复现 —— 所以它必须是「主动确认」的。"""
+
+    def test_ruleset_version_is_pinned(self) -> None:
+        """硬编码版本串：改了规则就必须显式改这里。
+
+        这不是重复劳动 —— 它的作用是让「版本变了」成为一个需要人确认的动作，
+        而不是顺手改一个常量就悄悄过关。
+        """
+        assert RULESET_VERSION == "v362@v3.6.2"
+
+    def test_spec_version_appears_in_ruleset_version(self) -> None:
+        assert SPEC_VERSION in RULESET_VERSION
+
+    def test_current_version_has_a_changelog_entry(self) -> None:
+        """bump 了却没写变更日志 = 后人无从知道「为什么变」。"""
+        assert RULESET_VERSION in RULESET_CHANGELOG
+        assert RULESET_CHANGELOG[RULESET_VERSION].strip()

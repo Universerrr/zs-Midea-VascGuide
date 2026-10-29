@@ -13,8 +13,8 @@
 
 四个刻意不做的事（都有明确的阻塞原因，不是遗漏）：
 
-    1. **不生成自然语言诊疗建议** —— ``primary_recommendation`` 是显式占位
-       （留白一：需临床确认三模式各自的标准处置路径）；
+    1. **不生成自然语言诊疗建议** —— ``primary_recommendation`` 只把既有结论
+       排成一句话（模式 · 病种 · 工具A 终点 · 待补数），不含任何治疗主张；
     2. **不调用 LLM** —— 抽取器（病历 → VascCase）与转译器均未实现；
     3. **不实现任何工具** —— 五个工具全部 blocked，``tool_findings`` 恒为空；
     4. **不做交互界面** —— 渲染器与可视化界面已推迟到术前 Agent 完成之后。
@@ -339,14 +339,21 @@ def _render_conclusion(state: PreopRunResult, verbose: int) -> str:
     out.append(f"置信    {result.confidence_level}")
     out.append(f"标签    {'、'.join(result.class_output) if result.class_output else '无'}")
 
-    out += ["", SEP_LIGHT, " 主建议（留白一：待临床口径）", SEP_LIGHT]
+    out += ["", SEP_LIGHT, " 主建议（既有结论的重新排列，不含新判断）", SEP_LIGHT]
     out.append(_indent(recommendation.primary_recommendation))
     options = recommendation.treatment_options
-    out.append(_indent("治疗选项：" + ("、".join(options) if options else "暂无（待补临床口径）")))
+    if options:
+        # 每项一行：两项挤成一行会把「EVAR 条件性候选」和「OSR 需 MDT」读成一件事。
+        out.append(_indent("治疗选项："))
+        out.extend(_indent(f"· {option}") for option in options)
+    else:
+        out.append(_indent("治疗选项：暂无（本病例未进入术式判断节点）"))
     if recommendation.translated_text is None:
         out.append(_indent("自然语言转译：未启用（留白二，LLM 转译未实现）"))
 
-    out += ["", SEP_LIGHT, f" 资料缺口（{len(result.evidence_gaps)} 项）", SEP_LIGHT]
+    # 路由层的缺口（判定依据不足）。病种流程的缺口由工具A 自己报，
+    # 见 -vv 的工具产物摘要 —— 两者口径不同，不能合并计数。
+    out += ["", SEP_LIGHT, f" 判定资料缺口（路由层 {len(result.evidence_gaps)} 项）", SEP_LIGHT]
     out += _render_gaps(result.evidence_gaps, verbose)
 
     out += ["", SEP_LIGHT, " 证据链", SEP_LIGHT]

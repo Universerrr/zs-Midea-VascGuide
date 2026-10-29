@@ -54,7 +54,7 @@ from src.preop_agent.execution_layer.node import (
     run_tool,
     unimplemented_tools,
 )
-from src.preop_agent.execution_layer.plan import plan_for
+from src.preop_agent.execution_layer.plan import Necessity, ToolPlanItem, plan_for
 from src.preop_agent.execution_layer.registry import SPEC_BY_KEY
 from src.preop_agent.graph import (
     build_checkpoint_serde,
@@ -87,6 +87,12 @@ from src.rules.router import RULES, RouteKind, RouteResult, RuleTrace, route
 from src.tools.base import MissingUpstreamError, ToolRequest, ToolSpec
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _keys(plan: tuple[ToolPlanItem, ...]) -> tuple[str, ...]:
+    """取计划里的工具键序列 —— 断言关心「跑哪些、什么顺序」，不关心必要性。"""
+    return tuple(item.tool for item in plan)
+
 
 #: 判定层目录：这些目录下的代码**只允许是确定性实现**。
 JUDGMENT_LAYER_DIRS = (
@@ -386,31 +392,37 @@ class TestExecutionLayer:
             "risk_calculator",
         }
 
-    def test_every_tool_documents_its_blocker(self) -> None:
+    def test_every_unimplemented_tool_documents_its_blocker(self) -> None:
         """未实现的工具必须写明**缺什么**，而不是一句「待办」。"""
         for spec in unimplemented_tools():
             assert spec.blocked_reason and len(spec.blocked_reason) > 10
-        assert len(unimplemented_tools()) == len(TOOL_REGISTRY)
+        assert len(unimplemented_tools()) + len(IMPLEMENTED_TOOLS) == len(TOOL_REGISTRY)
 
-    def test_implemented_set_is_empty(self) -> None:
-        assert IMPLEMENTED_TOOLS == frozenset()
+    def test_implemented_tools_are_exactly_guideline_engine(self) -> None:
+        """当前只有工具A 已实现；其余 4 个仍在等外部资源。"""
+        assert IMPLEMENTED_TOOLS == frozenset({"guideline_engine"})
 
     def test_run_tool_raises_with_reason(self) -> None:
+        """未实现的工具（此处取 B）必须抛自己的阻塞原因。"""
         with pytest.raises(NotImplementedError, match="未实现"):
-            run_tool("guideline_engine", {"case": make_case()})  # type: ignore[arg-type]
+            run_tool("imaging_quantifier", {"case": make_case()})  # type: ignore[arg-type]
 
-    def test_node_returns_empty_outputs(self) -> None:
-        """工具产物不存在，就必须返回空——绝不凭空造评分。"""
-        # 指南模式 → 计划里只有 A/B 两个工具，且都未实现 ⇒ 空产物
+    def test_node_runs_only_implemented_tools(self) -> None:
+        """指南模式计划 A+B：A 已实现则产出，B 未实现则静默缺席（不是空结论）。"""
         state = {"case": make_case(), "route_result": route(make_case())}  # type: ignore[arg-type]
-        assert execution_node(state) == {"tool_outputs": {}}  # type: ignore[arg-type]
+        update = execution_node(state)  # type: ignore[arg-type]
+        assert set(update["tool_outputs"]) == {"guideline_engine"}
+        assert update["tool_skips"] == {}
 
     def test_non_mode_result_runs_no_tool(self) -> None:
         """人工复核 / 资料核实不跑任何工具：判定依据不足时算出来的东西不可信。"""
         case = make_case(n={"neck_len": None})
         result = route(case)
         assert result.mode is None
-        assert execution_node({"case": case, "route_result": result}) == {"tool_outputs": {}}  # type: ignore[arg-type]
+        assert execution_node({"case": case, "route_result": result}) == {
+            "tool_outputs": {},
+            "tool_skips": {},
+        }  # type: ignore[arg-type]
 
     def test_node_requires_routed_case(self) -> None:
         """未经路由层就给执行层喂 case → 响亮失败，不猜模式。"""
@@ -481,6 +493,64 @@ class TestExecutionLayer:
         assert calls == ["imaging_quantifier", "anatomy_scorer", "memory_retriever"]
         assert set(outputs) == set(specs)
 
+    # ---- Necessity：跑不成时「抛」还是「记」的分岔 ----
+    @staticmethod
+    def _patch_one_tool(monkeypatch: pytest.MonkeyPatch, runner: Any) -> None:
+        """把 guideline_engine 换成「已实现 + 指定行为」的假工具。
+
+        只替换 A 一个：其余 4 个仍是未实现，``execution_order`` 会跳过它们
+        （急诊计划里 A 无上游依赖，所以不受牵连）。
+        """
+        fake = ToolSpec(
+            key="guideline_engine",
+            label="工具A · 指南引擎",
+            consumes=(),
+            produces="",
+            blocked_reason=None,
+        )
+        for module in (exec_node_module, registry_module):
+            monkeypatch.setattr(module, "SPEC_BY_KEY", {"guideline_engine": fake})
+        monkeypatch.setattr(exec_node_module, "IMPLEMENTED_TOOLS", frozenset({"guideline_engine"}))
+        monkeypatch.setattr(registry_module, "RUNNER_BY_KEY", {"guideline_engine": runner})
+
+    def test_best_effort_failure_is_recorded_not_raised(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """急诊：工具跑不成 → 记入 ``tool_skips``，节点继续。
+
+        这是 G05「不等待非必要分析」的机械表达 —— 缺一份分析不能换来空结论。
+        """
+
+        def boom(request: ToolRequest) -> Any:
+            raise RuntimeError("缺 CTA 影像句柄")
+
+        self._patch_one_tool(monkeypatch, boom)
+        case = make_case(v={"sbp": 70})  # G03.R20 → 急诊模式
+        result = route(case)
+        assert result.mode is RouteMode.EMERGENCY  # 前提校验：确实进了急诊
+
+        update = execution_node({"case": case, "route_result": result})  # type: ignore[arg-type]
+
+        assert update["tool_outputs"] == {}
+        assert "guideline_engine" in update["tool_skips"]
+        assert "CTA" in update["tool_skips"]["guideline_engine"]
+
+    def test_required_failure_propagates_in_guideline_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """指南：同样的失败必须抛出 —— 择期路径不允许拿「没算」冒充「算过」。"""
+
+        def boom(request: ToolRequest) -> Any:
+            raise RuntimeError("缺 CTA 影像句柄")
+
+        self._patch_one_tool(monkeypatch, boom)
+        case = make_case()  # 基线 → 指南模式
+        result = route(case)
+        assert result.mode is RouteMode.GUIDELINE
+
+        with pytest.raises(RuntimeError, match="CTA"):
+            execution_node({"case": case, "route_result": result})  # type: ignore[arg-type]
+
 
 # ===========================================================================
 # 执行层 · 三模式调度表
@@ -491,39 +561,49 @@ class TestModePlans:
     def test_every_mode_has_a_plan(self) -> None:
         assert set(MODE_PLANS) == set(RouteMode)
 
-    def test_emergency_plan_is_empty(self) -> None:
-        """设计表 06：急诊「不预置择期工具」。"""
-        assert MODE_PLANS[RouteMode.EMERGENCY] == ()
+    def test_emergency_plan_covers_all_tools_as_best_effort(self) -> None:
+        """G05：急诊「A/B 按可用性快速调用，C/D/E 按需调用，不等待非必要分析」。
+
+        形式上是全 5 个工具，但**全部 BEST_EFFORT** —— 跑不成只记录、不阻断。
+        这是「按可用性调用」的机械表达：不是不调用，而是调用失败不算失败。
+        """
+        plan = MODE_PLANS[RouteMode.EMERGENCY]
+        assert _keys(plan) == _keys(MODE_PLANS[RouteMode.COMPLEX])
+        assert {item.necessity for item in plan} == {Necessity.BEST_EFFORT}
 
     def test_guideline_plan_is_strict_subset_of_complex(self) -> None:
         """指南 ⊂ 复杂：指南只是「少跑几个」，不是另一套流程。"""
-        assert set(MODE_PLANS[RouteMode.GUIDELINE]) < set(MODE_PLANS[RouteMode.COMPLEX])
+        assert set(_keys(MODE_PLANS[RouteMode.GUIDELINE])) < set(
+            _keys(MODE_PLANS[RouteMode.COMPLEX])
+        )
 
     def test_guideline_plan_is_exactly_engine_and_imaging(self) -> None:
         """设计表 06：指南模式只跑 A + B。多塞一个都算错，不只是「子集」就算对。"""
-        assert MODE_PLANS[RouteMode.GUIDELINE] == ("guideline_engine", "imaging_quantifier")
+        assert _keys(MODE_PLANS[RouteMode.GUIDELINE]) == ("guideline_engine", "imaging_quantifier")
 
     def test_complex_plan_covers_every_registered_tool(self) -> None:
         """新增工具却忘了补计划 → 在这里失败（刻意设计的摩擦）。"""
-        assert set(MODE_PLANS[RouteMode.COMPLEX]) == {spec.key for spec in TOOL_REGISTRY}
+        assert set(_keys(MODE_PLANS[RouteMode.COMPLEX])) == {spec.key for spec in TOOL_REGISTRY}
 
     def test_plans_only_reference_registered_tools(self) -> None:
         registered = {spec.key for spec in TOOL_REGISTRY}
         for mode, plan in MODE_PLANS.items():
-            assert set(plan) <= registered, f"{mode} 引用了未登记的工具"
+            assert set(_keys(plan)) <= registered, f"{mode} 引用了未登记的工具"
 
     def test_plans_are_dependency_closed(self) -> None:
         """计划里每个工具的依赖必须也在同一计划内，否则它必然跑不起来。"""
         for mode, plan in MODE_PLANS.items():
-            for key in plan:
+            keys = _keys(plan)
+            for key in keys:
                 for dep in SPEC_BY_KEY[key].depends_on:
-                    assert dep in plan, f"{mode} 的 {key} 依赖 {dep}，但计划里没有"
+                    assert dep in keys, f"{mode} 的 {key} 依赖 {dep}，但计划里没有"
 
     def test_declared_order_respects_dependencies(self) -> None:
         """声明的书写顺序本身就是拓扑序，读代码时不必再算一遍。"""
         for mode, plan in MODE_PLANS.items():
-            position = {key: index for index, key in enumerate(plan)}
-            for key in plan:
+            keys = _keys(plan)
+            position = {key: index for index, key in enumerate(keys)}
+            for key in keys:
                 for dep in SPEC_BY_KEY[key].depends_on:
                     assert position[dep] < position[key], f"{mode}: {dep} 应排在 {key} 之前"
 
@@ -549,13 +629,13 @@ class TestExecutionOrder:
         assert execution_order(MODE_PLANS[RouteMode.COMPLEX], frozenset()) == ()
 
     def test_upstream_runs_before_downstream(self) -> None:
-        order = execution_order(MODE_PLANS[RouteMode.COMPLEX], self.ALL_KEYS)
+        order = _keys(execution_order(MODE_PLANS[RouteMode.COMPLEX], self.ALL_KEYS))
         assert order.index("imaging_quantifier") < order.index("anatomy_scorer")
         assert order.index("anatomy_scorer") < order.index("risk_calculator")
 
     def test_order_covers_exactly_the_plan(self) -> None:
         for plan in MODE_PLANS.values():
-            assert set(execution_order(plan, self.ALL_KEYS)) == set(plan)
+            assert set(_keys(execution_order(plan, self.ALL_KEYS))) == set(_keys(plan))
 
     def test_implemented_tool_with_blocked_upstream_is_loud(self) -> None:
         """「C 已实现、B 未实现」不得静默跳过 B 去算 C。"""
@@ -564,11 +644,11 @@ class TestExecutionOrder:
 
     def test_dependency_outside_plan_is_loud(self) -> None:
         with pytest.raises(RuntimeError, match="不在当前模式的计划内"):
-            execution_order(("anatomy_scorer",), frozenset({"anatomy_scorer"}))
+            execution_order((ToolPlanItem("anatomy_scorer"),), frozenset({"anatomy_scorer"}))
 
     def test_unregistered_tool_is_loud(self) -> None:
         with pytest.raises(RuntimeError, match="未在 TOOL_REGISTRY 登记"):
-            execution_order(("no_such_tool",), frozenset({"no_such_tool"}))
+            execution_order((ToolPlanItem("no_such_tool"),), frozenset({"no_such_tool"}))
 
     def test_dependency_cycle_is_loud(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = {
@@ -577,14 +657,14 @@ class TestExecutionOrder:
         }
         monkeypatch.setattr(exec_node_module, "SPEC_BY_KEY", fake)
         with pytest.raises(RuntimeError, match="成环"):
-            execution_order(("x", "y"), frozenset({"x", "y"}))
+            execution_order((ToolPlanItem("x"), ToolPlanItem("y")), frozenset({"x", "y"}))
 
 
 # ===========================================================================
 # 工具包契约
 # ===========================================================================
 class TestToolsPackage:
-    """一工具一文件、一份 SPEC、一条写明缺什么的阻塞说明。"""
+    """一工具一模块、一份 SPEC、一条写明缺什么的阻塞说明。"""
 
     TOOL_KEYS = (
         "anatomy_scorer",
@@ -610,12 +690,31 @@ class TestToolsPackage:
             assert module.SPEC.key == key
             assert callable(module.run)
 
-    def test_tool_implementation_lives_in_its_own_file(self) -> None:
-        """5 个工具是 5 个文件，不是一个文件里的 5 个分支。"""
+    def test_tool_implementation_lives_in_its_own_module(self) -> None:
+        """5 个工具是 5 个模块（单文件或包），不是一个模块里的 5 个分支。
+
+        工具A 自 V3.6 起是包：21 个病种 sheet / 172 条规则 + 21 节点状态机，
+        单文件会超过 3000 行。判据因此从「``src/tools/*.py`` 的文件名」放宽为
+        「文件，或带 ``__init__.py`` 的目录」——语义不变（一个工具一个模块、
+        各有自己的 ``SPEC`` 与 ``run``），只是允许包形态。
+
+        为什么要求目录带 ``__init__.py``：没有它，目录是命名空间包，
+        ``from ...tools.<key> import SPEC`` 会直接 ImportError（见
+        ``src/tools/guideline_engine/__init__.py`` 的说明）。
+        """
+        root = REPO_ROOT / "src" / "tools"
         modules = sorted(
-            path.stem
-            for path in (REPO_ROOT / "src" / "tools").glob("*.py")
-            if path.stem not in {"__init__", "base"}
+            path.name if path.is_dir() else path.stem
+            for path in root.iterdir()
+            if path.name != "__pycache__"
+            and (
+                (path.is_dir() and (path / "__init__.py").is_file())
+                or (
+                    path.is_file()
+                    and path.suffix == ".py"
+                    and path.stem not in {"__init__", "base"}
+                )
+            )
         )
         assert modules == list(self.TOOL_KEYS)
 
@@ -777,12 +876,24 @@ class TestOutputLayer:
         assert "无法判定" in joined
         assert VERDICT_TEXT[None] == "无法判定"
 
-    def test_clinical_conclusion_is_an_explicit_placeholder(self) -> None:
-        """治疗建议口径未定 → 必须是显式占位，不得编造临床主张。"""
-        recommendation, _ = self._recommendation()
-        assert recommendation.primary_recommendation == PRIMARY_RECOMMENDATION_PLACEHOLDER
-        assert "待补" in recommendation.primary_recommendation
+    def test_primary_recommendation_is_assembled_not_invented(self) -> None:
+        """主建议是既有结论的重新排列 —— 可读，但不得出现新的临床主张。
+
+        三段来源固定：``route_mode`` / ``class_output`` / 工具缺口语数。
+        出现治疗动词即意味着输出层自己下了判断，那是判定层的职责。
+        """
+        recommendation, route_result = self._recommendation()
+        text = recommendation.primary_recommendation
+        assert route_result.mode is not None
+        assert text.startswith(route_result.mode.value)
+        assert "待补" in text
+        for word in ("建议行", "推荐使用", "应行", "首选", "宜"):
+            assert word not in text, f"主建议不得含治疗主张：{word}"
         assert recommendation.treatment_options == []
+
+    def test_placeholder_only_when_nothing_was_decided(self) -> None:
+        """既无模式也无工具结论时才退回占位符 —— 占位符不是常态。"""
+        assert "无法给出结论" in PRIMARY_RECOMMENDATION_PLACEHOLDER
 
     def test_llm_translation_is_explicitly_unimplemented(self) -> None:
         recommendation, _ = self._recommendation()
@@ -842,11 +953,11 @@ class TestOutputLayer:
         assert finding.label == "unregistered_tool"
         assert finding.summary == "'raw'"
 
-    def test_findings_do_not_become_clinical_advice(self) -> None:
-        """承接工具产物**不得**顺手把结论也写了：留白仍为留白。"""
+    def test_findings_do_not_leak_numbers_into_primary_recommendation(self) -> None:
+        """工具产物的数值不得被抄进主建议 —— 那会让同一数字有两处真相。"""
         measurement = VascMeasurement(case_id="GRAPH-TOOL-001", max_diameter_mm=61.2)
         recommendation = self._recommendation_with_tools({"imaging_quantifier": measurement})
-        assert recommendation.primary_recommendation == PRIMARY_RECOMMENDATION_PLACEHOLDER
+        assert "61.2" not in recommendation.primary_recommendation
         assert recommendation.treatment_options == []
         assert isinstance(recommendation.tool_findings[0], ToolFinding)
 
@@ -958,7 +1069,11 @@ class TestGraphEndToEnd:
         assert case.k.classifiable is None
 
     def test_tool_outputs_empty_reflects_real_gap(self) -> None:
-        assert run_preop(make_case(), checkpointer=None)["tool_outputs"] == {}
+        outputs = run_preop(make_case(), checkpointer=None)["tool_outputs"]
+        assert set(outputs) == {"guideline_engine"}
+        # D1 标签 → D1.1 尚未实现 ⇒ 有缺口、无结论，绝不凭空编条目
+        assert outputs["guideline_engine"].entries == ()
+        assert outputs["guideline_engine"].gaps
 
 
 # ===========================================================================

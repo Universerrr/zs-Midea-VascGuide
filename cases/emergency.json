@@ -1,0 +1,213 @@
+{
+  "case_id": "DEMO-002",
+  "p": {
+    "id": "P-0002",
+    "visit": "V-0002",
+    "age": 76,
+    "sex": "男"
+  },
+  "t": {
+    "now": "2026-10-26T03:20:00+08:00"
+  },
+  "d": {
+    "note": "急诊病例：突发剧烈腹痛 6 小时",
+    "vital": [
+      "血压 82/50",
+      "心率 118"
+    ],
+    "lab": [
+      "Hb 92 g/L"
+    ],
+    "cta": "腹主动脉瘤破裂，造影剂外溢，腹膜后血肿",
+    "report": "急诊 CTA 报告",
+    "surg": [],
+    "med": [],
+    "intervention": [],
+    "dx": "肯定",
+    "allergy": "无明确记录",
+    "dx_context": "确认"
+  },
+  "q": {
+    "idmatch": "一致",
+    "visitmatch": "本次",
+    "time": "有效",
+    "unit": "有效",
+    "neg": "肯定",
+    "history": "当前",
+    "experiencer": "本人当前",
+    "conflict": [
+      "无"
+    ],
+    "cta_phase": "动脉期",
+    "cta_quality": "可评价",
+    "datasource": "报告值",
+    "value_status": "阳性",
+    "current_assess": "本次已评估",
+    "cta_cover": "完整",
+    "cta_enhance": "适当",
+    "report_vs_algo": "仅报告"
+  },
+  "s": {
+    "pain_present": "是",
+    "syncope": "否定",
+    "gi_bleed": [
+      "无"
+    ],
+    "limb": [
+      "无"
+    ],
+    "pulse_deficit": "未查",
+    "infection": [
+      "无"
+    ],
+    "abd_tender": "阳性",
+    "pain_current": "当前新发",
+    "aaa_tender": "明确阳性"
+  },
+  "v": {
+    "sbp": 82.0,
+    "dbp": 50.0,
+    "hr": 118.0,
+    "rr": 24.0,
+    "spo2": 95.0,
+    "oxygen": "否",
+    "spo2_scale": "Scale1",
+    "temp": 36.2,
+    "acvpu": "A",
+    "conscious_change": "无新变化",
+    "perfusion": [
+      "阴性"
+    ],
+    "urine": 30.0,
+    "vaso": [],
+    "resus": []
+  },
+  "lab": {
+    "hb": 92.0,
+    "hb_ref_low": 130.0,
+    "hb_prev": 128.0,
+    "hb_comparable": true,
+    "hb_confound": false,
+    "lact": 4.2,
+    "lact_uln": 2.0,
+    "creat": 112.0,
+    "inr": 1.2,
+    "plt": 186.0,
+    "blood_trans": "无记录"
+  },
+  "c": {
+    "aorta": [
+      "腹主动脉瘤"
+    ],
+    "maxd": 58.0,
+    "extrav": "明确",
+    "hematoma": "明确",
+    "wall": "未见",
+    "contain": "未见",
+    "stranding": "有",
+    "rup_context": "有关",
+    "branch": {},
+    "graft": "无",
+    "endoleak": "未评价",
+    "graft_fail": [],
+    "aef_sign": "未见",
+    "image_location": "完整",
+    "extrav_contig": "明确连续",
+    "hematoma_adj": "明确相邻",
+    "rupture_report": "明确破裂",
+    "source_kind": "正式报告"
+  },
+  "n": {
+    "cta_status": "完整",
+    "neck_len": 18.0,
+    "renal_r": "未受累",
+    "renal_l": "未受累",
+    "sma": "未受累",
+    "ca": "未受累",
+    "thoracic": "否",
+    "neck_d": 26.0,
+    "neck_angle": 45.0,
+    "seal_ifu": "未核验",
+    "iliac_bilat": "无",
+    "iia_left": "通畅",
+    "iia_right": "通畅",
+    "access_occlusion": "未见闭塞",
+    "access_tortuosity": "未见严重迂曲",
+    "genetic_ctx": "无已知阳性线索",
+    "inflammatory_ctx": "无当前支持证据",
+    "infection_ctx": "无相关征象",
+    "fistula_ctx": "未见",
+    "prev_repair": "无",
+    "endoleak_type": "无",
+    "sac_growth": 0.0,
+    "graft_major": "无",
+    "egfr": 68.0,
+    "dialysis": "否",
+    "heart_class": "II",
+    "resp_support": "无"
+  },
+  "gen": {
+    "syndrome_type": "不详",
+    "aaa_age_onset": 70,
+    "family_aneurysm": "明确无相关史",
+    "syndromic_features": [],
+    "variant_class": "未检测"
+  },
+  "inf": {
+    "mantle_sign": "未见",
+    "wall_fibrosis": "未见",
+    "organ_involvement": [
+      "无"
+    ],
+    "inflamm_markers": "CRP 12 mg/L（参考上限 5）",
+    "symptom_pattern": "无",
+    "aaa_true_diam": 58.0
+  },
+  "cl": {
+    "aorta_location": [
+      "腹主动脉"
+    ],
+    "aaa_diam": 58.0,
+    "aaa_reported": "确认",
+    "aaa_rupture": "明确",
+    "symptom_aaa": "医师确认相关",
+    "infection": "无证据",
+    "fistula": "否",
+    "pau": "阴性",
+    "imh": "阴性",
+    "iaad": "阴性",
+    "saccular": "否",
+    "pseudo": "否",
+    "iliac_site": [
+      "无"
+    ],
+    "iliac_diam": {},
+    "prev_evor": "无",
+    "diag_quality": "确认",
+    "diag_multi": [
+      "D3"
+    ]
+  },
+  "k": {
+    "new_urgent": "是"
+  },
+  "r": {},
+  "urgency_flag": false,
+  "field_evidence": {
+    "cl.aaa_rupture": {
+      "source_quote": "急诊 CTA（2026-10-26 03:10）：腹主动脉瘤最大径 58mm，造影剂外溢并跨壁连续，腹膜后血肿相邻，符合破裂。",
+      "writer": "LLM",
+      "overwritten_by_human": false
+    },
+    "c.extrav": {
+      "source_quote": "造影剂外溢，与主动脉壁连续，范围约 12mm。",
+      "writer": "LLM",
+      "overwritten_by_human": false
+    },
+    "c.rupture_report": {
+      "source_quote": "放射科报告结论：腹主动脉瘤破裂，伴腹膜后血肿形成。",
+      "writer": "LLM",
+      "overwritten_by_human": false
+    }
+  }
+}

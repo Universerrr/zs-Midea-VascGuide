@@ -1,20 +1,20 @@
 """规则版本号注册表（审计红线：规则变更必须显式登记）。
 
-为什么需要复合版本串？
-    VascCase 的路由结论同时依赖两份权威资料：
-      表1 —— 病种口径（26 病种 → 三模式 + 工具），决定「怎么归属」；
-      表2 —— 覆盖规则（P0a~P8 / O01~O29），决定「怎么判」。
-    任一版本变动都可能改变路由结论。审计要求「给定输入 + 给定规则版本 →
-    结论可复现」，故结论必须落盘**复合版本串**，而不是只记一个号。
+为什么需要版本串？
+    审计要求「给定输入 + 给定规则版本 → 结论可复现」，所以每个
+    :class:`~src.rules.router.RouteResult` 都带着它落盘。改了规则却不 bump，
+    历史结论就再也解释不通。
 
 版本串格式（规范）：
-    ``table1@<表1版本>+table2@<表2版本>``
-    例：``table1@v1.0+table2@v1.4``
+    ``<规则集代号>@<规格版本>``，例：``v36@v3.6``
+    代号取规格名的紧凑写法（``v312`` / ``v36``），与规格版本一起构成唯一键，
+    让「同一份规格下的哪个规则集」一眼可辨。
 
 变更纪律：
-    - 表1 改了病种/模式/工具归属 → 手动 bump ``TABLE1_VERSION``；
-    - 表2 改了任一覆盖规则 O01~O29 或 P 流水线 → 手动 bump ``TABLE2_VERSION``；
-    - 改完必须在 CHANGELOG 备注（见 ``RULESET_CHANGELOG``）。
+    - 改阈值、病种归属、note 文案、规则条数 → **手动** bump ``SPEC_VERSION``
+      或 ``RULESET_VERSION``，并在 ``RULESET_CHANGELOG`` 里写清原因；
+    - 禁止程序自动推导版本号（那会让「什么时候变的」无从追溯）；
+    - bump 后同步 ``tests/test_model_contract.py`` 的版本契约断言。
 """
 
 from __future__ import annotations
@@ -22,12 +22,10 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 # 版本号（发布前手动维护，禁止程序自动推导）
 # ---------------------------------------------------------------------------
-TABLE1_VERSION: str = "v1.0"  # 【legacy】表1：26 病种路由总表（v1.x 口径，已被 V3.1(2) 取代）
-TABLE2_VERSION: str = "v1.7"  # 【legacy】表2：覆盖规则库 O01~O29 / P0a~P8（v1.x）
-V312_VERSION: str = "v3.1.2"  # V3.1(2) 规格：169 字段 / 63 条规则
+SPEC_VERSION: str = "v3.6.2"  # V3.6.2 规格：300 个字段 ID（首列去重）/ 246 条规则
 
-RULESET_VERSION: str = f"v312@{V312_VERSION}"
-"""当前生效的规则集版本。V3.1(2) 重写后**单一版本串**，不再是 table1+table2 复合串。
+RULESET_VERSION: str = f"v362@{SPEC_VERSION}"
+"""当前生效的规则集版本。单一版本串，不再是 v1.x 的 table1+table2 复合串。
 
 变更必须 bump 本串并写 ``RULESET_CHANGELOG``：它进审计哈希，历史结论靠它复现。
 """
@@ -36,6 +34,30 @@ RULESET_VERSION: str = f"v312@{V312_VERSION}"
 # 变更日志（审计用：说明每次 bump 的原因）
 # ---------------------------------------------------------------------------
 RULESET_CHANGELOG: dict[str, str] = {
+    "v362@v3.6.2": (
+        "对齐 V3.6.2 规格（2026-10-29）。**规格侧**：genetic_syndrome → N.GENETIC_CTX、"
+        "inflammatory_evidence → N.INFLAMMATORY_CTX、D5.MALPERFUSION 与 C.MALPERFUSION "
+        "去重（保留 C.）、D2.RESOURCE → D3.TEAM_RESOURCE；规则总数 246 不变，字段 302→300。"
+        "**代码侧**：(1) VascCase 增 c.malperfusion —— C 域 19→20、总数 160→161。"
+        "规格只有 G04!C39 字段行、没有规则行，也没有 GEN.*/INF.* 那样的证据明细层，"
+        "故取「派生量」方案：抽取值优先；缺失时由 _materialize_malperfusion 保守派生，"
+        "**永不因分支解剖异常判为确认**（G04!C39 明文「不能仅凭解剖狭窄自动推断器官缺血」）。"
+        "(2) 新增 G04.R21 消费该值，来源性质登记为「工程安全规则」（非 ESVS 原文），"
+        "规则数 54→55，归入 G04_EXTRA（UNKNOWN 不阻断 G07 放行）。"
+        "影响面：字段数与规则数变化会改变 case 哈希与审计链，历史 checkpoint 不再可比。"
+    ),
+    "v36@v3.6": (
+        "对齐 V3.6 规格（2026-10-28 起为唯一开发基准，替代 V3.1(2)）。"
+        "本轮改动：RouteResult 增 next_nodes（规格的「输出／下一节点」列天生是序列，"
+        "如 D3.1.R01「G05 急诊模式并进入 D3.2」）；新增 RULE_SOURCE 表，"
+        "为 54 条规则逐条登记来源性质（ESVS原文 29 / 工程安全规则 22 / 其他指南 3）"
+        "与 ESVS 章节号。"
+        "**判定逻辑、阈值、字段归属、短路顺序全部未变** —— 54 条规则函数一字未改，"
+        "606 项测试原样通过。bump 的理由是审计一致性：RouteResult 多了字段"
+        "（进哈希），且来源性质进输出层，同一版本串必须对应同一份可复现记录。"
+        "待办：字段模型尚未扩到 V3.6 的 294 个（病种域 d1–d7 待建），"
+        "规则尚未扩到 65 条判定层 + 172 条病种流程。"
+    ),
     "v312@v3.1.2": (
         "V3.1(2) 重写：字段模型 160 字段 / 14 域子模型；路由改为 54 条判定规则"
         "（G03 21 / G04 18 / G08 11 / G09 4），淘汰 v1.x 的 P0a~P8 与 O01~O29。"
@@ -106,6 +128,5 @@ RULESET_CHANGELOG: dict[str, str] = {
 __all__ = [
     "RULESET_CHANGELOG",
     "RULESET_VERSION",
-    "TABLE1_VERSION",
-    "TABLE2_VERSION",
+    "SPEC_VERSION",
 ]

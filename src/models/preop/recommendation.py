@@ -6,7 +6,7 @@
 
 审计要求（核心）：
     1. 必须记录**完整决策路径**（逐条规则求值结果，含被否决项）；
-    2. 必须记录**规则版本号**（``RULESET_VERSION``，如 ``v312@v3.1.2``）；
+    2. 必须记录**规则版本号**（``RULESET_VERSION``，如 ``v36@v3.6``）；
     3. 必须记录**输入快照哈希**，保证可复现。
 """
 
@@ -140,7 +140,7 @@ class FinalRecommendation(BaseModel):
 
     ruleset_version: str = Field(
         ...,
-        description="规则版本号（如 'v312@v3.1.2'）。审计必需。",
+        description="规则版本号（如 'v36@v3.6'）。审计必需。",
     )
     input_snapshot_hash: str | None = Field(default=None, description="输入快照哈希（用于复现）。")
     translated_text: str | None = Field(

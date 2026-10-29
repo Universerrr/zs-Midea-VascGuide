@@ -111,7 +111,7 @@ def test_gaps_are_grouped_by_domain(tmp_path, capsys) -> None:
     empty.write_text('{"case_id": "EMPTY"}', encoding="utf-8")
     cli.main(["--case", str(empty), "--no-persist"])
     out = capsys.readouterr().out
-    assert "资料缺口（40 项）" in out
+    assert "判定资料缺口（路由层 40 项）" in out
     assert "CTA 报告（" in out  # 域中文名出现在分组标题里，而非裸域键 c
 
 
