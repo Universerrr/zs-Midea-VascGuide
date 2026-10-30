@@ -74,7 +74,7 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 | **审计留痕结构** | `FieldProvenance`（字段原文出处 / 写入者 / 是否被人工覆写）、`UrgencyFlagAudit` |
 | **确定性规则层** | `router.py`（V3.1(2) 的 55 条判定规则 + 三值求值）+ `RULESET.md`（规则↔源行对照）+ `version.py`（规则版本），详见「四」 |
 | **编排层（LangGraph）** | 四层节点 `input → router → execution → output` 串成 `StateGraph` 并接 SQLite Checkpoint；每节点自动留痕（节点名 / 起止时间 / 输入输出哈希），审计链可**逐环校验**，详见「五」 |
-| **测试与工具链** | **697 项测试**（86 路由基线 + 84 数据契约 + 114 编排层 + 220 规则分支 + 121 结论自证契约 + 12 CLI + 60 工具A）、`ruff` 无告警、覆盖率 **99%**（`router.py` 99%、`audit.py` 与 `recommendation.py` 100%） |
+| **测试与工具链** | **1079 项测试**（86 路由基线 + 84 数据契约 + 115 编排层 + 220 规则分支 + 121 结论自证契约 + 12 CLI + 445 工具A）、`ruff` 无告警、覆盖率 **99%**（`router.py` 99%、`audit.py` 与 `recommendation.py` 100%、病种节点全部 ≥97%） |
 
 ### ⏳ 尚未开始
 
@@ -83,7 +83,7 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 
 **① 等外部资源（技术缺口）**
 
-- **工具A 已实现 D3 分支；B/C/D/E 仍未实现**（实现位置 `src/tools/<tool>.py`；工具A 是 `src/tools/guideline_engine/` 包）。未实现的工具都在
+- **工具A 已实现 D1–D7 全部 21 个病种节点（169 / 172 条规则）；B/C/D/E 仍未实现**（实现位置 `src/tools/<tool>.py`；工具A 是 `src/tools/guideline_engine/` 包）。未实现的工具都在
   自己的 `SPEC` 里写明了**具体缺什么**：指南引擎缺「接入哪部指南 + 条目结构化方式」、
   影像量化器缺「CTA 数据 + 分割与中心线算法」、解剖评分器与风险计算器缺「临床量表与模型系数」、
   记忆检索器缺「历史病例库与检索索引」。
@@ -139,7 +139,7 @@ zs-Midea VascGuide/
 │   │   └── RULESET.md           # ✅ 55 条规则 ↔ 函数名 ↔ V3.1(2) 源行 对照表（防规格漂移）
 │   ├── tools/                   # ✅ 5 个确定性工具（一工具一模块，全部未实现）
 │   │   ├── base.py              # ✅ ToolSpec / ToolRequest / MissingUpstreamError
-│   │   ├── guideline_engine/    # ✅ 工具A · 指南引擎（21 节点 / 172 条中已实现 3 / 17）
+│   │   ├── guideline_engine/    # ✅ 工具A · 指南引擎（21 节点 / 172 条中已实现 21 / 169，差 D3.3 的三条裁决留痕规则）
 │   │   │   ├── __init__.py      # ✅ 公开接口：只 re-export SPEC / run（零逻辑）
 │   │   │   ├── spec.py          # ✅ ToolSpec 实例（单列以避免 __init__ ↔ engine 循环导入）
 │   │   │   ├── engine.py        # ✅ 节点遍历（深度优先 + 去重）+ 出口汇总
@@ -147,6 +147,11 @@ zs-Midea VascGuide/
 │   │   │   ├── registry.py      # ✅ 规格 21 sheet / 172 条 与 已实现规模 的对照
 │   │   │   └── nodes/           # 病种节点（按规格 sheet 分文件）
 │   │   │       ├── common.py    # ✅ 优先级求值（P0→P3）+ 缺口 + 出户口径
+│   │   │       ├── d1_asymptomatic.py # ✅ D1.1–D1.3（31 条全实现：阈值分层 / 获益风险 / 术式候选）
+│   │   │       ├── d2_symptomatic.py # ✅ D2.1–D2.3（24 条全实现：症状归因 / 紧急度 / 术式候选）
+│   │   │       ├── d4_infected.py    # ✅ D4.1–D4.3（25 条全实现：感染分型 / 感染源控制 / MAGIC）
+│   │   │       ├── d5_special.py     # ✅ D5.1–D5.3（20 条全实现：特殊病变分诊 / 复杂性 / 炎症与形态）
+│   │   │       ├── d6_postop.py      # ✅ D6.1–D6.3（28 条全实现：术后分诊 / 内漏与瘤囊 / 结构与靶血管）
 │   │   │       └── d3_ruptured.py # ✅ D3.1–D3.3（20 条中实现 17 条）
 │   │   ├── imaging_quantifier.py # 工具B · 影像量化器（阻塞：CTA 数据 + 分割算法）
 │   │   ├── anatomy_scorer.py    # 工具C · 解剖评分器（阻塞：评分量表）
@@ -176,10 +181,10 @@ zs-Midea VascGuide/
 │   ├── conftest.py              # ✅ 唯一病例构造入口：baseline_kwargs() + make_case()（域级浅合并）
 │   ├── test_preop.py            # ✅ 86 项路由端到端基线（五出口 / 同桶优先级 / 标签）
 │   ├── test_model_contract.py   # ✅ 84 项数据契约（161 字段 / 不确定值白名单 / 严格模式）
-│   ├── test_preop_graph.py      # ✅ 111 项编排层 + 调度表 + 依赖排序 + Checkpoint 往返 + 架构守卫
+│   ├── test_preop_graph.py      # ✅ 115 项编排层 + 调度表 + 依赖排序 + Checkpoint 往返 + 架构守卫
 │   ├── test_router_branches.py  # ✅ 220 项规则分支（55 条逐条命中 + 三值语义 + 派生量）
 │   ├── test_router_note_contract.py # ✅ 121 项结论自证契约（rule_id / reason / gaps / trace）
-│   ├── test_guideline_engine.py # ✅ 60 项工具A 契约（D3 判据复用 / 术式候选 / 粒度红线 / 不越权 / 缺口可见）
+│   ├── test_guideline_engine.py # ✅ 445 项工具A 契约（D1–D7 七条路径 + 粒度红线 / 不越权 / 缺口可见）
 │   └── test_main.py             # ✅ 12 项 CLI 契约（错误提示可读性 / JSON 与文本同源 / 副作用边界）
 ├── cases/                       # 病例样例（JSON，直接喂给 main.py）
 │   └── example.json             # ✅ 完整病例：走指南模式、零缺口、含 3 条原文出处
@@ -307,7 +312,7 @@ uv run python -c "from src.rules.version import RULESET_VERSION, RULESET_CHANGEL
 | `execution_layer/plan.py` | `MODE_PLANS`：三模式各跑哪些工具（**唯一真源**） |
 | `execution_layer/registry.py` | `TOOL_REGISTRY` / `SPEC_BY_KEY` / `run_tool()` 分派 |
 | `execution_layer/node.py` | `execution_order()` 拓扑排序 + `execution_node()` 按模式调度 |
-| `tools/<tool>.py` | 5 个确定性工具的实现位置（一工具一模块；工具A 为包且已实现 D3 分支，B/C/D/E 未实现） |
+| `tools/<tool>.py` | 5 个确定性工具的实现位置（一工具一模块；工具A 为包且已实现 D1–D7 分支，B/C/D/E 未实现） |
 | `output_layer/node.py` | 聚合 `FinalRecommendation`，并把 `tool_outputs` 渲染为 `tool_findings` |
 
 ### 2. 图与状态
@@ -570,7 +575,7 @@ with sqlite_checkpointer() as reopened:
 ### 常用命令（测试 / 检查）
 
 ```bash
-# 跑全部测试（应为 693 passed, 4 skipped）
+# 跑全部测试（应为 712 passed, 4 skipped）
 uv run pytest tests/ -q
 
 # 静态检查（应为 All checks passed）
@@ -595,7 +600,7 @@ uv run pytest tests/ --cov --cov-report=term-missing
 - **覆盖了哪些代码**：`--cov-report=html` 生成 `htmlcov/index.html`，红色行即未被测试执行到的分支。
 
 > ⚠️ **覆盖率 ≠ 测试结果**：前者衡量「代码有多少行被执行到」，后者衡量「每个用例过没过」。
-> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 693 项全绿、覆盖率 99%。
+> 两者互补 —— 一个看「测了没有」，一个看「测的对不对」。当前 712 项全绿、覆盖率 99%。
 
 ---
 

@@ -32,7 +32,7 @@ from __future__ import annotations
 import itertools
 import logging
 import sqlite3
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import is_dataclass
 from datetime import UTC, datetime
@@ -256,6 +256,7 @@ def run_preop(
     *,
     checkpointer: SqliteSaver | None | Any = _PERSIST_BY_DEFAULT,
     thread_id: str | None = None,
+    node_inputs: Mapping[str, Any] | None = None,
 ) -> PreopRunResult:
     """执行一次完整术前流水线，返回最终 state（含运行期元信息）。
 
@@ -270,6 +271,10 @@ def run_preop(
             · 不传 → 落盘到 :data:`DEFAULT_CHECKPOINT_DB`；
             · ``None`` → **显式**不落盘（并告警）；仅限测试 / what-if 试算 / 压测；
             · 传入 saver → 落盘到该 saver。
+        node_inputs: 病种域字段（``{"D1": {"D1.DIAM_METHOD": "超声AP内-内"}}``）。
+            这些是**专科评估时医生填**的细节，不在 ``VascCase`` 里（后者是路由专用）。
+            进 :data:`..state.HASHED_KEYS` —— 同一病例填不同测量方法会得出不同结论，
+            输入变了必须能被审计看出来。缺省为空：工具A 据此报「待补」。
         thread_id: 存储分区键 —— 区分「**审计身份**」与「**运行身份**」。
             · 不传（``None``）→ 派生 ``preop:{case_id}:{run_id}``，**一次运行占一条
               线程**。这样每次调用都从零开始写审计轨迹，链自闭合；而按前缀
@@ -300,7 +305,7 @@ def run_preop(
         # 定义时求值，测试就无法用 monkeypatch 把默认库导向 tmp_path。
         with sqlite_checkpointer(DEFAULT_CHECKPOINT_DB) as saver:
             result = build_preop_graph(checkpointer=saver).invoke(
-                {"case": case}, thread_config(resolved_thread_id)
+                {"case": case, "node_inputs": node_inputs or {}}, thread_config(resolved_thread_id)
             )
         persisted = True
     else:
@@ -313,7 +318,7 @@ def run_preop(
                 resolved_thread_id,
             )
         result = build_preop_graph(checkpointer=checkpointer).invoke(
-            {"case": case}, thread_config(resolved_thread_id)
+            {"case": case, "node_inputs": node_inputs or {}}, thread_config(resolved_thread_id)
         )
         persisted = checkpointer is not None
 

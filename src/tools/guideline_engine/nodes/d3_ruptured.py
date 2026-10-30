@@ -39,7 +39,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from ....models.preop.case import UNCERTAIN_TOKENS
 from ....rules.router import (
     D3_EMERGENCY_RULES,
     Verdict,
@@ -50,7 +49,13 @@ from ....rules.router import (
     token,
 )
 from ..state import Candidate, CandidateStatus, GuidelineEntry, GuidelineState, NodeFn, NodeOutcome
-from .common import RuleSlot, evaluate_node, gap_if_missing
+from .common import (
+    RuleSlot,
+    access_blocked,
+    anatomy_available,
+    evaluate_node,
+    missing_fields,
+)
 
 __all__ = ["NODES", "d3_1", "d3_2", "d3_3"]
 
@@ -86,16 +91,6 @@ _D33_FIELDS: tuple[tuple[str, str], ...] = (
     ("D3.PROGNOSIS", "获益与预后综合评估"),
     ("D3.GOALS", "治疗目标：积极修复 / 转诊 / 有限治疗 / 舒适照护"),
 )
-
-
-def _missing(state: GuidelineState, fields: tuple[tuple[str, str], ...]) -> tuple[str, ...]:
-    """从 ``state.d3`` 通道读字段，缺失或取值不确定的记一条缺口。"""
-    out: list[str] = []
-    for spec_id, label in fields:
-        gap = gap_if_missing(f"{spec_id}（{label}）", state.d3.get(spec_id))
-        if gap:
-            out.append(gap)
-    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +132,28 @@ def _d31_r02(state: GuidelineState) -> Verdict:
 
 
 def _d31_r03(state: GuidelineState) -> Verdict:
-    """CTA 是否可等待 —— 依赖 ``D3.CTA_FEASIBLE``，当前无输入通道。"""
-    return None  # type: ignore[return-value]  # 字段未提供 ≠ 不可化验，保持 UNKNOWN
+    """CTA 是否可等待 —— **恒 UNKNOWN，不是「没有通道」**。
+
+    通道是通的（``state.node_field("D3.CTA_FEASIBLE")`` 能取到「可以/不可以/
+    不确定」），缺的是**抽取来源**：目前没有任何环节把这张表填进 ``node_inputs``。
+    在抽取通道建好之前返回 ``None`` 而不是 ``False``，语义上才对：字段没提供
+    不等于「不可以做 CTA」。
+
+    补实现时注意：本条两档（尽快 CTA / 直接手术室）的 ``exit_value`` 是同一个
+    ``D3.2``，差别只在说明文字。``RuleSlot.statement`` 是静态串，装不下这个
+    分叉——要么接受「一条规则两种说法」的措辞，要么把分档写进 ``terminal``。
+    """
+    return None  # type: ignore[return-value]
 
 
 def _d31_r04(state: GuidelineState) -> Verdict:
-    """临床高度怀疑但影像缺失/不确定 —— 依赖 ``D3.*`` 三个组合字段，当前无输入通道。"""
+    """临床高度怀疑但影像缺失/不确定 —— 同上，通道存在、抽取缺位。
+
+    要判它得同时读 ``D3.RUPTURE_CONTEXT`` / ``D3.CTA_COVERAGE`` /
+    ``D3.HEMORRHAGE_EVIDENCE`` 三个**自由文本枚举**（「未做 / 不可评价 / 结果
+    冲突」），而模型层没有对应的 ``Literal``。在抽取层定下这三档的规范值之前
+    就读，只会得到「关键词匹配」，那正是本仓库禁止的做法。
+    """
     return None  # type: ignore[return-value]
 
 
@@ -260,46 +271,9 @@ def d3_1(state: GuidelineState) -> NodeOutcome:
 # 选项**」——那是一条有明确结论的推荐，只是后面跟了一句「仍需术者即时确认」。
 #
 # 所以正确形态是：**给出方向 + 标注把握程度 + 列出还差什么**，而不是「不判」。
-def _anatomy_available(state: GuidelineState) -> Verdict:
-    """解剖参数是否足以比较 EVAR 与 OSR（替代规格的 ``D3.ANATOMY_INFO_STATUS``）。
-
-    为什么不建这个字段：它问的是「资料够不够」，而够不够直接看三个瘤颈参数
-    有没有值就知道。再造一个「关于信息的字段」等于把同一事实存两遍。
-
-    三值：齐全 → ``True``；一个都没有 → ``False``（R90 阻断）；部分缺 → ``None``
-    （不阻断，但不给方向，让团队补）。
-    """
-    vals = (state.case.n.neck_len, state.case.n.neck_d, state.case.n.neck_angle)
-    present = sum(v is not None for v in vals)
-    if present == len(vals):
-        return True
-    if present == 0:
-        return False
-    return None
-
-
-def _access_blocked(state: GuidelineState) -> Verdict:
-    """入路是否**明确阻断** EVAR（替代规格的 ``D3.ACCESS_PLAN``）。
-
-    只有「双侧」才阻断：单侧闭塞/迂曲时对侧仍可建立入路，EVAR 依然可行。
-    这正是规格把「入路可行」与「器械可用」分开写的原因。
-    """
-    occlusion = token(state.case.n.access_occlusion)
-    tortuosity = token(state.case.n.access_tortuosity)
-    if occlusion == "双侧闭塞" or tortuosity == "双侧严重迂曲":
-        return True
-    if occlusion is None or tortuosity is None:
-        return None
-    if _is_uncertain(occlusion) or _is_uncertain(tortuosity):
-        return None
-    return False
-
-
-def _is_uncertain(value: object) -> bool:
-    """取值本身不确定（「未知」等）—— 只用于本地判断，不参与规则求值。"""
-    return isinstance(value, str) and value in UNCERTAIN_TOKENS
-
-
+#
+# ``anatomy_available`` / ``access_blocked`` 已提到 ``common.py``：``D1.3`` 的择期
+# 术式候选用的是完全相同的两条判据。留在本文件会让同一事实出现两套实现。
 def _patient_evaluable(state: GuidelineState) -> Verdict:
     """患者是否处于可完成术前评估的状态（替代规格的 ``D3.PATIENT_STATUS``）。
 
@@ -334,8 +308,8 @@ def _d32_r01(state: GuidelineState) -> Verdict:
     单独列出，由术者当场确认。
     """
     return and_(
-        _anatomy_available(state),
-        not_(_access_blocked(state)),
+        anatomy_available(state),
+        not_(access_blocked(state)),
         eq(token(state.case.n.seal_ifu), "符合"),
         _patient_evaluable(state),
     )
@@ -348,14 +322,14 @@ def _d32_r02(state: GuidelineState) -> Verdict:
     不等于不符（三值语义），此时本规则保持 UNKNOWN，不把病人推去开放手术。
     """
     return or_(
-        _access_blocked(state),
+        access_blocked(state),
         eq(token(state.case.n.seal_ifu), "不符"),
     )
 
 
 def _d32_r03(state: GuidelineState) -> Verdict:
     """P3：本中心无法安全实施 → 现场救援/转诊。依赖团队资源，当前无来源。"""
-    return eq(token(state.d3.get("D3.TEAM_RESOURCE")), "本中心无法实施")
+    return eq(token(state.node_field("D3.TEAM_RESOURCE")), "本中心无法实施")
 
 
 def _d32_r04(state: GuidelineState) -> Verdict:
@@ -364,7 +338,7 @@ def _d32_r04(state: GuidelineState) -> Verdict:
     这是 R01 的降级版本：同样给方向，只是把握程度低一档。规格原文要求
     「记录具体依据与 IFU 核验程度，最终由术者确认」——记录程度就是本规则的产出。
     """
-    return and_(_anatomy_available(state), not_(_access_blocked(state)))
+    return and_(anatomy_available(state), not_(access_blocked(state)))
 
 
 def _d32_r06(state: GuidelineState) -> Verdict:
@@ -387,7 +361,7 @@ def _d32_r07(state: GuidelineState) -> Verdict:
 
 def _d32_r90(state: GuidelineState) -> Verdict:
     """P2：解剖参数一个都没有 → 不得给出任何术式方向。"""
-    return _anatomy_available(state) is False
+    return anatomy_available(state) is False
 
 
 def _d32_r91(state: GuidelineState) -> Verdict:
@@ -479,16 +453,16 @@ def _d32_gaps(state: GuidelineState) -> tuple[str, ...]:
     """
     gaps: list[str] = []
 
-    if _anatomy_available(state) is not True:
+    if anatomy_available(state) is not True:
         gaps.append("解剖参数不足以比较 EVAR 与 OSR（瘤颈长度/直径/角度）")
     if eq(token(state.case.n.seal_ifu), "符合", "不符") is None:
         gaps.append("EVAR 器械 IFU 未核验（seal_ifu = 未核验/未选型号）")
-    if _access_blocked(state) is None:
+    if access_blocked(state) is None:
         gaps.append("入路可行性未评估（股髂直径/钙化/迂曲）")
     if _patient_evaluable(state) is None:
         gaps.append("患者是否可完成评估未明确（血压/意识状态）")
 
-    gaps.extend(_missing(state, _D32_RESOURCE_FIELDS))
+    gaps.extend(missing_fields(state, _D32_RESOURCE_FIELDS))
     return tuple(gaps)
 
 
@@ -506,8 +480,8 @@ def _evar_candidate(state: GuidelineState) -> Candidate:
     顺序不是随手排的：硬排除先于数据阻断。入路双侧闭塞时，资料再全也是排除；
     反之瘤颈参数全缺时不叫排除，叫「未评估」（``D3.2.R90`` 的阻断口径）。
     """
-    anatomy = _anatomy_available(state)
-    blocked = _access_blocked(state)
+    anatomy = anatomy_available(state)
+    blocked = access_blocked(state)
     ifu_ok = eq(token(state.case.n.seal_ifu), "符合")
     evaluable = _patient_evaluable(state)
 
@@ -566,7 +540,7 @@ def _osr_candidate(state: GuidelineState) -> Candidate:
     OSR 已被排除，而实际上它只是待专家评估——两者临床含义完全不同。
     """
     evar_excluded = (
-        _access_blocked(state) is True or eq(token(state.case.n.seal_ifu), "符合") is False
+        access_blocked(state) is True or eq(token(state.case.n.seal_ifu), "符合") is False
     )
     reason = (
         "EVAR 不可行，本方向成为唯一候选；开放解剖与麻醉评估无输入"
@@ -602,7 +576,7 @@ def d3_3(state: GuidelineState) -> NodeOutcome:
     规格三条规则都写了同一句话：「系统不得自行下达不修复结论」。故本节点
     **不产出任何"建议不修复"的结论**，只把缺项和依据摊开给授权医生。
     """
-    gaps = _missing(state, _D33_FIELDS)
+    gaps = missing_fields(state, _D33_FIELDS)
     if gaps:
         return NodeOutcome(
             node_id="D3.3",

@@ -69,6 +69,26 @@ class PreopState(TypedDict, total=False):
     """
 
     case: VascCase
+    node_inputs: Mapping[str, Any]
+    """病种域字段（``D1.DIAM_METHOD`` / ``D3.TEAM_RESOURCE`` 等），按病种前缀分组。
+
+    为什么单开一个通道而不是塞进 ``VascCase``：
+
+        ``VascCase`` 是**路由专用**（161 字段，进哈希）。而 ``D1.DIAM_METHOD``
+        这类字段是**专科评估时医生填**的病种细节——它们既不影响路由判定，也不
+        需要随路由结论一起进哈希。塞进去会让每一次路由哈希都随病种字段抖动，
+        还会破坏「``VascCase`` 只装路由需要的字段」这条定位。
+
+    为什么必须进 :data:`HASHED_KEYS`：
+
+        它是**输入事实**，不是派生量。同一个病例填了不同的测量方法，结论可能
+        完全不同（``D1.SEX_THRESHOLD_SOURCE`` 明写「仅有 CTA 外径不可直接套用
+        超声阈值」）。不进哈希就等于「输入变了但审计看不出来」。
+
+    缺省为空字典：规格里这些字段**没有抽取来源**（G02 的抽取清单不含 ``D*.``），
+    生产调用时通常为空；各节点据此报「待补关键资料」，而不是编一个默认值。
+    """
+
     case_id: str
     input_snapshot_hash: str
     route_result: RouteResult
@@ -113,6 +133,7 @@ class PreopRunResult(PreopState, total=False):
 # 也会得到不同哈希，直接违反「可复现」红线。
 HASHED_KEYS: tuple[str, ...] = (
     "case",
+    "node_inputs",
     "case_id",
     "route_result",
     "tool_outputs",

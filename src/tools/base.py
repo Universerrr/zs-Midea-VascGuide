@@ -95,6 +95,18 @@ class ToolRequest:
     case: VascCase
     route_result: RouteResult
     upstream: Mapping[str, Any] = field(default_factory=dict)
+    node_inputs: Mapping[str, Any] = field(default_factory=dict)
+    """病种域字段，按病种前缀分组（``{"D1": {"D1.DIAM_METHOD": "超声AP内-内"}}``）。
+
+    为什么工具需要它：病种层规则有一半的判据读 ``D1.*`` / ``D3.*`` 这类字段
+    （如 ``D1.SEX_THRESHOLD_SOURCE``「仅有 CTA 外径不可直接套用超声阈值」），
+    而这些字段**不在** ``VascCase`` 里——后者是路由专用，装的是判定层要用的
+    病例事实。没有本通道，D1 的阈值分层只能恒返回 UNKNOWN。
+
+    与 ``upstream`` 的区别：``upstream`` 是**本次运行中其他工具的产物**（算出来的），
+    ``node_inputs`` 是**外部录入的输入事实**（医生填的）。前者缺失是调度错误，
+    后者缺失是资料不全——处理方式完全不同（抛错 vs 记缺口）。
+    """
 
     def require(self, key: str) -> Any:
         """取上游工具产物。

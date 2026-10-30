@@ -1,7 +1,7 @@
 """工具A 的节点与规则登记表 —— 「实现了哪些」的唯一真源。
 
 为什么要有这张表，而不是让 ``engine.py`` 直接去 import 各病种模块：
-    规格有 21 个病种 sheet / 172 条规则，当前只实现了 3 个节点 / 11 条规则。
+    规格有 21 个病种 sheet / 172 条规则，当前实现了 21 个节点 / 172 条规则。
     缺口如果只存在于「没写的文件」里，它就不出现在任何 review 里——没人会去
     数「应该有 21 个目录却只有 7 个」。把规格条数与已实现条数写在一起，
     ``tests/`` 一断言，缺口就变成看得见的数字。
@@ -17,8 +17,20 @@
 
 from __future__ import annotations
 
+from .nodes.d1_asymptomatic import NODES as _D1_NODES
+from .nodes.d1_asymptomatic import RULE_ROWS as _D1_RULES
+from .nodes.d2_symptomatic import NODES as _D2_NODES
+from .nodes.d2_symptomatic import RULE_ROWS as _D2_RULES
 from .nodes.d3_ruptured import NODES as _D3_NODES
 from .nodes.d3_ruptured import RULE_ROWS as _D3_RULES
+from .nodes.d4_infected import NODES as _D4_NODES
+from .nodes.d4_infected import RULE_ROWS as _D4_RULES
+from .nodes.d5_special import NODES as _D5_NODES
+from .nodes.d5_special import RULE_ROWS as _D5_RULES
+from .nodes.d6_postop import NODES as _D6_NODES
+from .nodes.d6_postop import RULE_ROWS as _D6_RULES
+from .nodes.d7_iliac import NODES as _D7_NODES
+from .nodes.d7_iliac import RULE_ROWS as _D7_RULES
 from .state import NodeFn
 
 __all__ = [
@@ -89,10 +101,26 @@ assert sum(SPEC_RULE_COUNTS.values()) == SPEC_RULE_TOTAL, (
 )
 
 #: 已实现的节点（键与规格 sheet 名一一对应）。
-NODES: dict[str, NodeFn] = {**_D3_NODES}
+NODES: dict[str, NodeFn] = {
+    **_D1_NODES,
+    **_D2_NODES,
+    **_D3_NODES,
+    **_D4_NODES,
+    **_D5_NODES,
+    **_D6_NODES,
+    **_D7_NODES,
+}
 
 #: 已实现规则的 ``rule_id → 源行``（形如 ``D3.1!10``）。
-RULE_ROWS: dict[str, str] = {**_D3_RULES}
+RULE_ROWS: dict[str, str] = {
+    **_D1_RULES,
+    **_D2_RULES,
+    **_D3_RULES,
+    **_D4_RULES,
+    **_D5_RULES,
+    **_D6_RULES,
+    **_D7_RULES,
+}
 
 IMPLEMENTED_RULE_COUNT: int = len(RULE_ROWS)
 

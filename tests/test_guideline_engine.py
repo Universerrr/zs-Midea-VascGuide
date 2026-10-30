@@ -1,18 +1,21 @@
-"""工具A（指南引擎）的契约测试 —— D3 分支与登记表。
+"""工具A（指南引擎）的契约测试 —— D1 / D3 分支与登记表。
 
 为什么测试要写得比实现还细：工具A 的规则是**临床判据**，改错的代价不是崩一个
 接口，而是给医生一个错的下一步。这里守三类东西：
 
   1. **判据复用**：``D3.1.R01`` 必须直接看 ``route_result.rule_id``，不得在工具里
      重写 ``c.extrav`` / ``c.hematoma`` 的组合——同一事实两套判据，改一处就分叉；
-  2. **不越权**：``D3.2`` / ``D3.3`` 的规格明令「Agent 不得自动作出不可手术结论」，
-     故这两个节点的出口恒为「术者确认」，不得出现「建议不做」类结论；
-  3. **缺口可见**：``D3.*`` 字段无抽取来源时，必须报「待补」而不是静默为空。
+  2. **不越权**：``D3.2`` / ``D3.3`` / ``D1.2`` 的规格明令「Agent 不得自动作出不可
+     手术结论」「未评估不等于无衰弱」，故出口恒为「术者/医生确认」，不得出现
+     「建议不做」类结论；
+  3. **缺口可见**：``D3.*`` / ``D1.*`` 字段无抽取来源时，必须报「待补」而不是静默为空。
 """
 
 from __future__ import annotations
 
+import pytest
 from conftest import make_case
+from pydantic import ValidationError
 
 from src.models.preop.case import VascCase
 from src.preop_agent.output_layer.node import build_tool_findings
@@ -20,16 +23,22 @@ from src.rules.router import D3_EMERGENCY_RULES, route
 from src.tools.base import ToolRequest
 from src.tools.guideline_engine import run
 from src.tools.guideline_engine.nodes.common import RuleSlot, evaluate_node
+from src.tools.guideline_engine.nodes.d1_asymptomatic import d1_1, d1_2, d1_3
+from src.tools.guideline_engine.nodes.d2_symptomatic import d2_1, d2_2, d2_3
 from src.tools.guideline_engine.nodes.d3_ruptured import (
     _D33_FIELDS,
-    RULE_ROWS,
     d3_1,
     d3_2,
     d3_3,
 )
+from src.tools.guideline_engine.nodes.d4_infected import d4_1, d4_2, d4_3
+from src.tools.guideline_engine.nodes.d5_special import _mantle, d5_1, d5_2, d5_3
+from src.tools.guideline_engine.nodes.d6_postop import d6_1, d6_2, d6_3
+from src.tools.guideline_engine.nodes.d7_iliac import d7_1, d7_2, d7_3
 from src.tools.guideline_engine.registry import (
     IMPLEMENTED_RULE_COUNT,
     NODES,
+    RULE_ROWS,
     SPEC_NODE_SHEETS,
     SPEC_RULE_COUNTS,
     SPEC_RULE_TOTAL,
@@ -41,9 +50,24 @@ from src.tools.guideline_engine.state import (
     NodeOutcome,
 )
 
+#: D1.1 判定年龄阈值所需的测量方法与阈值基准（规格 D1.SEX_THRESHOLD_SOURCE）。
+_D1_METHOD: dict[str, dict[str, str]] = {
+    "D1": {
+        "D1.DIAM_METHOD": "超声AP内-内",
+        "D1.SEX_THRESHOLD_SOURCE": "超声测量匹配",
+        "D1.MEASURE_VALID": "可比",
+    }
+}
 
-def _report(case: VascCase):
-    return run(ToolRequest(case=case, route_result=route(case)))
+
+def _report(case: VascCase, node_inputs: dict[str, dict[str, str]] | None = None):
+    return run(
+        ToolRequest(
+            case=case,
+            route_result=route(case),
+            node_inputs=node_inputs or {},
+        )
+    )
 
 
 def _options(case: VascCase) -> list[str]:
@@ -75,7 +99,29 @@ class TestRegistry:
         assert sum(SPEC_RULE_COUNTS.values()) == SPEC_RULE_TOTAL == 172
 
     def test_implemented_nodes_belong_to_spec_sheets(self) -> None:
-        assert set(NODES) == {"D3.1", "D3.2", "D3.3"}
+        assert set(NODES) == {
+            "D1.1",
+            "D1.2",
+            "D1.3",
+            "D2.1",
+            "D2.2",
+            "D2.3",
+            "D3.1",
+            "D3.2",
+            "D3.3",
+            "D4.1",
+            "D4.2",
+            "D4.3",
+            "D5.1",
+            "D5.2",
+            "D5.3",
+            "D6.1",
+            "D6.2",
+            "D6.3",
+            "D7.1",
+            "D7.2",
+            "D7.3",
+        }
 
     def test_implemented_rules_belong_to_their_sheet_and_count(self) -> None:
         for rule_id, row in RULE_ROWS.items():
@@ -84,7 +130,7 @@ class TestRegistry:
             assert row.startswith(f"{sheet}!"), f"{rule_id} 的源行 {row} 与 sheet 不符"
 
     def test_implemented_rule_count_matches_declaration(self) -> None:
-        assert IMPLEMENTED_RULE_COUNT == len(RULE_ROWS) == 17
+        assert IMPLEMENTED_RULE_COUNT == len(RULE_ROWS) == 169
 
     def test_implemented_rules_per_sheet_do_not_exceed_spec(self) -> None:
         for sheet, total in SPEC_RULE_COUNTS.items():
@@ -221,12 +267,26 @@ class TestEntryAndBoundary:
         assert report.entries == ()
         assert report.path == ()
 
-    def test_unimplemented_node_reports_a_gap(self) -> None:
-        """D1 标签指向未实现的 D1.1：报缺口，不假装有结论。"""
-        report = _report(make_case())
-        assert report.path == ("D1.1",)
+    def test_unimplemented_node_reports_a_gap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """病种标签指向未实现节点时，只留缺口、不伪装成有结论。
+
+        21 个节点已全部实现，所以这里用 ``monkeypatch`` 摘掉一个——守的是
+        ``engine._walk`` 的分支**本身**，不是当前的开发进度。哪天新增病种或
+        临时下线某节点，这条测试仍然成立；反过来，若把它删掉，那个分支就再
+        也没有任何一处被执行过（``NODES.get() is None`` 会静默走空）。
+        """
+        from src.tools.guideline_engine import engine
+
+        monkeypatch.setattr(engine, "NODES", {k: v for k, v in engine.NODES.items() if k != "D7.1"})
+        case = make_case()
+        result = route(case)
+        result.class_output = ["D7"]
+        report = run(ToolRequest(case=case, route_result=result))
+        # 入口节点本身记进 path（它确实是本轮的目标），但一条条目都没有
+        assert report.path == ("D7.1",)
         assert report.entries == ()
-        assert any("D1.1" in g for g in report.gaps)
+        assert any("D7.1" in gap and "尚未实现" in gap for gap in report.gaps)
+        assert report.terminal is not None and "D7.1" in report.terminal
 
     def test_run_does_not_mutate_the_case(self) -> None:
         """病种流程的产物属于本次运行，不得写回病例。"""
@@ -276,7 +336,7 @@ class TestD33:
         """五项都记录后仍需医生确认——不是系统给出「不修复」结论。"""
         case = _rupture_case()
         filled = {spec_id: "已记录" for spec_id, _ in _D33_FIELDS}
-        outcome = d3_3(GuidelineState(case=case, route=route(case), d3=filled))
+        outcome = d3_3(GuidelineState(case=case, route=route(case), node_inputs={"D3": filled}))
         assert outcome.verdicts["D3.3.R91"] is True
         assert outcome.gaps == ()
         assert outcome.terminal is not None and "确认" in outcome.terminal
@@ -599,3 +659,3385 @@ class TestTreatmentOptionsRendering:
         for option in _options(_rupture_case()):
             for word in ("建议行", "推荐使用", "应行", "首选"):
                 assert word not in option
+
+
+# ===========================================================================
+# D1.1 诊断与直径分层
+# ===========================================================================
+class TestD11DiameterStratification:
+    """D1.1 的核心是「性别 + 直径 + 测量方法」三件套，三者缺一不可。
+
+    规格在这里埋了一条硬约束（D1.SEX_THRESHOLD_SOURCE）：「若仅有 CTA 外径，
+    不可未经方法核对直接套用超声阈值」。所以本组测试有一半在守「**不该判**」
+    的情形——这比守「该判」更重要，因为误判阈值会直接改变手术与否。
+    """
+
+    @staticmethod
+    def _outcome(**overrides):
+        case = make_case(**overrides)
+        return d1_1(GuidelineState(case=case, route=route(case), node_inputs=_D1_METHOD))
+
+    def test_male_below_threshold_goes_to_surveillance(self) -> None:
+        outcome = self._outcome(cl={"aaa_diam": 42.0}, p={"sex": "男"})
+        assert outcome.verdicts["D1.1.R03"] is True
+        assert outcome.terminal is not None and "监测" in outcome.terminal
+
+    def test_female_below_threshold_goes_to_surveillance(self) -> None:
+        outcome = self._outcome(cl={"aaa_diam": 48.0}, p={"sex": "女"})
+        assert outcome.verdicts["D1.1.R04"] is True
+
+    def test_male_at_threshold_goes_to_d12(self) -> None:
+        """男 55 mm 是「达到」不是「低于」——边界必须含等号。"""
+        outcome = self._outcome(cl={"aaa_diam": 55.0}, p={"sex": "男"})
+        assert outcome.verdicts["D1.1.R05"] is True
+        assert outcome.next_node == "D1.2"
+
+    def test_female_threshold_differs_from_male(self) -> None:
+        """50 mm 女性已达标、男性未达标 —— 守性别阈值没有被写成同一个数。"""
+        female = self._outcome(cl={"aaa_diam": 50.0}, p={"sex": "女"})
+        male = self._outcome(cl={"aaa_diam": 50.0}, p={"sex": "男"})
+        assert female.verdicts["D1.1.R05"] is True
+        assert male.verdicts["D1.1.R05"] is False
+        assert male.verdicts["D1.1.R03"] is True
+
+    def test_unknown_method_never_applies_threshold(self) -> None:
+        """方法未知 → 不套阈值，且缺口必须点名缺的是什么。
+
+        这是规格「仅有 CTA 外径不可直接套用超声阈值」的机械落点。若无此约束，
+        42 mm 会被直接判成「未达阈值」，而实际上测量方法可能让结论翻转。
+        """
+        case = make_case(cl={"aaa_diam": 56.0}, p={"sex": "男"})
+        outcome = d1_1(GuidelineState(case=case, route=route(case)))
+        assert outcome.verdicts["D1.1.R05"] is None
+        assert outcome.verdicts["D1.1.R03"] is None
+        assert any("测量方法" in gap for gap in outcome.gaps)
+
+    def test_cta_method_requires_specialist_confirmation(self) -> None:
+        """CTA 外径明确标为「需专科确认」，不是「未知」——两者处理方式不同。"""
+        case = make_case(cl={"aaa_diam": 56.0}, p={"sex": "男"})
+        outcome = d1_1(
+            GuidelineState(
+                case=case,
+                route=route(case),
+                node_inputs={"D1": {"D1.DIAM_METHOD": "CTA中心线正交外径"}},
+            )
+        )
+        assert outcome.verdicts["D1.1.R05"] is None
+        assert any("需专科确认" in gap for gap in outcome.gaps)
+
+    def test_unknown_sex_falls_back_to_generic_surveillance(self) -> None:
+        """性别未知 → 只给方向不给间隔，不替它猜一个阈值。"""
+        outcome = self._outcome(cl={"aaa_diam": 42.0}, p={"sex": "未知"})
+        assert outcome.verdicts["D1.1.R03"] is None
+        assert outcome.verdicts["D1.1.R91"] is True
+        assert outcome.terminal is not None and "监测" in outcome.terminal
+
+
+class TestD11SurveillanceInterval:
+    """随访间隔按性别与直径分档（D1.1.R06）—— 分档错了会漏掉该早复查的病人。"""
+
+    @staticmethod
+    def _interval(diam: float, sex: str) -> str | None:
+        from src.tools.guideline_engine.nodes.d1_asymptomatic import _surveillance_interval
+
+        case = make_case(cl={"aaa_diam": diam}, p={"sex": sex})
+        return _surveillance_interval(GuidelineState(case=case, route=route(case)))
+
+    def test_male_bands(self) -> None:
+        assert self._interval(35.0, "男") == "每 3 年 1 次"
+        assert self._interval(42.0, "男") == "每年 1 次"
+        assert self._interval(52.0, "男") == "每 6 个月 1 次"
+
+    def test_female_bands_start_earlier(self) -> None:
+        """女性 45 岁起就要每 6 个月 —— 与男性的 50 不同档。"""
+        assert self._interval(42.0, "女") == "每年 1 次"
+        assert self._interval(46.0, "女") == "每 6 个月 1 次"
+
+    def test_below_30_mm_has_no_surveillance_plan(self) -> None:
+        """<30 mm 不是 AAA，套监测计划没有意义。"""
+        assert self._interval(25.0, "男") is None
+
+    def test_interval_is_appended_to_monitoring_terminal(self) -> None:
+        case = make_case(cl={"aaa_diam": 42.0}, p={"sex": "男"})
+        outcome = d1_1(GuidelineState(case=case, route=route(case), node_inputs=_D1_METHOD))
+        assert outcome.terminal is not None and "每年 1 次" in outcome.terminal
+        assert any(e.rule_id == "D1.1.R06" for e in outcome.entries)
+
+
+class TestD11Branches:
+    """P0 危险与特殊形态分支：走错会导致病例被归入错误的病种路径。"""
+
+    @staticmethod
+    def _outcome(**overrides):
+        case = make_case(**overrides)
+        return d1_1(GuidelineState(case=case, route=route(case), node_inputs=_D1_METHOD))
+
+    def test_symptomatic_case_is_escalated(self) -> None:
+        """无症状岗位收到有症状病例 = 标签与事实冲突，退回判定层重判。"""
+        outcome = self._outcome(cl={"symptom_aaa": "医师确认相关"})
+        assert outcome.verdicts["D1.1.R01"] is True
+        assert outcome.escalation == "G03"
+
+    def test_unevaluable_rupture_is_escalated(self) -> None:
+        """破裂「无法评价」不得留在 D1 —— 不能因影像不可评就当作未破裂。"""
+        outcome = self._outcome(cl={"aaa_rupture": "无法评价"})
+        assert outcome.verdicts["D1.1.R01"] is True
+        assert outcome.escalation == "G03"
+
+    def test_saccular_lesion_goes_to_special_assessment(self) -> None:
+        outcome = self._outcome(cl={"saccular": "明确"})
+        assert outcome.verdicts["D1.1.R07"] is True
+        assert outcome.terminal is not None and "D5.3" in outcome.terminal
+
+    def test_special_morphology_blocks_threshold_path(self) -> None:
+        """特殊形态不套普通梭形阈值：即使直径达阈值也不进 D1.2。
+
+        ``R05`` 记 UNKNOWN 而非 False —— 「是否达阈值」在特殊形态下无法用普通
+        阈值回答，记 False 会被读成「确认未达阈值」，那是另一个错误结论。
+        """
+        outcome = self._outcome(cl={"aaa_diam": 60.0, "pseudo": "明确"})
+        assert outcome.verdicts["D1.1.R05"] is None
+        assert outcome.verdicts["D1.1.R07"] is True
+        assert outcome.next_node is None
+
+    def test_genetic_clue_routes_to_d12(self) -> None:
+        outcome = self._outcome(n={"genetic_ctx": "疑似遗传背景"})
+        assert outcome.verdicts["D1.1.R10"] is True
+        assert outcome.next_node == "D1.2"
+
+    def test_early_onset_counts_as_genetic_clue(self) -> None:
+        """首次发病 <60 岁也算线索 —— 不要求已确诊遗传背景。"""
+        case = make_case(
+            cl={"aaa_diam": 42.0},
+            n={"genetic_ctx": "无已知阳性线索"},
+            gen={"aaa_age_onset": 55},
+        )
+        outcome = d1_1(GuidelineState(case=case, route=route(case), node_inputs=_D1_METHOD))
+        assert outcome.verdicts["D1.1.R10"] is True
+
+    def test_rapid_growth_is_marked_for_recheck(self) -> None:
+        """年化 ≥10 mm/年只标记「待复核」，不得直接作为修复指征。"""
+        case = make_case(cl={"aaa_diam": 42.0})
+        outcome = d1_1(
+            GuidelineState(
+                case=case,
+                route=route(case),
+                node_inputs={"D1": {**_D1_METHOD["D1"], "D1.GROWTH_RATE": 12.0}},
+            )
+        )
+        assert outcome.verdicts["D1.1.R02"] is True
+        assert outcome.terminal is not None and "复核" in outcome.terminal
+
+
+# ===========================================================================
+# D1.2 患者获益与手术风险
+# ===========================================================================
+#: 四条关键评估都给出「可以往下走」的取值 —— 各测试在此基础上单点覆盖。
+_D12_GO: dict[str, str] = {
+    "D1.OP_FITNESS": "可接受",
+    "D1.PREFERENCE": "倾向修复",
+    "D1.LIFE_EXPECTANCY": "较长",
+    "D1.PROGNOSIS": "合理预期",
+    "D1.SURVEILLANCE_BENEFIT": "有潜在修复获益",
+}
+
+
+def _d12_outcome(d1: dict[str, object] | None = None, **overrides) -> NodeOutcome:
+    """造一个「已达修复阈值」的病例 —— 42 mm 基线进不了 D1.2 的 P1/P3 分支。"""
+    overrides.setdefault("cl", {"aaa_diam": 56.0})
+    case = make_case(**overrides)
+    inputs = {"D1": {**_D1_METHOD["D1"], **_D12_GO, **(d1 or {})}}
+    return d1_2(GuidelineState(case=case, route=route(case), node_inputs=inputs))
+
+
+class TestD12BenefitRisk:
+    """D1.2 是「分诊台」：不判病人能不能手术，只按医生已有的结论分流。
+
+    所以本组测试守的主要是**不越权**：医生没给的结论，规则既不能补也不能猜；
+    医生给了「不适合/寿命有限」时，规则也不得改写成「建议不做」。
+    """
+
+    def test_full_agreement_reaches_d13(self) -> None:
+        outcome = _d12_outcome()
+        assert outcome.verdicts["D1.2.R04"] is True
+        assert outcome.next_node == "D1.3"
+
+    def test_genetic_background_goes_to_d13_with_mdt_requirement(self) -> None:
+        """遗传病例的出口也是 D1.3，但缺一条 MDT 前置就必须在缺口里看得见。"""
+        outcome = _d12_outcome(n={"genetic_ctx": "疑似遗传背景"})
+        assert outcome.verdicts["D1.2.R03"] is True
+        assert outcome.next_node == "D1.3"
+        assert any("MDT" in gap and "个体化" in gap for gap in outcome.gaps)
+
+    def test_unassessed_fitness_is_unknown_not_denied(self) -> None:
+        """「未评价」不得被折成「不可接受」——R04 必须记 UNKNOWN 而非 False。"""
+        outcome = _d12_outcome({"D1.OP_FITNESS": "未评价"})
+        assert outcome.verdicts["D1.2.R04"] is None
+        assert outcome.verdicts["D1.2.R05"] is True
+        assert outcome.terminal is not None and "待完成风险评估" in outcome.terminal
+
+    def test_missing_monitoring_benefit_blocks_after_the_three_are_set(self) -> None:
+        """前三项齐、只缺监测获益 → 落到 R90（不是 R05）。
+
+        用「高风险」把 P1 的 ``R04`` 挡掉：``evaluate_node`` 命中即停，``R04``
+        若成立，``R90`` 根本不会执行，这条测试就测不到想测的东西。
+        """
+        outcome = _d12_outcome({"D1.SURVEILLANCE_BENEFIT": None, "D1.OP_FITNESS": "高风险"})
+        assert outcome.verdicts["D1.2.R05"] is not True
+        assert outcome.verdicts["D1.2.R90"] is True
+        assert outcome.terminal is not None and "补齐" in outcome.terminal
+
+    def test_no_assessment_at_all_asks_for_the_three_key_items(self) -> None:
+        outcome = d1_2(GuidelineState(case=make_case(), route=route(make_case())))
+        assert outcome.verdicts["D1.2.R05"] is True
+        assert outcome.next_node is None
+        missing = [gap for gap in outcome.gaps if "D1.OP_FITNESS" in gap]
+        assert missing and "未记录" in missing[0]
+
+    def test_limited_life_expectancy_goes_to_non_surgical_exit(self) -> None:
+        outcome = _d12_outcome({"D1.LIFE_EXPECTANCY": "有限"})
+        assert outcome.verdicts["D1.2.R01"] is True
+        assert outcome.terminal is not None and "非手术" in outcome.terminal
+
+    def test_prognosis_alone_can_carry_the_limited_life_conclusion(self) -> None:
+        """寿命未评价、长期预后明确有限 → 仍应走到 R07，而不是被 R05 拦下。
+
+        这一条守的是「两个字段合成一个寿命维度」的判法：若各自独立必填，
+        本例会被判成「关键评估缺失」而停在人工复核，丢掉 R07 的明确结论。
+        """
+        outcome = _d12_outcome(
+            {"D1.LIFE_EXPECTANCY": None, "D1.PROGNOSIS": "有限（约2–3年或更短）"}
+        )
+        assert outcome.verdicts["D1.2.R05"] is not True
+        assert outcome.verdicts["D1.2.R07"] is True
+        assert outcome.terminal is not None and "预后有限" in outcome.terminal
+
+    def test_currently_unfit_goes_to_optimisation_not_to_refusal(self) -> None:
+        """「当前不适合」= 优化后复评，不得写成「不建议手术」。"""
+        outcome = _d12_outcome({"D1.OP_FITNESS": "当前不适合"})
+        assert outcome.verdicts["D1.2.R02"] is True
+        assert outcome.terminal is not None and "优化" in outcome.terminal
+        assert "不可手术" not in (outcome.terminal or "")
+
+    def test_stopping_surveillance_needs_both_conditions(self) -> None:
+        """只有「监测已无获益」+「修复不适宜」同时成立才考虑停止监测。"""
+        outcome = _d12_outcome(
+            {"D1.OP_FITNESS": "当前不适合", "D1.SURVEILLANCE_BENEFIT": "无明显获益"}
+        )
+        assert outcome.verdicts["D1.2.R08"] is True
+        assert outcome.terminal is not None and "授权医生确认" in outcome.terminal
+
+    def test_no_monitoring_benefit_alone_does_not_stop_surveillance(self) -> None:
+        """监测无获益但手术可接受 → 不该停止监测，该去修复。"""
+        outcome = _d12_outcome({"D1.SURVEILLANCE_BENEFIT": "无明显获益"})
+        assert outcome.verdicts["D1.2.R04"] is True
+        assert outcome.next_node == "D1.3"
+
+    def test_high_risk_with_long_life_expectancy_still_compares_options(self) -> None:
+        """高风险不等于不可修复：R04 不成立，但 R09 仍把病例送进 D1.3 做并列比较。"""
+        outcome = _d12_outcome({"D1.OP_FITNESS": "高风险"})
+        assert outcome.verdicts["D1.2.R04"] is False
+        assert outcome.verdicts["D1.2.R09"] is True
+        assert outcome.next_node == "D1.3"
+
+    def test_optimisable_risk_factors_form_a_checklist(self) -> None:
+        outcome = _d12_outcome(
+            {
+                "D1.LIFE_EXPECTANCY": "不确定",
+                "D1.RISK_OPTIMIZATION": ["吸烟", "血压"],
+            }
+        )
+        assert outcome.verdicts["D1.2.R06"] is True
+        assert outcome.terminal is not None and "优化清单" in outcome.terminal
+
+    def test_patient_preference_for_surveillance_closes_the_repair_branch(self) -> None:
+        """患者选了监测 → R91 的两个分支只剩一个，文案必须跟着变。"""
+        outcome = _d12_outcome({"D1.PREFERENCE": "倾向监测"})
+        assert outcome.verdicts["D1.2.R91"] is True
+        assert outcome.terminal is not None and "监测方案" in outcome.terminal
+        assert "D1.3" not in (outcome.terminal or "")
+
+    def test_age_alone_never_terminates_repair(self) -> None:
+        """95 岁但医生评估寿命较长 → 不因年龄单项落到非手术出口。"""
+        outcome = _d12_outcome(p={"age": 95})
+        assert outcome.verdicts["D1.2.R04"] is True
+        assert outcome.next_node == "D1.3"
+
+    def test_frailty_missing_does_not_block_p3_exits(self) -> None:
+        """衰弱/合并症未评估只进缺口清单，不得把「当前不适合」挡在人工复核。"""
+        outcome = _d12_outcome({"D1.OP_FITNESS": "当前不适合"})
+        assert outcome.verdicts["D1.2.R90"] is False
+        assert any("D1.FRAILTY" in gap for gap in outcome.gaps)
+
+
+# ===========================================================================
+# D1.3 术式候选（EVAR / OSR 两列）
+# ===========================================================================
+def _d13_outcome(d1: dict[str, object] | None = None, **overrides) -> NodeOutcome:
+    overrides.setdefault("cl", {"aaa_diam": 56.0})
+    case = make_case(**overrides)
+    inputs = {"D1": {**_D1_METHOD["D1"], **_D12_GO, **(d1 or {})}}
+    return d1_3(GuidelineState(case=case, route=route(case), node_inputs=inputs))
+
+
+def _candidate(outcome: NodeOutcome, procedure: str) -> Candidate:
+    for candidate in outcome.candidates:
+        if candidate.procedure == procedure:
+            return candidate
+    raise AssertionError(f"没有 {procedure} 这一列：{outcome.candidates}")
+
+
+class TestD13Candidates:
+    """D1.3 的核心是「两列并列」——任何一列被遮蔽都是结论错误。
+
+    ``R01``（EVAR 候选）与 ``R02``（OSR 候选）不是互斥选项，所以它们不进
+    出口竞争；本组测试守两件事：两列都在，且每列的档位与理由对得上判据。
+    """
+
+    def test_both_columns_are_always_present(self) -> None:
+        outcome = _d13_outcome()
+        procedures = [c.procedure for c in outcome.candidates]
+        assert procedures == ["EVAR", "OSR"]
+
+    def test_standard_evar_is_feasible_only_with_distal_seal(self) -> None:
+        outcome = _d13_outcome({"D1.DISTAL_SEAL": "右 25mm / 左 22mm，无病变"})
+        evar = _candidate(outcome, "EVAR")
+        assert evar.status is CandidateStatus.FEASIBLE
+        assert "D1.3.R05" in evar.rule_ids
+        assert outcome.verdicts["D1.3.R05"] is True
+
+    def test_missing_distal_seal_degrades_to_conditional(self) -> None:
+        """缺远端密封区 → 不能标「标准 EVAR 候选」，且缺口要点名。"""
+        outcome = _d13_outcome()
+        evar = _candidate(outcome, "EVAR")
+        assert evar.status is CandidateStatus.CONDITIONAL
+        assert "远端密封区" in evar.reason
+        assert any("D1.DISTAL_SEAL" in gap for gap in outcome.gaps)
+
+    def test_branch_involvement_excludes_standard_evar_and_escalates(self) -> None:
+        """分支受累 → 标准 EVAR 排除 + 转 G06；不得同时给出「EVAR 候选」。"""
+        outcome = _d13_outcome(n={"renal_r": "明确受累"})
+        assert _candidate(outcome, "EVAR").status is CandidateStatus.EXCLUDED
+        assert outcome.escalation == "G06"
+        assert outcome.verdicts["D1.3.R01"] is False
+
+    def test_ifu_mismatch_excludes_evar_and_escalates(self) -> None:
+        outcome = _d13_outcome(n={"seal_ifu": "不符"})
+        assert _candidate(outcome, "EVAR").status is CandidateStatus.EXCLUDED
+        assert outcome.escalation == "G06"
+        assert outcome.verdicts["D1.3.R06"] is True
+
+    def test_bilateral_access_occlusion_excludes_evar_only(self) -> None:
+        """单侧闭塞不排除 EVAR，双侧才排除——这里守双侧那一支。"""
+        outcome = _d13_outcome(n={"access_occlusion": "双侧闭塞"})
+        evar = _candidate(outcome, "EVAR")
+        assert evar.status is CandidateStatus.EXCLUDED
+        assert "入路" in evar.reason
+        assert outcome.escalation is None
+
+    def test_unverified_ifu_stays_conditional_not_excluded(self) -> None:
+        """「未核验」是结构性常态（本节点不选型号），不得当成排除或阻断。"""
+        outcome = _d13_outcome(n={"seal_ifu": "未核验"})
+        evar = _candidate(outcome, "EVAR")
+        assert evar.status is CandidateStatus.CONDITIONAL
+        assert "IFU 未核验" in evar.reason
+
+    def test_missing_anatomy_is_unassessed_not_excluded(self) -> None:
+        """三个瘤颈参数全缺 → 「未评估」，不是「排除」（R90 的草案口径）。"""
+        outcome = _d13_outcome(n={"neck_len": None, "neck_d": None, "neck_angle": None})
+        evar = _candidate(outcome, "EVAR")
+        assert evar.status is CandidateStatus.UNASSESSED
+        assert outcome.verdicts["D1.3.R90"] is True
+        assert outcome.terminal is not None and "草案" in outcome.terminal
+
+    def test_osr_never_reaches_feasible(self) -> None:
+        """开放解剖无输入 → OSR 封顶在「需 MDT 评估」，任何输入组合都不给可行。"""
+        for overrides in (
+            {},
+            {"D1.OP_FITNESS": "高风险"},
+            {"D1.OP_FITNESS": "当前不适合"},
+            {"D1.LIFE_EXPECTANCY": "有限"},
+        ):
+            osr = _candidate(_d13_outcome(overrides), "OSR")
+            assert osr.status is CandidateStatus.MDT, overrides
+
+    def test_osr_reason_tracks_the_blocking_condition(self) -> None:
+        assert "不可接受" in _candidate(_d13_outcome({"D1.OP_FITNESS": "当前不适合"}), "OSR").reason
+        assert "高危" in _candidate(_d13_outcome({"D1.OP_FITNESS": "高风险"}), "OSR").reason
+        assert (
+            "预期寿命有限" in _candidate(_d13_outcome({"D1.LIFE_EXPECTANCY": "有限"}), "OSR").reason
+        )
+
+    def test_patient_refusal_goes_to_non_surgical_exit(self) -> None:
+        outcome = _d13_outcome({"D1.PREFERENCE": "倾向监测"})
+        assert outcome.verdicts["D1.3.R04"] is True
+        assert outcome.terminal is not None and "非手术" in outcome.terminal
+
+    def test_display_rules_do_not_steal_the_exit(self) -> None:
+        """四条展示性规则都要留痕，但出口仍由 R91 给出（不是 EVAR/OSR 之一）。"""
+        outcome = _d13_outcome({"D1.DISTAL_SEAL": "已记录"})
+        for rule_id in ("D1.3.R01", "D1.3.R02", "D1.3.R05", "D1.3.R09"):
+            assert rule_id in outcome.verdicts, rule_id
+        assert outcome.verdicts["D1.3.R91"] is True
+        assert outcome.terminal is not None and "候选已列出" in outcome.terminal
+
+    def test_escalation_does_not_leave_a_contradictory_terminal(self) -> None:
+        """转复杂模式时不得再写「候选已列出」——两个互斥结论不能同现。"""
+        outcome = _d13_outcome(n={"seal_ifu": "不符"})
+        assert outcome.escalation == "G06"
+        assert outcome.terminal is None
+
+
+class TestD13DegradedInputs:
+    """输入残缺时 D1.3 的落档 —— 每一格「差什么」都要能在理由里读出来。
+
+    这些分支不进 ``evaluate_node`` 的出口竞争（候选是节点层独立算的），
+    所以必须单独守着：否则「条件性候选」会退化成一句无信息的「资料不全」。
+    """
+
+    def test_cta_missing_blocks_with_a_draft(self) -> None:
+        outcome = _d13_outcome(n={"cta_status": "缺失"})
+        assert outcome.verdicts["D1.3.R90"] is True
+        assert _candidate(outcome, "EVAR").status is not CandidateStatus.FEASIBLE
+
+    def test_cta_partial_is_unknown_not_missing(self) -> None:
+        """「部分可评价」与「缺失」在处理上不同：前者不阻断，只是判不了完整适配。"""
+        outcome = _d13_outcome(n={"cta_status": "部分"})
+        assert outcome.verdicts["D1.3.R90"] is False
+        assert outcome.verdicts["D1.3.R01"] is None
+
+    def test_partial_neck_parameters_are_named_one_by_one(self) -> None:
+        outcome = _d13_outcome(n={"neck_d": None, "neck_angle": None})
+        evar = _candidate(outcome, "EVAR")
+        assert evar.status is CandidateStatus.CONDITIONAL
+        assert "瘤颈参数不全" in evar.reason
+
+    def test_ifu_never_recorded_is_named_as_such(self) -> None:
+        """``seal_ifu=None`` 与「未核验」不是同一件事：前者根本没记录。"""
+        outcome = _d13_outcome(n={"seal_ifu": None})
+        evar = _candidate(outcome, "EVAR")
+        assert "IFU 未记录" in evar.reason
+        assert any("N.SEAL_IFU" in gap and "未记录" in gap for gap in outcome.gaps)
+
+    def test_unassessed_fitness_leaves_osr_unassessed(self) -> None:
+        outcome = _d13_outcome({"D1.OP_FITNESS": "未评价"})
+        osr = _candidate(outcome, "OSR")
+        assert osr.status is CandidateStatus.UNASSESSED
+        assert "未评价" in osr.reason
+
+    def test_unrecorded_access_and_cta_become_explicit_gaps(self) -> None:
+        outcome = _d13_outcome(n={"access_occlusion": None, "cta_status": None})
+        joined = " ".join(outcome.gaps)
+        assert "入路可行性未评估" in joined
+        assert "N.CTA_STATUS" in joined
+
+    def test_incomplete_anatomy_is_reported_as_a_gap(self) -> None:
+        outcome = _d13_outcome(n={"neck_len": None})
+        assert any("EVAR 解剖参数不全" in gap for gap in outcome.gaps)
+
+
+class TestD11RemainingBranches:
+    """D1.1 的边角分支 —— 补在这里而不是散进主类，避免主类被细节淹没。"""
+
+    def test_female_below_40_gets_three_year_interval(self) -> None:
+        from src.tools.guideline_engine.nodes.d1_asymptomatic import _surveillance_interval
+
+        case = make_case(cl={"aaa_diam": 35.0}, p={"sex": "女"})
+        assert (
+            _surveillance_interval(GuidelineState(case=case, route=route(case))) == "每 3 年 1 次"
+        )
+
+    def test_recorded_family_history_counts_as_a_genetic_clue(self) -> None:
+        """家族史阳性 = 线索；「未询问」不等于阴性（词表已含该写法）。"""
+        case = make_case(cl={"aaa_diam": 42.0}, n={"genetic_ctx": "无已知阳性线索"})
+        inputs = {"D1": {**_D1_METHOD["D1"], "D1.FAMILY_HISTORY": "阳性"}}
+        outcome = d1_1(GuidelineState(case=case, route=route(case), node_inputs=inputs))
+        assert outcome.verdicts["D1.1.R10"] is True
+
+    def test_unasked_family_history_is_unknown_not_positive(self) -> None:
+        case = make_case(cl={"aaa_diam": 42.0}, n={"genetic_ctx": "未评价"})
+        inputs = {"D1": {**_D1_METHOD["D1"], "D1.FAMILY_HISTORY": "未询问"}}
+        outcome = d1_1(GuidelineState(case=case, route=route(case), node_inputs=inputs))
+        assert outcome.verdicts["D1.1.R10"] is None
+
+    def test_missing_diameter_blocks_the_diagnosis_row(self) -> None:
+        case = make_case(cl={"aaa_diam": None})
+        outcome = d1_1(GuidelineState(case=case, route=route(case), node_inputs=_D1_METHOD))
+        assert outcome.verdicts["D1.1.R90"] is True
+
+    def test_cta_threshold_source_needs_specialist_conversion(self) -> None:
+        """来源明确标为「CTA 需转换」→ 阈值不可用，且缺口要说清不是「没记录」。"""
+        case = make_case(cl={"aaa_diam": 56.0}, p={"sex": "男"})
+        inputs = {
+            "D1": {
+                "D1.DIAM_METHOD": "CTA中心线正交外径",
+                "D1.SEX_THRESHOLD_SOURCE": "CTA需转换或专科确认",
+            }
+        }
+        outcome = d1_1(GuidelineState(case=case, route=route(case), node_inputs=inputs))
+        assert outcome.verdicts["D1.1.R05"] is None
+        assert any("需专科确认" in gap for gap in outcome.gaps)
+
+
+class TestRecordedHelper:
+    """``recorded`` 的三种值形态 —— 单值 / 多选 / 结构化数值，缺一都不算记录。"""
+
+    def test_scalar_value_counts_as_recorded(self) -> None:
+        outcome = _d13_outcome({"D1.DISTAL_SEAL": 25.0})
+        assert _candidate(outcome, "EVAR").status is CandidateStatus.FEASIBLE
+
+    def test_empty_list_is_not_recorded(self) -> None:
+        outcome = _d13_outcome({"D1.DISTAL_SEAL": []})
+        assert _candidate(outcome, "EVAR").status is CandidateStatus.CONDITIONAL
+
+    def test_uncertain_token_is_not_recorded(self) -> None:
+        outcome = _d13_outcome({"D1.DISTAL_SEAL": "未评估"})
+        assert _candidate(outcome, "EVAR").status is CandidateStatus.CONDITIONAL
+
+
+# ===========================================================================
+# D2 有症状 AAA
+# ===========================================================================
+#: 能产出 ``D2`` 标签的病例骨架。
+#:
+#: 三个坑必须一起避开，否则病例走不到 D2：
+#:   · ``diag_multi`` 基线是 ``["D1"]`` —— 与 D2 并存会触发 ``G09.R03`` 病种冲突；
+#:   · ``pain_present`` 必须是「否」—— ``G03.R15`` 只在无当前疼痛时放行；
+#:   · 症状改由 ``aaa_tender``（触痛）承载 —— 这正是 D2 里「非疼痛症状」的入口。
+_D2_CTX: dict[str, object] = {
+    "symptom_aaa": "医师确认相关",
+    "aaa_diam": 56.0,
+    "diag_multi": None,
+}
+_D2_SYMPTOM: dict[str, object] = {
+    "pain_present": "否",
+    "aaa_tender": "明确阳性",
+    "pain_attrib": "明确相关",
+}
+_D2_GO: dict[str, object] = {
+    "D2.CLINICAL_STABILITY": "稳定",
+    "D2.URGENCY_DECISION": "紧急",
+    "D2.VITAL_TREND": "稳定",
+    "D2.RISK": "可接受",
+    "D2.PREF": "EVAR倾向",
+    "D2.COMPRESSION": ["无"],
+    "D2.EMBOLIC_SOURCE": "其他来源明确",
+}
+
+
+def _d2_state(
+    cl: dict[str, object] | None = None,
+    s: dict[str, object] | None = None,
+    n: dict[str, object] | None = None,
+    c: dict[str, object] | None = None,
+    d2: dict[str, object] | None = None,
+    d3: dict[str, object] | None = None,
+) -> GuidelineState:
+    overrides: dict[str, object] = {
+        "cl": {**_D2_CTX, **(cl or {})},
+        "s": {**_D2_SYMPTOM, **(s or {})},
+    }
+    if n:
+        overrides["n"] = n
+    if c:
+        overrides["c"] = c
+    case = make_case(**overrides)
+    inputs: dict[str, dict[str, object]] = {"D2": {**_D2_GO, **(d2 or {})}}
+    if d3:
+        # ``D3.TEAM_RESOURCE`` 按前缀分在 D3 通道：node_field 靠前缀定位，
+        # 放进 D2 通道是取不到的。
+        inputs["D3"] = dict(d3)
+    return GuidelineState(case=case, route=route(case), node_inputs=inputs)
+
+
+class TestD21SymptomAndRupture:
+    """D2.1 先把「是不是 AAA 的症状、瘤子破没破」这两件事分开。
+
+    本组测试有一半在守**词表**：规格的 ``S.PAIN_ATTRIB`` / ``S.AAA_TENDER`` 与模型
+    的字面量不同，照规格写会得到恒为 ``False`` 的死分支——那种错误不会报错，
+    只会安静地把每个症状性 AAA 判成「与 AAA 无关」。
+    """
+
+    def test_tender_with_attribution_reaches_d22(self) -> None:
+        outcome = d2_1(_d2_state())
+        assert outcome.verdicts["D2.1.R01"] is True
+        assert outcome.next_node == "D2.2"
+
+    def test_spec_wording_is_rejected_by_the_model(self) -> None:
+        """规格写「医师确认相关」，模型只收「明确相关」——类型系统挡住了词表混用。
+
+        这条守的是「**不要**为对齐规格去改模型 ``Literal``」：改了模型，判定层所有
+        按模型字面量写的规则都会静默失效（``eq("明确相关", "医师确认相关")`` 恒假），
+        而且单测全绿也发现不了。
+        """
+        with pytest.raises(ValidationError):
+            make_case(s={"pain_attrib": "医师确认相关"})
+
+    def test_both_related_values_are_accepted(self) -> None:
+        for value in ("明确相关", "怀疑相关"):
+            assert d2_1(_d2_state(s={"pain_attrib": value})).verdicts["D2.1.R01"] is True
+
+    def test_rupture_evidence_escalates_and_enters_d31(self) -> None:
+        outcome = d2_1(_d2_state(cl={"aaa_rupture": "疑似"}))
+        assert outcome.verdicts["D2.1.R03"] is True
+        assert outcome.escalation == "G03"
+        assert outcome.next_node == "D3.1"
+
+    def test_suspicious_wall_breach_is_unknown_not_confirmed(self) -> None:
+        """影像「可疑」不得直接判成破裂，但也不能当作已排除。"""
+        outcome = d2_1(_d2_state(c={"extrav": "可疑"}))
+        assert outcome.verdicts["D2.1.R03"] is None
+        assert outcome.verdicts["D2.1.R01"] is None
+
+    def test_pain_without_attribution_keeps_emergency_assessment(self) -> None:
+        """腹痛 + 医生未判归因 → P0-A，回 G03 并继续 D2.2。"""
+        outcome = d2_1(_d2_state(s={"pain_present": "是", "pain_attrib": "未判断"}))
+        assert outcome.verdicts["D2.1.R05"] is True
+        assert outcome.escalation == "G03"
+        assert outcome.next_node == "D2.2"
+
+    def test_pain_attributed_elsewhere_is_not_a_d2_symptom(self) -> None:
+        outcome = d2_1(_d2_state(s={"pain_present": "是", "pain_attrib": "明确其他原因"}))
+        assert outcome.verdicts["D2.1.R05"] is not True
+
+    def test_small_aneurysm_with_suspected_symptom_still_goes_to_d22(self) -> None:
+        """直径 <55 mm 不排除症状性 AAA —— 这一条守的是「不因尺寸小就放过」。"""
+        outcome = d2_1(
+            _d2_state(cl={"aaa_diam": 48.0}, s={"pain_present": "可疑", "pain_attrib": "怀疑相关"})
+        )
+        assert outcome.verdicts["D2.1.R02"] is True
+        assert outcome.next_node == "D2.2"
+
+    def test_large_aneurysm_does_not_trigger_the_small_one_rule(self) -> None:
+        outcome = d2_1(_d2_state(s={"pain_present": "可疑"}))
+        assert outcome.verdicts["D2.1.R02"] is False
+
+    def test_compression_symptom_goes_to_d22(self) -> None:
+        outcome = d2_1(_d2_state(d2={"D2.COMPRESSION": ["肾积水"]}))
+        assert outcome.verdicts["D2.1.R06"] is True
+        assert outcome.next_node == "D2.2"
+
+    def test_compression_absent_is_not_a_positive(self) -> None:
+        outcome = d2_1(_d2_state(d2={"D2.COMPRESSION": ["无"]}))
+        assert outcome.verdicts["D2.1.R06"] is False
+
+    def test_symptom_gone_returns_to_the_asymptomatic_path(self) -> None:
+        outcome = d2_1(_d2_state(s={"aaa_tender": "阴性", "pain_attrib": "明确其他原因"}))
+        assert outcome.verdicts["D2.1.R91"] is True
+        assert outcome.next_node == "D1.1"
+
+    def test_unjudged_attribution_with_symptom_blocks_the_asymptomatic_path(self) -> None:
+        outcome = d2_1(_d2_state(s={"pain_attrib": "未判断"}))
+        assert outcome.verdicts["D2.1.R04"] is True
+        assert outcome.terminal is not None and "人工复核" in outcome.terminal
+        assert "不得进入无症状路径" in outcome.terminal
+
+    def test_missing_pain_status_blocks(self) -> None:
+        outcome = d2_1(_d2_state(s={"pain_present": None}))
+        assert outcome.verdicts["D2.1.R90"] is True
+
+    def test_gaps_name_the_unjudged_attribution(self) -> None:
+        outcome = d2_1(_d2_state(s={"pain_attrib": "未判断"}))
+        assert any("S.PAIN_ATTRIB" in gap and "尚未判断" in gap for gap in outcome.gaps)
+
+
+class TestD22Urgency:
+    """D2.2 只回答一个问题：能不能等。
+
+    规格在这里反复写「不因等待优化而不安全延误」，所以本组测试守的是**不拖延**：
+    恶化/不稳定必须先出急症出口，判不了则停人工复核，绝不默认稳定。
+    """
+
+    def test_unstable_escalates_to_g05(self) -> None:
+        outcome = d2_2(_d2_state(d2={"D2.CLINICAL_STABILITY": "不稳定"}))
+        assert outcome.verdicts["D2.2.R04"] is True
+        assert outcome.escalation == "G05"
+
+    def test_deteriorating_trend_escalates_even_when_called_stable(self) -> None:
+        """趋势恶化优先于「稳定」这个结论——单次结论不能覆盖持续恶化。"""
+        outcome = d2_2(_d2_state(d2={"D2.CLINICAL_STABILITY": "稳定", "D2.VITAL_TREND": "恶化"}))
+        assert outcome.verdicts["D2.2.R04"] is True
+        assert outcome.escalation == "G05"
+
+    def test_unexcluded_rupture_goes_back_to_g03(self) -> None:
+        outcome = d2_2(_d2_state(cl={"aaa_rupture": "无法评价"}))
+        assert outcome.verdicts["D2.2.R01"] is True
+        assert outcome.escalation == "G03"
+        assert outcome.next_node == "D3.1"
+
+    def test_missing_cta_cannot_be_called_stable(self) -> None:
+        outcome = d2_2(_d2_state(n={"cta_status": "缺失"}))
+        assert outcome.verdicts["D2.2.R06"] is True
+        assert outcome.terminal is not None and "人工复核" in outcome.terminal
+
+    def test_unassessed_stability_is_unknown_not_stable(self) -> None:
+        """「未评价」不得折成「稳定」——``R02`` 必须记 UNKNOWN。
+
+        放行与否由 P1 的另一条规则（``R05``）决定：规格给 ``R05`` 的字段清单里
+        根本没有稳定性，只有趋势与已定的时效级别。所以这条测试守的是「别把未评价
+        读成稳定」，不是「未评价必须阻断」。
+        """
+        outcome = d2_2(_d2_state(d2={"D2.CLINICAL_STABILITY": "未评价"}))
+        assert outcome.verdicts["D2.2.R02"] is None
+        assert outcome.verdicts["D2.2.R05"] is True
+
+    def test_stable_unruptured_case_goes_to_d23(self) -> None:
+        outcome = d2_2(_d2_state())
+        assert outcome.verdicts["D2.2.R02"] is True
+        assert outcome.next_node == "D2.3"
+
+    def test_urgency_decision_alone_is_enough_when_stability_unknown(self) -> None:
+        """稳定性没结论但已定「紧急」→ 仍可进 D2.3（R05）。
+
+        ``R02`` 要求临床稳定，``R05`` 只要求时效级别已定——两者是「稳定」与
+        「已经决定按紧急处理」的分野。
+        """
+        outcome = d2_2(_d2_state(d2={"D2.CLINICAL_STABILITY": None}))
+        assert outcome.verdicts["D2.2.R02"] is None
+        assert outcome.verdicts["D2.2.R05"] is True
+        assert outcome.next_node == "D2.3"
+
+    def test_missing_trend_blocks_r05(self) -> None:
+        """稳定性与趋势都没有 → R05 判不了，落 R90 人工复核。"""
+        outcome = d2_2(_d2_state(d2={"D2.CLINICAL_STABILITY": None, "D2.VITAL_TREND": None}))
+        assert outcome.verdicts["D2.2.R05"] is None
+        assert outcome.verdicts["D2.2.R90"] is True
+
+    def test_unproven_symptom_source_goes_back_to_g03(self) -> None:
+        outcome = d2_2(_d2_state(s={"pain_attrib": "明确其他原因"}))
+        assert outcome.verdicts["D2.2.R03"] is True
+        assert outcome.escalation == "G03"
+
+    def test_gaps_name_the_unexcluded_rupture(self) -> None:
+        outcome = d2_2(_d2_state(cl={"aaa_rupture": "无法评价"}))
+        assert any("破裂未充分排除" in gap for gap in outcome.gaps)
+
+
+class TestD23Candidates:
+    """D2.3 与 D1.3 同构，但要守「紧急场景降低完整度要求」这条线。"""
+
+    def test_both_columns_are_always_present(self) -> None:
+        assert [c.procedure for c in d2_3(_d2_state()).candidates] == ["EVAR", "OSR"]
+
+    def test_anatomy_and_ifu_met_makes_evar_feasible(self) -> None:
+        outcome = d2_3(_d2_state())
+        evar = _candidate(outcome, "EVAR")
+        assert evar.status is CandidateStatus.FEASIBLE
+        assert "D2.3.R01" in evar.rule_ids
+
+    def test_distal_seal_is_not_required_here(self) -> None:
+        """紧急场景不要求远端密封区 —— 这正是 D2.3 与 D1.3 的实质差别。
+
+        ``D1.3`` 在同样输入下只能给「条件性候选（远端密封区未评估）」；
+        ``D2.3`` 直接给可行。用择期的完整度卡急诊，等于把病人卡在评估里。
+        """
+        assert _candidate(d2_3(_d2_state()), "EVAR").status is CandidateStatus.FEASIBLE
+        d13_case = make_case(cl={"aaa_diam": 56.0})
+        d13_state = GuidelineState(
+            case=d13_case,
+            route=route(d13_case),
+            node_inputs={"D1": {**_D1_METHOD["D1"], **_D12_GO}},
+        )
+        assert _candidate(d1_3(d13_state), "EVAR").status is CandidateStatus.CONDITIONAL
+
+    def test_unverified_ifu_stays_a_pending_candidate(self) -> None:
+        outcome = d2_3(_d2_state(n={"seal_ifu": "未核验"}))
+        evar = _candidate(outcome, "EVAR")
+        assert evar.status is CandidateStatus.CONDITIONAL
+        assert "待核验候选" in evar.reason
+        assert outcome.verdicts["D2.3.R06"] is True
+
+    def test_ifu_mismatch_excludes_evar_and_escalates(self) -> None:
+        outcome = d2_3(_d2_state(n={"seal_ifu": "不符"}))
+        assert _candidate(outcome, "EVAR").status is CandidateStatus.EXCLUDED
+        assert outcome.escalation == "G06"
+
+    def test_branch_involvement_escalates_to_complex(self) -> None:
+        outcome = d2_3(_d2_state(n={"renal_l": "明确受累"}))
+        assert outcome.verdicts["D2.3.R03"] is True
+        assert outcome.escalation == "G06"
+        assert _candidate(outcome, "EVAR").status is CandidateStatus.EXCLUDED
+
+    def test_bilateral_access_occlusion_excludes_evar(self) -> None:
+        outcome = d2_3(_d2_state(n={"access_occlusion": "双侧闭塞"}))
+        assert _candidate(outcome, "EVAR").status is CandidateStatus.EXCLUDED
+
+    def test_missing_anatomy_yields_a_draft(self) -> None:
+        outcome = d2_3(_d2_state(n={"neck_len": None, "neck_d": None, "neck_angle": None}))
+        assert _candidate(outcome, "EVAR").status is CandidateStatus.UNASSESSED
+        assert outcome.verdicts["D2.3.R90"] is True
+
+    def test_missing_team_resource_does_not_block_the_direction(self) -> None:
+        """团队资源未确认不阻断 —— 规格明写「未确认不等于不可用」。"""
+        outcome = d2_3(_d2_state(d3={"D3.TEAM_RESOURCE": "未知"}))
+        assert outcome.verdicts["D2.3.R90"] is False
+        assert _candidate(outcome, "EVAR").status is CandidateStatus.FEASIBLE
+
+    def test_unavailable_team_escalates_to_complex(self) -> None:
+        outcome = d2_3(_d2_state(d3={"D3.TEAM_RESOURCE": "均不可立即用"}))
+        assert outcome.verdicts["D2.3.R05"] is True
+        assert outcome.escalation == "G06"
+
+    def test_osr_unassessed_without_risk(self) -> None:
+        outcome = d2_3(_d2_state(d2={"D2.RISK": "未评价"}))
+        osr = _candidate(outcome, "OSR")
+        assert osr.status is CandidateStatus.UNASSESSED
+        assert "未评价" in osr.reason
+
+    def test_osr_reason_marks_the_only_option_when_evar_out(self) -> None:
+        outcome = d2_3(_d2_state(n={"seal_ifu": "不符"}))
+        assert "唯一候选" in _candidate(outcome, "OSR").reason
+
+    def test_display_rules_leave_traces(self) -> None:
+        outcome = d2_3(_d2_state())
+        for rule_id in ("D2.3.R01", "D2.3.R02", "D2.3.R04", "D2.3.R06"):
+            assert rule_id in outcome.verdicts, rule_id
+
+    def test_end_to_end_from_d21_reaches_candidates(self) -> None:
+        case = make_case(cl=_D2_CTX, s=_D2_SYMPTOM)
+        report = run(
+            ToolRequest(
+                case=case,
+                route_result=route(case),
+                node_inputs={"D2": _D2_GO},
+            )
+        )
+        assert report.path == ("D2.1", "D2.2", "D2.3")
+        assert [c.procedure for c in report.candidates] == ["EVAR", "OSR"]
+        assert report.escalation is None
+
+
+class TestD2DegradedInputs:
+    """D2 的残缺输入 —— 每一格「差什么」都要能在结论里读出来。"""
+
+    def test_all_image_fields_missing_leaves_wall_breach_unknown(self) -> None:
+        """四个影像字段全缺 → 壁外出血「判不了」，既不确认也不排除。"""
+        outcome = d2_1(
+            _d2_state(c={"extrav": None, "hematoma": None, "wall": None, "contain": None})
+        )
+        assert outcome.verdicts["D2.1.R03"] is None
+
+    def test_unevaluable_image_grade_stays_unknown(self) -> None:
+        outcome = d2_1(_d2_state(c={"extrav": "不可评价", "wall": "不可评价"}))
+        assert outcome.verdicts["D2.1.R03"] is None
+
+    def test_missing_rupture_status_leaves_exclusion_unknown(self) -> None:
+        outcome = d2_1(_d2_state(cl={"aaa_rupture": None}))
+        assert outcome.verdicts["D2.1.R90"] is True
+
+    def test_limb_sign_counts_as_a_symptom(self) -> None:
+        """``s.limb`` 是多选列表：有症状项即算有表现，不能用 ``eq`` 判。"""
+        outcome = d2_1(
+            _d2_state(s={"aaa_tender": "阴性", "pain_attrib": "明确相关", "limb": ["发凉"]})
+        )
+        assert outcome.verdicts["D2.1.R01"] is True
+
+    def test_limb_unknown_is_not_a_negative(self) -> None:
+        outcome = d2_1(
+            _d2_state(s={"aaa_tender": "阴性", "pain_attrib": "明确相关", "limb": ["未知"]})
+        )
+        assert outcome.verdicts["D2.1.R01"] is None
+
+    def test_partial_anatomy_names_each_missing_item(self) -> None:
+        outcome = d2_3(
+            _d2_state(
+                n={
+                    "neck_d": None,
+                    "neck_angle": None,
+                    "access_occlusion": None,
+                    "seal_ifu": None,
+                }
+            )
+        )
+        evar = _candidate(outcome, "EVAR")
+        assert evar.status is CandidateStatus.CONDITIONAL
+        assert "瘤颈参数不全" in evar.reason
+        assert "入路可行性未评估" in evar.reason
+        assert "IFU 未记录" in evar.reason
+        joined = " ".join(outcome.gaps)
+        assert "入路可行性未评估" in joined
+        assert "N.SEAL_IFU" in joined
+
+    def test_missing_cta_status_is_reported(self) -> None:
+        outcome = d2_3(_d2_state(n={"cta_status": None}))
+        assert any("N.CTA_STATUS" in gap for gap in outcome.gaps)
+
+    def test_high_risk_osr_explains_itself(self) -> None:
+        outcome = d2_3(_d2_state(d2={"D2.RISK": "高风险"}))
+        assert "高危" in _candidate(outcome, "OSR").reason
+
+    def test_patient_preference_for_osr_shows_in_the_reason(self) -> None:
+        outcome = d2_3(_d2_state(d2={"D2.PREF": "OSR倾向"}))
+        assert "患者倾向 OSR" in _candidate(outcome, "OSR").reason
+
+
+class TestMultiFieldNormalisation:
+    """``multi_field`` 把标量/列表统一成列表 —— ``has()`` 对字符串会逐字符迭代。"""
+
+    def test_scalar_string_is_wrapped(self) -> None:
+        outcome = d2_1(_d2_state(d2={"D2.COMPRESSION": "肾积水"}))
+        assert outcome.verdicts["D2.1.R06"] is True
+
+    def test_confirmed_wall_breach_outranks_the_rupture_label(self) -> None:
+        """影像明确外溢，即使破裂状态写「未见」也必须进急诊路径。"""
+        outcome = d2_1(_d2_state(cl={"aaa_rupture": "未见相关证据"}, c={"extrav": "明确"}))
+        assert outcome.verdicts["D2.1.R03"] is True
+
+    def test_rupture_exclusion_is_unknown_without_a_status(self) -> None:
+        from src.tools.guideline_engine.nodes.d2_symptomatic import _rupture_excluded
+
+        assert _rupture_excluded(_d2_state(cl={"aaa_rupture": None})) is None
+
+
+# ===========================================================================
+# D4 感染性主动脉病变
+# ===========================================================================
+#: 原生感染病例的「方案要素齐全」基线 —— 各测试在此基础上单点覆盖。
+_D4_PLAN: dict[str, object] = {
+    "D4.BLOOD_CULTURE": "阳性：沙门菌",
+    "D4.INFECTION_IMAGING": ["主动脉周围气体"],
+    "D4.INFECTION_SOURCE": ["不明"],
+    "D4.INFECTION_EXTENT": ["局限"],
+    "D4.NATIVE_FITNESS": "高风险",
+    "D4.CENTRE_CAPABILITY": "具备",
+    "D4.SOURCE_CONTROL": "切除清创",
+    "D4.RECONSTRUCTION_OPTIONS": ["自体静脉"],
+    "D4.ANTIMICROBIAL_PLAN": "培养后已启动",
+    "D4.POSTOP_SURVEILLANCE": "6 周静脉抗菌 + 3/6/12 月 CTA",
+}
+
+#: 原生感染的三类证据（``D4.1.R04`` 的组合判据）。
+_D4_NATIVE_EVIDENCE: dict[str, object] = {
+    "D4.NATIVE_CLINICAL": ["发热≥38°C", "菌血症"],
+    "D4.NATIVE_LAB": ["CRP 150（参考<5）"],
+    "D4.NATIVE_CTA": ["囊状", "周围软组织包块"],
+}
+
+
+def _d4_state(
+    cl: dict[str, object] | None = None,
+    c: dict[str, object] | None = None,
+    n: dict[str, object] | None = None,
+    s: dict[str, object] | None = None,
+    v: dict[str, object] | None = None,
+    d4: dict[str, object] | None = None,
+    d3: dict[str, object] | None = None,
+) -> GuidelineState:
+    overrides: dict[str, object] = {
+        "cl": {"aaa_diam": 56.0, "diag_multi": None, **(cl or {})},
+    }
+    for key, value in (("c", c), ("n", n), ("s", s), ("v", v)):
+        if value:
+            overrides[key] = value
+    case = make_case(**overrides)
+    inputs: dict[str, dict[str, object]] = {
+        "D4": {**_D4_PLAN, **(d4 or {})},
+    }
+    if d3:
+        inputs["D3"] = dict(d3)
+    return GuidelineState(case=case, route=route(case), node_inputs=inputs)
+
+
+class TestD41Triage:
+    """D4.1 是分诊台：原生 → D4.2、移植物 → D4.3、瘘 → D4.3、都没有 → 回 G08。
+
+    这一组测试守的主线是**不许猜**：分型、修复史、瘘状态任一判不了，都必须停在
+    人工复核，而不是往某一条支路上推。三条支路的治疗逻辑完全不同（一侧按感染源
+    控制 + 重建，一侧先按 MAGIC 定性），猜错等于换了整条路径。
+    """
+
+    def test_native_infection_goes_to_the_native_branch(self) -> None:
+        outcome = d4_1(_d4_state(cl={"infection": "原生感染明确"}))
+        assert outcome.verdicts["D4.1.R01"] is True
+        assert outcome.next_node == "D4.2"
+
+    def test_graft_infection_goes_to_the_graft_branch(self) -> None:
+        outcome = d4_1(
+            _d4_state(
+                cl={"infection": "移植物感染疑似", "prev_evor": "EVAR"},
+                d4={"D4.MAGIC_STATUS": "疑似"},
+            )
+        )
+        assert outcome.verdicts["D4.1.R02"] is True
+        assert outcome.next_node == "D4.3"
+
+    def test_graft_history_can_come_from_imaging_alone(self) -> None:
+        """``N.PREV_REPAIR`` 没记录、但 CTA 见到移植物 → 仍按移植物分支走。
+
+        两条证据任一成立即可：漏掉一条既往修复，整条路径就换错了。
+        """
+        outcome = d4_1(
+            _d4_state(
+                cl={"infection": "移植物感染明确"}, n={"prev_repair": None}, c={"graft": "有"}
+            )
+        )
+        assert outcome.verdicts["D4.1.R02"] is True
+        assert outcome.next_node == "D4.3"
+
+    def test_suspected_fistula_is_a_positive_trigger(self) -> None:
+        """``CL.FISTULA = 疑似`` 必须命中 R03 —— 「疑似」不是「没有」。"""
+        outcome = d4_1(_d4_state(cl={"fistula": "疑似"}))
+        assert outcome.verdicts["D4.1.R03"] is True
+        assert outcome.next_node == "D4.3"
+        assert outcome.escalation == "G03"
+
+    def test_aef_imaging_sign_alone_triggers_the_fistula_branch(self) -> None:
+        outcome = d4_1(_d4_state(cl={"fistula": "否"}, c={"aef_sign": "明确"}))
+        assert outcome.verdicts["D4.1.R03"] is True
+
+    def test_suspicious_aef_sign_is_unknown_not_positive(self) -> None:
+        outcome = d4_1(_d4_state(cl={"fistula": "否"}, c={"aef_sign": "可疑"}))
+        assert outcome.verdicts["D4.1.R03"] is None
+
+    def test_no_infection_and_no_fistula_returns_to_g08(self) -> None:
+        outcome = d4_1(_d4_state(cl={"infection": "无证据", "fistula": "否"}))
+        assert outcome.verdicts["D4.1.R91"] is True
+        assert outcome.escalation == "G08"
+        assert outcome.next_node is None
+
+    def test_unassessed_infection_blocks_instead_of_concluding_absence(self) -> None:
+        outcome = d4_1(_d4_state(cl={"infection": "未评价", "fistula": "否"}))
+        assert outcome.verdicts["D4.1.R90"] is True
+        assert outcome.terminal is not None and "人工复核" in outcome.terminal
+        assert any("CL.INFECTION" in gap for gap in outcome.gaps)
+
+    def test_unknown_graft_history_with_infection_blocks_the_branch_choice(self) -> None:
+        """有感染线索、却不知道有没有移植物 → 两条支路选不了，交人工复核。"""
+        outcome = d4_1(
+            _d4_state(
+                cl={"infection": "原生感染疑似"},
+                n={"prev_repair": None},
+                c={"graft": "可疑"},
+            )
+        )
+        assert outcome.verdicts["D4.1.R90"] is True
+        assert any("N.PREV_REPAIR" in gap for gap in outcome.gaps)
+
+    def test_graft_case_without_magic_assessment_blocks(self) -> None:
+        outcome = d4_1(
+            _d4_state(cl={"infection": "无证据", "prev_evor": "EVAR"}, c={"graft": "有"})
+        )
+        assert outcome.verdicts["D4.1.R90"] is True
+        assert any("MAGIC" in gap for gap in outcome.gaps)
+
+    def test_composite_evidence_without_classification_still_reaches_d42(self) -> None:
+        """分型字段空着、但临床 + 实验室 + 影像已凑齐两类 → 仍走原生分支。
+
+        这条守的是「不能因为分类字段没填就掉到 G08」——那会把感染病例判成无感染。
+        """
+        outcome = d4_1(
+            _d4_state(cl={"infection": "未评价", "fistula": "否"}, d4=_D4_NATIVE_EVIDENCE)
+        )
+        assert outcome.verdicts["D4.1.R04"] is True
+        assert outcome.next_node == "D4.2"
+
+    def test_single_evidence_category_is_not_enough(self) -> None:
+        outcome = d4_1(
+            _d4_state(
+                cl={"infection": "未评价", "fistula": "否"},
+                d4={
+                    "D4.NATIVE_CLINICAL": ["发热≥38°C"],
+                    "D4.NATIVE_LAB": ["无"],
+                    "D4.NATIVE_CTA": ["未见"],
+                },
+            )
+        )
+        assert outcome.verdicts["D4.1.R04"] is False
+
+    def test_inflammation_with_infection_is_kept_as_dual_label(self) -> None:
+        """炎症影像 + 感染线索 → 双标签并行评估，不得以炎症影像排除感染。"""
+        outcome = d4_1(
+            _d4_state(
+                cl={"infection": "未评价", "fistula": "否", "saccular": "明确"},
+                n={"inflammatory_ctx": "影像高度提示", "infection_ctx": "高度怀疑"},
+            )
+        )
+        assert outcome.verdicts["D4.1.R05"] is True
+        assert outcome.terminal is not None and "D5.3" in outcome.terminal
+
+    def test_inflammation_alone_does_not_trigger_the_dual_label(self) -> None:
+        outcome = d4_1(
+            _d4_state(
+                cl={"infection": "无证据", "fistula": "否"},
+                n={"inflammatory_ctx": "影像高度提示"},
+                d4={
+                    "D4.NATIVE_CLINICAL": ["无"],
+                    "D4.NATIVE_LAB": ["无"],
+                    "D4.NATIVE_CTA": ["未见"],
+                },
+            )
+        )
+        assert outcome.verdicts["D4.1.R05"] is False
+
+    def test_typed_native_infection_takes_the_exit_before_the_overlap_rule(self) -> None:
+        """分型已明确时走 R01 的出口；R05 不再求值（先命中即返回）。
+
+        ``R05`` 的信息不丢：``_d41_gaps`` 会另记一条「双标签并行」的提示。
+        """
+        outcome = d4_1(
+            _d4_state(
+                cl={"infection": "原生感染明确", "fistula": "否"},
+                n={"inflammatory_ctx": "临床确认"},
+            )
+        )
+        assert outcome.verdicts["D4.1.R01"] is True
+        assert "D4.1.R05" not in outcome.verdicts
+
+
+class TestD42NativePlan:
+    """D4.2 不选术式，只回答「确定性方案还差什么」。
+
+    五条 P1 是并列义务，任何一条被遮蔽都意味着报告少了一个必须做的动作。
+    候选档位封顶在「需 MDT 评估」——规格 4 处明令不指定材料与疗程。
+    """
+
+    def test_complete_plan_reaches_the_mdt_exit(self) -> None:
+        outcome = d4_2(_d4_state(cl={"infection": "原生感染明确"}))
+        assert outcome.verdicts["D4.2.R91"] is True
+        assert outcome.terminal is not None and "MDT" in outcome.terminal
+        assert outcome.verdicts["D4.2.R09"] is False
+
+    def test_undecided_source_control_requires_the_comparison(self) -> None:
+        outcome = d4_2(
+            _d4_state(cl={"infection": "原生感染明确"}, d4={"D4.SOURCE_CONTROL": "未决定"})
+        )
+        assert outcome.verdicts["D4.2.R03"] is True
+        assert outcome.verdicts["D4.2.R09"] is True
+        assert any("感染源控制计划" in gap for gap in outcome.gaps)
+
+    def test_missing_antimicrobial_blocks_the_complete_plan_marker(self) -> None:
+        outcome = d4_2(
+            _d4_state(cl={"infection": "原生感染明确"}, d4={"D4.ANTIMICROBIAL_PLAN": "未开始"})
+        )
+        assert outcome.verdicts["D4.2.R09"] is True
+        assert any("抗菌" in gap for gap in outcome.gaps)
+
+    def test_missing_extent_and_fitness_blocks_the_direction(self) -> None:
+        outcome = d4_2(
+            _d4_state(
+                cl={"infection": "原生感染明确"},
+                d4={"D4.INFECTION_EXTENT": None, "D4.NATIVE_FITNESS": None},
+            )
+        )
+        assert outcome.verdicts["D4.2.R90"] is True
+        assert outcome.terminal is not None and "人工复核" in outcome.terminal
+        assert _candidate(outcome, "OSR").status is CandidateStatus.UNASSESSED
+
+    def test_pending_culture_does_not_block(self) -> None:
+        """未采集/待结果不阻断 —— 规格明写不得为采样延误急救。"""
+        outcome = d4_2(
+            _d4_state(cl={"infection": "原生感染明确"}, d4={"D4.BLOOD_CULTURE": "已采集待结果"})
+        )
+        assert outcome.verdicts["D4.2.R90"] is False
+        assert outcome.verdicts["D4.2.R91"] is True
+        assert any("未采集/待结果不等于阴性" in gap for gap in outcome.gaps)
+
+    def test_insufficient_centre_capability_prompts_referral(self) -> None:
+        outcome = d4_2(
+            _d4_state(cl={"infection": "原生感染明确"}, d4={"D4.CENTRE_CAPABILITY": "不具备"})
+        )
+        assert outcome.verdicts["D4.2.R04"] is True
+        assert "转诊" in _candidate(outcome, "OSR").reason
+        assert "转诊" in _candidate(outcome, "EVAR").reason
+
+    def test_extreme_risk_goes_to_individualised_mdt(self) -> None:
+        outcome = d4_2(
+            _d4_state(cl={"infection": "原生感染明确"}, d4={"D4.NATIVE_FITNESS": "极高风险"})
+        )
+        assert "极高风险" in _candidate(outcome, "OSR").reason
+
+    def test_evar_bridge_is_never_a_feasible_candidate(self) -> None:
+        """腔内桥接永远不是「可行候选」——它从不代表感染源已控制。"""
+        for overrides in (
+            {},
+            {"D4.INFECTION_EXTENT": None},
+            {"D4.CENTRE_CAPABILITY": "不具备"},
+            {"D4.NATIVE_FITNESS": "极高风险"},
+        ):
+            outcome = d4_2(_d4_state(cl={"infection": "原生感染明确"}, d4=overrides))
+            assert _candidate(outcome, "EVAR").status is not CandidateStatus.FEASIBLE
+
+    def test_fistula_adds_a_repair_item_to_the_plan(self) -> None:
+        outcome = d4_2(_d4_state(cl={"infection": "原生感染明确", "fistula": "主动脉肠瘘"}))
+        assert any("瘘的处理方式" in gap for gap in outcome.gaps)
+
+    def test_both_columns_are_always_present(self) -> None:
+        outcome = d4_2(_d4_state(cl={"infection": "原生感染明确"}))
+        assert [c.procedure for c in outcome.candidates] == ["OSR", "EVAR"]
+
+
+class TestD43Magic:
+    """D4.3 的核心是 MAGIC 定性 —— 算错一档就换了治疗目标。
+
+    MAGIC 的判据是「主要/次要标准 + 类别组合」，三处最容易写错的地方都在本组测试里：
+    ① 同类别两条次要标准不算疑似（必须来自不同类别）；
+    ② 三类标准没收全时不得标「不支持」；
+    ③ 逐项标准与团队结论冲突时取更严的一档，不许静默降级。
+    """
+
+    @staticmethod
+    def _graft_case(d4: dict[str, object] | None = None) -> GuidelineState:
+        return _d4_state(
+            cl={"infection": "移植物感染疑似", "prev_evor": "EVAR"},
+            c={"graft": "有"},
+            d4={"D4.GRAFT_EXTENT": "吻合口", "D4.GRAFT_FITNESS": "可接受", **(d4 or {})},
+        )
+
+    def test_one_major_plus_another_category_confirms(self) -> None:
+        outcome = d4_3(
+            self._graft_case(
+                {
+                    "D4.MAGIC_CLINICAL": ["移植物周围脓液"],
+                    "D4.MAGIC_IMAGING": ["植入后≥7周周围气体"],
+                    "D4.MAGIC_LAB": [],
+                }
+            )
+        )
+        assert outcome.verdicts["D4.3.R06"] is True
+        assert outcome.verdicts["D4.3.R05"] is False
+
+    def test_two_minors_from_different_categories_are_suspected(self) -> None:
+        outcome = d4_3(
+            self._graft_case(
+                {
+                    "D4.MAGIC_CLINICAL": ["无其他原因发热≥38°C"],
+                    "D4.MAGIC_IMAGING": ["动脉瘤扩大"],
+                    "D4.MAGIC_LAB": ["无"],
+                }
+            )
+        )
+        assert outcome.verdicts["D4.3.R05"] is True
+        assert outcome.verdicts["D4.3.R06"] is False
+
+    def test_two_minors_in_one_category_are_not_enough(self) -> None:
+        """``D4.3.R05`` 要求「**不同类别** ≥2 项次要标准」。"""
+        outcome = d4_3(
+            self._graft_case(
+                {
+                    "D4.MAGIC_CLINICAL": ["无其他原因发热≥38°C", "局部红肿热痛或脓性分泌物"],
+                    "D4.MAGIC_IMAGING": ["未见"],
+                    "D4.MAGIC_LAB": ["无"],
+                }
+            )
+        )
+        assert outcome.verdicts["D4.3.R05"] is False
+
+    def test_uncollected_categories_never_yield_not_supported(self) -> None:
+        """三类清单没收全 → 「未完成评估」，R90 阻断，R91 不放行。"""
+        outcome = d4_3(
+            self._graft_case(
+                {
+                    "D4.MAGIC_STATUS": None,
+                    "D4.MAGIC_CLINICAL": ["无其他原因发热≥38°C"],
+                    "D4.MAGIC_IMAGING": [],
+                    "D4.MAGIC_LAB": [],
+                }
+            )
+        )
+        assert outcome.verdicts["D4.3.R90"] is True
+        assert outcome.verdicts.get("D4.3.R91") is not True
+        assert any("未完成评估" in gap for gap in outcome.gaps)
+
+    def test_all_categories_negative_yields_not_supported_and_goes_to_d6(self) -> None:
+        outcome = d4_3(
+            self._graft_case(
+                {
+                    "D4.MAGIC_STATUS": "不支持",
+                    "D4.MAGIC_CLINICAL": ["无"],
+                    "D4.MAGIC_IMAGING": ["未见"],
+                    "D4.MAGIC_LAB": ["无"],
+                }
+            )
+        )
+        assert outcome.verdicts["D4.3.R91"] is True
+        assert outcome.next_node == "D6.1"
+
+    def test_stated_status_is_taken_when_criteria_are_incomplete(self) -> None:
+        """团队结论也是权威来源：清单没收全但写了「确诊」→ 按确诊处理。"""
+        outcome = d4_3(
+            self._graft_case(
+                {
+                    "D4.MAGIC_STATUS": "确诊",
+                    "D4.MAGIC_CLINICAL": [],
+                    "D4.MAGIC_IMAGING": [],
+                    "D4.MAGIC_LAB": [],
+                }
+            )
+        )
+        assert outcome.verdicts["D4.3.R06"] is True
+        assert outcome.verdicts.get("D4.3.R90") is not True
+
+    def test_criteria_outrank_a_lower_stated_status(self) -> None:
+        """逐项标准算确诊、团队写疑似 → 取确诊并留一条冲突缺口（不许降级）。"""
+        outcome = d4_3(
+            self._graft_case(
+                {
+                    "D4.MAGIC_STATUS": "疑似",
+                    "D4.MAGIC_CLINICAL": ["移植物周围脓液"],
+                    "D4.MAGIC_IMAGING": ["植入后≥7周周围气体"],
+                    "D4.MAGIC_LAB": [],
+                }
+            )
+        )
+        assert outcome.verdicts["D4.3.R06"] is True
+        assert any("不一致" in gap or "更严" in gap for gap in outcome.gaps)
+
+    def test_imaging_item_without_time_window_is_surfaced(self) -> None:
+        """「移植物周围气体」缺「植入后 ≥7 周」这个时间窗 → 不计入，且要点名。"""
+        outcome = d4_3(
+            self._graft_case(
+                {
+                    "D4.MAGIC_STATUS": None,
+                    "D4.MAGIC_CLINICAL": ["无"],
+                    "D4.MAGIC_IMAGING": ["移植物周围气体"],
+                    "D4.MAGIC_LAB": ["无"],
+                }
+            )
+        )
+        assert any("未归类" in gap and "移植物周围气体" in gap for gap in outcome.gaps)
+
+    def test_active_bleeding_goes_to_the_emergency_path(self) -> None:
+        state = _d4_state(
+            cl={"infection": "移植物感染疑似", "prev_evor": "EVAR"},
+            c={"graft": "有"},
+            s={"gi_bleed": ["呕血"]},
+        )
+        outcome = d4_3(state)
+        assert outcome.verdicts["D4.3.R01"] is True
+        assert outcome.escalation == "G05"
+
+    def test_herald_bleed_in_aef_warning_escalates(self) -> None:
+        outcome = d4_3(
+            _d4_state(
+                cl={"fistula": "主动脉肠瘘", "prev_evor": "EVAR"},
+                c={"graft": "有"},
+                d4={"D4.AEF_WARNING": "先兆性少量出血"},
+            )
+        )
+        assert outcome.verdicts["D4.3.R07"] is True
+        assert outcome.escalation == "G05"
+
+    def test_extreme_risk_switches_the_goal_to_palliation(self) -> None:
+        outcome = d4_3(
+            _d4_state(
+                cl={"infection": "移植物感染疑似", "prev_evor": "EVAR"},
+                c={"graft": "有"},
+                d4={
+                    "D4.MAGIC_STATUS": "确诊",
+                    "D4.GRAFT_FITNESS": "极高风险",
+                    "D4.GRAFT_EXTENT": "广泛",
+                },
+            )
+        )
+        assert outcome.verdicts["D4.3.R03"] is True
+        assert outcome.terminal is not None and "姑息" in outcome.terminal
+
+    def test_enteric_fistula_asks_for_the_abdominal_surgeon(self) -> None:
+        outcome = d4_3(
+            _d4_state(
+                cl={"fistula": "主动脉肠瘘", "prev_evor": "EVAR"},
+                c={"graft": "有"},
+                d4={
+                    "D4.MAGIC_STATUS": "疑似",
+                    "D4.GRAFT_EXTENT": "瘘相关",
+                    "D4.GRAFT_FITNESS": "高风险",
+                },
+            )
+        )
+        assert outcome.verdicts["D4.3.R04"] is True
+        assert any("消化道外科" in gap for gap in outcome.gaps)
+
+    def test_both_columns_are_always_present(self) -> None:
+        outcome = d4_3(self._graft_case())
+        assert [c.procedure for c in outcome.candidates] == [
+            "移植物去除 + 重建（根治）",
+            "保留移植物 + 长期抑制（姑息）",
+        ]
+
+    def test_retention_column_is_unassessed_without_magic(self) -> None:
+        outcome = d4_3(
+            _d4_state(
+                cl={"infection": "移植物感染疑似", "prev_evor": "EVAR"},
+                c={"graft": "有"},
+                d4={"D4.MAGIC_STATUS": None},
+            )
+        )
+        assert (
+            _candidate(outcome, "保留移植物 + 长期抑制（姑息）").status
+            is CandidateStatus.UNASSESSED
+        )
+
+
+class TestD4DegradedInputs:
+    """输入残缺时 D4 的落档 —— 每一格「差什么」都要能在缺口里读出来。"""
+
+    def test_empty_inputs_block_at_triage_with_named_gaps(self) -> None:
+        case = make_case(cl={"aaa_diam": 56.0, "diag_multi": None, "infection": "未评价"})
+        outcome = d4_1(GuidelineState(case=case, route=route(case)))
+        assert outcome.verdicts["D4.1.R90"] is True
+        joined = " ".join(outcome.gaps)
+        assert "D4.BLOOD_CULTURE" in joined
+        assert "CL.INFECTION" in joined
+
+    def test_triage_lists_native_evidence_only_for_native_cases(self) -> None:
+        native = d4_1(_d4_state(cl={"infection": "原生感染明确"}, d4={"D4.NATIVE_LAB": None}))
+        graft = d4_1(
+            _d4_state(cl={"infection": "移植物感染疑似", "prev_evor": "EVAR"}, c={"graft": "有"})
+        )
+        assert any("D4.NATIVE_LAB" in gap for gap in native.gaps)
+        assert not any("D4.NATIVE_LAB" in gap for gap in graft.gaps)
+
+    def test_graft_case_with_magic_still_gets_no_native_checklist(self) -> None:
+        """MAGIC 已评的移植物病例同样不该被要求补原生感染的三类证据。"""
+        graft = d4_1(
+            _d4_state(
+                cl={"infection": "移植物感染疑似", "prev_evor": "EVAR"},
+                c={"graft": "有"},
+                d4={"D4.MAGIC_STATUS": "疑似"},
+            )
+        )
+        assert not any("D4.NATIVE_CLINICAL" in gap for gap in graft.gaps)
+        assert not any("MAGIC 评估未完成" in gap for gap in graft.gaps)
+
+    def test_suspected_fistula_type_is_named(self) -> None:
+        outcome = d4_1(_d4_state(cl={"fistula": "疑似"}, c={"aef_sign": "未见"}))
+        assert any("CL.FISTULA_TYPE" in gap for gap in outcome.gaps)
+
+    def test_plan_node_reports_all_missing_elements(self) -> None:
+        outcome = d4_2(_d4_state(cl={"infection": "原生感染明确"}, d4={"D4.SOURCE_CONTROL": None}))
+        joined = " ".join(outcome.gaps)
+        assert "D4.SOURCE_CONTROL" in joined
+        assert "确定性方案要素不全" in joined
+
+
+class TestD4EdgeBranches:
+    """D4 的边角分支 —— 三值判据「判不了」的那一侧必须能走通。"""
+
+    def test_no_repair_evidence_at_all_is_unknown(self) -> None:
+        """三处修复史全空 → 不给结论（不是「没有修复史」）。"""
+        outcome = d4_1(
+            _d4_state(
+                cl={"infection": "原生感染明确", "prev_evor": None},
+                n={"prev_repair": None},
+                c={"graft": None},
+            )
+        )
+        assert outcome.verdicts["D4.1.R90"] is True
+        assert any("N.PREV_REPAIR" in gap for gap in outcome.gaps)
+
+    def test_uncertain_evidence_item_is_unknown(self) -> None:
+        outcome = d4_1(
+            _d4_state(
+                cl={"infection": "未评价", "fistula": "否"},
+                d4={
+                    "D4.NATIVE_CLINICAL": ["未知"],
+                    "D4.NATIVE_LAB": ["无"],
+                    "D4.NATIVE_CTA": ["未见"],
+                },
+            )
+        )
+        assert outcome.verdicts["D4.1.R04"] is None
+
+    def test_unrecorded_fistula_status_is_named(self) -> None:
+        outcome = d4_1(_d4_state(cl={"infection": "原生感染明确", "fistula": None}))
+        assert any("CL.FISTULA" in gap for gap in outcome.gaps)
+
+    def test_missing_sbp_is_unknown_not_unstable(self) -> None:
+        outcome = d4_3(
+            _d4_state(
+                cl={"infection": "移植物感染疑似", "prev_evor": "EVAR"},
+                c={"graft": "有"},
+                v={"sbp": None},
+            )
+        )
+        assert outcome.verdicts["D4.3.R01"] is None
+
+    def test_single_major_criterion_is_suspected(self) -> None:
+        outcome = d4_3(
+            _d4_state(
+                cl={"infection": "移植物感染疑似", "prev_evor": "EVAR"},
+                c={"graft": "有"},
+                d4={
+                    "D4.GRAFT_EXTENT": "吻合口",
+                    "D4.GRAFT_FITNESS": "可接受",
+                    "D4.MAGIC_CLINICAL": ["移植物周围脓液"],
+                    "D4.MAGIC_IMAGING": ["未见"],
+                    "D4.MAGIC_LAB": ["无"],
+                },
+            )
+        )
+        assert outcome.verdicts["D4.3.R05"] is True
+
+    def test_plan_names_reconstruction_and_surveillance(self) -> None:
+        outcome = d4_2(
+            _d4_state(
+                cl={"infection": "原生感染明确"},
+                d4={"D4.RECONSTRUCTION_OPTIONS": None, "D4.POSTOP_SURVEILLANCE": None},
+            )
+        )
+        joined = " ".join(outcome.gaps)
+        assert "重建方式与材料" in joined
+        assert "术后抗菌与影像随访计划" in joined
+
+    def test_unknown_capability_is_reported_without_blocking(self) -> None:
+        outcome = d4_2(
+            _d4_state(cl={"infection": "原生感染明确"}, d4={"D4.CENTRE_CAPABILITY": None})
+        )
+        assert outcome.verdicts["D4.2.R90"] is False
+        assert any("D4.CENTRE_CAPABILITY" in gap for gap in outcome.gaps)
+
+    def test_removal_column_tracks_risk_and_capability(self) -> None:
+        def removal(overrides: dict[str, object]) -> Candidate:
+            state = _d4_state(
+                cl={"infection": "移植物感染疑似", "prev_evor": "EVAR"},
+                c={"graft": "有"},
+                d4={"D4.MAGIC_STATUS": "确诊", "D4.GRAFT_EXTENT": "广泛", **overrides},
+            )
+            return _candidate(d4_3(state), "移植物去除 + 重建（根治）")
+
+        assert "极高风险" in removal({"D4.GRAFT_FITNESS": "极高风险"}).reason
+        assert (
+            "转诊"
+            in removal({"D4.GRAFT_FITNESS": "可接受", "D4.CENTRE_CAPABILITY": "不具备"}).reason
+        )
+        assert (
+            removal({"D4.GRAFT_FITNESS": "可接受", "D4.GRAFT_EXTENT": None}).status
+            is CandidateStatus.CONDITIONAL
+        )
+
+    def test_multi_label_report_ends_at_the_specialty_conclusion(self) -> None:
+        """``D1 + D4`` 双标签：报告终点取**末端**（感染 MDT），不是 D1 的监测结论。
+
+        ``G08`` 允许多标签且顺序固定 D1 → D7，D1 链总是先跑完。若报告取第一个
+        终点，一个 56 mm 的感染性 AAA 会被总结成「按性别与直径安排随访」——
+        感染需要控制感染源，而不是继续监测。
+        """
+        case = make_case(cl={"aaa_diam": 56.0, "infection": "原生感染明确", "diag_multi": None})
+        report = run(ToolRequest(case=case, route_result=route(case), node_inputs={"D4": _D4_PLAN}))
+        assert report.path == ("D1.1", "D4.1", "D4.2")
+        assert report.terminal is not None and "MDT" in report.terminal
+        assert "监测" not in report.terminal
+
+
+# ===========================================================================
+# D5 特殊主动脉病变
+# ===========================================================================
+#: 「复杂征象全部明确未见」的方案基线 —— 各测试在此基础上单点覆盖。
+_D5_PLAN: dict[str, object] = {
+    "D5.SYMPTOMS": ["无"],
+    "D5.CAUSE": ["退变"],
+    "D5.LESION_LOCATION": "肾下，未累及肾动脉",
+    "D5.LESION_GROWTH": "稳定",
+    "D5.PERIAORTIC_BLEED": "无",
+    "D5.EMBOLISM": "否",
+    "D5.PAIN_RECURRENT": "无",
+    "D5.INTIMAL_DISRUPTION": "未见",
+    "D5.PAU_DEPTH": "深 8mm / 宽 12mm，肾下",
+    "D5.IMH_FEATURES": "最大厚度 9mm，主动脉 46mm，肾下至肾旁",
+    "D5.IAAD_FEATURES": "入口位于肾下，远端至髂总，假腔血栓化",
+    "D5.SACCULAR_DEF": "球形，累及部分周径",
+    "D5.PSEUDO_CAUSE": ["术后吻合口"],
+    "INF.IGG4": "未检测",
+    "INF.PET_MRI": "未做",
+}
+
+
+def _d5_state(
+    cl: dict[str, object] | None = None,
+    n: dict[str, object] | None = None,
+    c: dict[str, object] | None = None,
+    s: dict[str, object] | None = None,
+    inf: dict[str, object] | None = None,
+    d5: dict[str, object] | None = None,
+) -> GuidelineState:
+    overrides: dict[str, object] = {"cl": {"aaa_diam": 56.0, "diag_multi": None, **(cl or {})}}
+    for key, value in (("n", n), ("c", c), ("s", s), ("inf", inf)):
+        if value:
+            overrides[key] = value
+    case = make_case(**overrides)
+    # 按前缀分组投递：``D5.*`` 进 D5 通道，``INF.*`` / ``C.*`` 各归各的通道
+    # （``node_field`` 就是按前缀定位的，全塞进 D5 会取不到）。
+    channels: dict[str, dict[str, object]] = {}
+    for spec_id, value in {**_D5_PLAN, **(d5 or {})}.items():
+        channels.setdefault(spec_id.split(".", 1)[0], {})[spec_id] = value
+    return GuidelineState(case=case, route=route(case), node_inputs=channels)
+
+
+class TestD51Triage:
+    """D5.1 是分诊台：壁结构病变 → D5.2、形态与病因病变 → D5.3、都不是 → G08。
+
+    本组守的最关键一条是 **R90 不能无条件阻断**（模块文档第 ④ 条）：照规格字面
+    实现成「任一字段未知即阻断」，一个 ``PAU = 明确`` 而囊状字段没填的病例就会
+    停在人工复核——而它的归类依据其实已经充分。
+    """
+
+    def test_pau_goes_to_complexity(self) -> None:
+        outcome = d5_1(_d5_state(cl={"pau": "明确"}))
+        assert outcome.verdicts["D5.1.R01"] is True
+        assert outcome.next_node == "D5.2"
+
+    def test_imh_and_iaad_take_the_same_branch(self) -> None:
+        for field in ("imh", "iaad"):
+            outcome = d5_1(_d5_state(cl={field: "明确"}))
+            assert outcome.next_node == "D5.2", field
+
+    def test_saccular_goes_to_the_morphology_branch(self) -> None:
+        outcome = d5_1(_d5_state(cl={"saccular": "明确"}))
+        assert outcome.verdicts["D5.1.R02"] is True
+        assert outcome.next_node == "D5.3"
+
+    def test_inflammatory_context_alone_reaches_d53(self) -> None:
+        """``G08.R10`` 的入口：没有 PAU/囊状，靠炎症状态进 D5。"""
+        outcome = d5_1(_d5_state(n={"inflammatory_ctx": "影像高度提示"}))
+        assert outcome.verdicts["D5.1.R02"] is True
+        assert outcome.next_node == "D5.3"
+
+    def test_confirmed_rupture_escalates_to_the_emergency_path(self) -> None:
+        outcome = d5_1(_d5_state(cl={"pau": "明确", "aaa_rupture": "明确"}))
+        assert outcome.verdicts["D5.1.R03"] is True
+        assert outcome.escalation == "G05"
+        assert outcome.next_node is None
+
+    def test_suspicious_imaging_sign_does_not_trigger_p0(self) -> None:
+        """可疑外溢/血肿不算「可靠本次事实」——P0 只由明确事实触发。"""
+        outcome = d5_1(_d5_state(cl={"pau": "明确"}, c={"extrav": "可疑", "hematoma": "可疑"}))
+        assert outcome.verdicts["D5.1.R03"] is not True
+        assert outcome.next_node == "D5.2"
+
+    def test_acute_malperfusion_escalates(self) -> None:
+        outcome = d5_1(_d5_state(cl={"pau": "明确"}, c={"malperfusion": ["肠系膜"]}))
+        assert outcome.verdicts["D5.1.R03"] is True
+        assert outcome.escalation == "G05"
+
+    def test_branch_involvement_keeps_both_the_escalation_and_d52(self) -> None:
+        """累及肾动脉：既要转复杂路径，也继续判复杂性 —— 两件事都不能丢。"""
+        outcome = d5_1(_d5_state(cl={"pau": "明确"}, n={"renal_r": "明确受累"}))
+        assert outcome.verdicts["D5.1.R05"] is True
+        assert outcome.escalation == "G06"
+        assert outcome.next_node == "D5.2"
+
+    def test_branch_involvement_outranks_the_plain_d52_route(self) -> None:
+        """``R05`` 声明在 ``R01`` 之前：同优先级靠声明顺序，先声明的先命中。"""
+        outcome = d5_1(_d5_state(cl={"pau": "明确"}, n={"sma": "明确受累"}))
+        assert "D5.1.R01" not in outcome.verdicts
+
+    def test_all_negative_returns_to_g08(self) -> None:
+        outcome = d5_1(_d5_state())
+        assert outcome.verdicts["D5.1.R91"] is True
+        assert outcome.escalation == "G08"
+
+    def test_unassessed_fields_block_when_no_subtype_is_established(self) -> None:
+        outcome = d5_1(
+            _d5_state(
+                cl={"pau": None, "imh": None, "iaad": None, "saccular": None, "pseudo": None},
+                n={"inflammatory_ctx": None},
+            )
+        )
+        assert outcome.verdicts["D5.1.R90"] is True
+        assert outcome.terminal is not None and "人工复核" in outcome.terminal
+
+    def test_established_subtype_is_not_blocked_by_an_unfilled_neighbour(self) -> None:
+        """PAU 明确 + 囊状字段没填 → 不阻断（归类依据已充分）。"""
+        outcome = d5_1(_d5_state(cl={"pau": "明确", "saccular": None}))
+        assert outcome.verdicts["D5.1.R90"] is False
+        assert outcome.next_node == "D5.2"
+
+    def test_cause_check_is_traced_even_if_another_rule_owns_the_exit(self) -> None:
+        """``R04`` 是展示性规则：出口被 ``R02`` 拿走时它仍要留痕。"""
+        outcome = d5_1(_d5_state(cl={"saccular": "明确"}))
+        assert outcome.verdicts["D5.1.R04"] is True
+        assert outcome.next_node == "D5.3"
+
+    def test_missing_cause_is_named_for_morphology_cases(self) -> None:
+        outcome = d5_1(_d5_state(cl={"saccular": "明确"}, d5={"D5.CAUSE": None}))
+        assert any("D5.CAUSE" in gap for gap in outcome.gaps)
+
+    def test_both_branches_present_is_disclosed(self) -> None:
+        """囊状 + PAU 并存：本轮只走 D5.3，缺口里要说清 D5.2 没跑。"""
+        outcome = d5_1(_d5_state(cl={"saccular": "明确", "pau": "明确"}))
+        assert any("D5.2 复杂性评估未执行" in gap for gap in outcome.gaps)
+
+    def test_spec_wording_is_rejected_by_the_model(self) -> None:
+        """规格写「疑似」，模型只收「可疑」——类型系统挡住了词表混用。"""
+        with pytest.raises(ValidationError):
+            make_case(cl={"pau": "疑似"})
+
+
+class TestD52Complexity:
+    """D5.2 只回答「这个壁结构病变有没有并发征象」，不决定术式。
+
+    三档出口的边界必须清楚：高危组合 → 加急；任一复杂征象 → 修复评估；全阴性
+    才允许「无并发症 + 监测」。判不了的一律不许落到第三档。
+    """
+
+    def test_pau_with_imh_is_a_high_risk_combination(self) -> None:
+        outcome = d5_2(_d5_state(cl={"pau": "明确", "imh": "明确"}, c={"malperfusion": ["无"]}))
+        assert outcome.verdicts["D5.2.R03"] is True
+        assert outcome.terminal is not None and "加急" in outcome.terminal
+
+    def test_growth_alone_is_a_high_risk_combination(self) -> None:
+        outcome = d5_2(
+            _d5_state(
+                cl={"imh": "明确"}, d5={"D5.LESION_GROWTH": "扩大"}, c={"malperfusion": ["无"]}
+            )
+        )
+        assert outcome.verdicts["D5.2.R03"] is True
+
+    def test_complex_sign_without_high_risk_goes_to_repair_assessment(self) -> None:
+        outcome = d5_2(
+            _d5_state(
+                cl={"iaad": "明确"},
+                d5={"D5.INTIMAL_DISRUPTION": "明确"},
+                c={"malperfusion": ["无"]},
+            )
+        )
+        assert outcome.verdicts["D5.2.R02"] is True
+        assert outcome.verdicts.get("D5.2.R03") is not True
+        assert outcome.terminal is not None and "专科评估是否修复" in outcome.terminal
+
+    def test_malperfusion_is_a_complex_sign(self) -> None:
+        outcome = d5_2(_d5_state(cl={"imh": "明确"}, c={"malperfusion": ["肾"]}))
+        assert outcome.verdicts["D5.2.R02"] is True
+
+    def test_all_negative_reaches_the_monitoring_branch(self) -> None:
+        outcome = d5_2(_d5_state(cl={"pau": "明确"}, c={"malperfusion": ["无"]}))
+        assert outcome.verdicts["D5.2.R01"] is True
+        assert outcome.terminal is not None and "监测" in outcome.terminal
+
+    def test_unrecorded_malperfusion_blocks_the_monitoring_conclusion(self) -> None:
+        """灌注状态没记录 → 不许判「无并发症」（规格 R90 的 J 列）。"""
+        outcome = d5_2(_d5_state(cl={"pau": "明确"}))
+        assert outcome.verdicts["D5.2.R90"] is True
+        assert outcome.terminal is not None and "不得判为无并发症" in outcome.terminal
+
+    def test_incomparable_growth_blocks_instead_of_counting_as_stable(self) -> None:
+        """「不可比」有值但不能比较 —— 它既不支持「扩大」也不支持「稳定」。"""
+        outcome = d5_2(
+            _d5_state(
+                cl={"pau": "明确"}, d5={"D5.LESION_GROWTH": "不可比"}, c={"malperfusion": ["无"]}
+            )
+        )
+        assert outcome.verdicts["D5.2.R90"] is True
+        assert any("不可比" in gap for gap in outcome.gaps)
+
+    def test_missing_embolism_status_blocks(self) -> None:
+        outcome = d5_2(
+            _d5_state(cl={"pau": "明确"}, d5={"D5.EMBOLISM": None}, c={"malperfusion": ["无"]})
+        )
+        assert outcome.verdicts["D5.2.R90"] is True
+
+    def test_size_threshold_policy_leaves_a_trace(self) -> None:
+        """``R06`` 是取值口径而非分流：无论走哪条出口都要留痕。"""
+        outcome = d5_2(_d5_state(cl={"pau": "明确"}, c={"malperfusion": ["无"]}))
+        assert outcome.verdicts["D5.2.R06"] is True
+
+    def test_morphology_gaps_follow_the_present_subtype(self) -> None:
+        pau = d5_2(
+            _d5_state(cl={"pau": "明确"}, d5={"D5.PAU_DEPTH": None}, c={"malperfusion": ["无"]})
+        )
+        iaad = d5_2(
+            _d5_state(
+                cl={"iaad": "明确"}, d5={"D5.IAAD_FEATURES": None}, c={"malperfusion": ["无"]}
+            )
+        )
+        assert any("D5.PAU_DEPTH" in gap for gap in pau.gaps)
+        assert not any("D5.IAAD_FEATURES" in gap for gap in pau.gaps)
+        assert any("D5.IAAD_FEATURES" in gap for gap in iaad.gaps)
+
+
+class TestD53MorphologyAndInflammation:
+    """D5.3 的核心是「按病因口径评估」，不是「选术式」。
+
+    五条 P1 是并列义务、出口只有一个，所以本组除了守出口，还守「被遮蔽的义务
+    仍然出现在缺口里」——那是这一层不丢信息的唯一保障。
+    """
+
+    def test_saccular_goes_to_special_morphology_assessment(self) -> None:
+        outcome = d5_3(_d5_state(cl={"saccular": "明确"}))
+        assert outcome.verdicts["D5.3.R01"] is True
+        assert outcome.terminal is not None and "特殊形态" in outcome.terminal
+
+    def test_pseudo_goes_to_cause_workup(self) -> None:
+        outcome = d5_3(_d5_state(cl={"pseudo": "明确"}))
+        assert outcome.verdicts["D5.3.R02"] is True
+        assert outcome.terminal is not None and "病因" in outcome.terminal
+
+    def test_inflammation_goes_to_specialist_assessment(self) -> None:
+        outcome = d5_3(_d5_state(n={"inflammatory_ctx": "临床确认"}))
+        assert outcome.verdicts["D5.3.R03"] is True
+        assert outcome.terminal is not None and "鉴别感染" in outcome.terminal
+
+    def test_inflammation_with_unexcluded_infection_keeps_both_labels(self) -> None:
+        outcome = d5_3(
+            _d5_state(n={"inflammatory_ctx": "影像高度提示", "infection_ctx": "高度怀疑"})
+        )
+        assert outcome.verdicts["D5.3.R04"] is True
+        assert outcome.terminal is not None and "双标签" in outcome.terminal
+
+    def test_unassessed_infection_also_keeps_both_labels(self) -> None:
+        """感染「没记录」也等于「未排除」——不能因此取消感染疑似标签。"""
+        outcome = d5_3(
+            _d5_state(
+                cl={"infection": "未评价"},
+                n={"inflammatory_ctx": "临床确认", "infection_ctx": None},
+            )
+        )
+        assert outcome.verdicts["D5.3.R04"] is True
+
+    def test_excluded_infection_unlocks_the_pure_inflammatory_path(self) -> None:
+        outcome = d5_3(_d5_state(n={"inflammatory_ctx": "临床确认"}))
+        assert outcome.verdicts["D5.3.R04"] is False
+        assert outcome.verdicts["D5.3.R03"] is True
+
+    def test_below_threshold_with_symptoms_opens_the_anti_inflammatory_path(self) -> None:
+        outcome = d5_3(
+            _d5_state(
+                n={"inflammatory_ctx": "临床确认"},
+                inf={
+                    "aaa_true_diam": 48.0,
+                    "mantle_sign": "明确存在",
+                    "symptom_pattern": "持续/反复腹背痛",
+                },
+            )
+        )
+        assert outcome.verdicts["D5.3.R09"] is True
+        assert outcome.terminal is not None and "抗炎" in outcome.terminal
+
+    def test_true_diameter_not_total_diameter_decides_the_threshold(self) -> None:
+        """总径 56 mm、真实瘤径 48 mm → 仍算「低于阈值」。
+
+        规格 Rec 145 明写修复指征不得把瘤周炎症/壁水肿算入直径。用总径判会把
+        这批本该先抗炎的病例直接推进手术。
+        """
+        outcome = d5_3(
+            _d5_state(
+                cl={"aaa_diam": 56.0},
+                n={"inflammatory_ctx": "临床确认"},
+                inf={
+                    "aaa_true_diam": 48.0,
+                    "mantle_sign": "明确存在",
+                    "symptom_pattern": "持续/反复腹背痛",
+                },
+            )
+        )
+        assert outcome.verdicts["D5.3.R09"] is True
+
+    def test_true_diameter_above_threshold_skips_the_anti_inflammatory_path(self) -> None:
+        outcome = d5_3(
+            _d5_state(
+                n={"inflammatory_ctx": "临床确认"},
+                inf={
+                    "aaa_true_diam": 62.0,
+                    "mantle_sign": "明确存在",
+                    "symptom_pattern": "持续/反复腹背痛",
+                },
+            )
+        )
+        assert outcome.verdicts["D5.3.R09"] is False
+        assert outcome.verdicts["D5.3.R03"] is True
+
+    def test_missing_true_diameter_blocks_the_low_threshold_claim(self) -> None:
+        outcome = d5_3(
+            _d5_state(
+                n={"inflammatory_ctx": "临床确认"},
+                inf={
+                    "mantle_sign": "明确存在",
+                    "symptom_pattern": "持续/反复腹背痛",
+                    "aaa_true_diam": None,
+                },
+            )
+        )
+        assert outcome.verdicts["D5.3.R09"] is None
+        assert any("真实瘤径" in gap for gap in outcome.gaps)
+
+    def test_hydronephrosis_alone_counts_as_an_inflammatory_symptom(self) -> None:
+        outcome = d5_3(
+            _d5_state(
+                n={"inflammatory_ctx": "临床确认"},
+                inf={
+                    "aaa_true_diam": 45.0,
+                    "mantle_sign": "明确存在",
+                    "symptom_pattern": "无",
+                    "organ_involvement": ["肾积水"],
+                },
+            )
+        )
+        assert outcome.verdicts["D5.3.R09"] is True
+
+    def test_mantle_sign_is_required_for_the_anti_inflammatory_path(self) -> None:
+        outcome = d5_3(
+            _d5_state(
+                n={"inflammatory_ctx": "临床确认"},
+                inf={
+                    "aaa_true_diam": 45.0,
+                    "mantle_sign": "未见",
+                    "symptom_pattern": "体重下降",
+                },
+            )
+        )
+        assert outcome.verdicts["D5.3.R09"] is False
+
+    def test_no_special_lesion_returns_to_d11(self) -> None:
+        outcome = d5_3(_d5_state())
+        assert outcome.verdicts["D5.3.R91"] is True
+        assert outcome.next_node == "D1.1"
+
+    def test_unassessed_fields_block_when_nothing_is_established(self) -> None:
+        outcome = d5_3(
+            _d5_state(
+                cl={"saccular": None, "pseudo": None, "pau": None},
+                n={"inflammatory_ctx": None},
+            )
+        )
+        assert outcome.verdicts["D5.3.R90"] is True
+
+    def test_established_shape_is_not_blocked_by_unassessed_inflammation(self) -> None:
+        outcome = d5_3(_d5_state(cl={"saccular": "明确"}, n={"inflammatory_ctx": "未评价"}))
+        # R01 是 P1，命中后 R90（P2）根本不求值——这正是「有亚型就不阻断」的效果
+        assert outcome.verdicts.get("D5.3.R90") is not True
+        assert outcome.terminal is not None and "特殊形态" in outcome.terminal
+
+    def test_shadowed_obligations_still_show_up_in_gaps(self) -> None:
+        """炎症确认 + 囊状并存：出口给炎症，但囊状的取证义务不能跟着消失。
+
+        ``_d53_gaps`` 按**字段**枚举而不是按命中的规则枚举，所以 ``R01`` 没被
+        求值时，``D5.SACCULAR_DEF`` 这类囊状侧缺口仍然出现在清单里。
+        """
+        outcome = d5_3(
+            _d5_state(
+                cl={"saccular": "明确"},
+                n={"inflammatory_ctx": "临床确认"},
+                d5={"D5.SACCULAR_DEF": None},
+            )
+        )
+        assert outcome.terminal is not None and "炎症" in outcome.terminal
+        assert "D5.3.R01" not in outcome.verdicts
+        assert any("D5.SACCULAR_DEF" in gap for gap in outcome.gaps)
+
+    def test_inf_fields_come_from_the_case_model_not_the_channel(self) -> None:
+        """``INF.*`` 的证据明细在 ``VascCase.inf`` 里，不要求调用方再传一遍。"""
+        state = _d5_state(
+            n={"inflammatory_ctx": "临床确认"},
+            inf={"mantle_sign": "明确存在", "wall_fibrosis": "明确", "aaa_true_diam": 44.0},
+        )
+        assert state.node_field("INF.MANTLE_SIGN") is None
+        assert _mantle(state) == "明确存在"
+        assert not any("INF.MANTLE_SIGN" in gap for gap in d5_3(state).gaps)
+
+
+class TestD5DegradedInputs:
+    """D5 的残缺输入与读取分支 —— 「差什么」必须能读出来，通道也要能补位。"""
+
+    def test_classified_infection_blocks_the_clean_inflammatory_path(self) -> None:
+        """``CL.INFECTION`` 已分类成立时，影像侧写「无相关征象」不能反推排除。"""
+        outcome = d5_3(
+            _d5_state(
+                cl={"infection": "原生感染明确"},
+                n={"inflammatory_ctx": "临床确认", "infection_ctx": "无相关征象"},
+            )
+        )
+        assert outcome.verdicts["D5.3.R04"] is True
+
+    def test_unexcluded_infection_is_named_in_d51_gaps(self) -> None:
+        outcome = d5_1(_d5_state(cl={"pau": "明确", "infection": "未评价"}))
+        assert any("感染证据未排除" in gap for gap in outcome.gaps)
+
+    def test_organ_involvement_can_come_from_the_channel_as_a_scalar(self) -> None:
+        """通道里写成单值字符串时按一项处理 —— 不能逐字符拆开。"""
+        outcome = d5_3(
+            _d5_state(
+                n={"inflammatory_ctx": "临床确认"},
+                inf={"organ_involvement": None, "aaa_true_diam": 45.0, "mantle_sign": "明确存在"},
+                d5={"INF.ORGAN_INVOLVEMENT": "肾积水", "INF.SYMPTOM_PATTERN": "无"},
+            )
+        )
+        assert outcome.verdicts["D5.3.R09"] is True
+
+    def test_missing_organ_involvement_is_not_treated_as_absent(self) -> None:
+        outcome = d5_3(
+            _d5_state(
+                n={"inflammatory_ctx": "临床确认"},
+                inf={"organ_involvement": None},
+                d5={"INF.ORGAN_INVOLVEMENT": None},
+            )
+        )
+        assert any("INF.ORGAN_INVOLVEMENT" in gap for gap in outcome.gaps)
+
+    def test_malperfusion_can_come_from_the_channel(self) -> None:
+        outcome = d5_2(
+            _d5_state(cl={"pau": "明确"}, c={"malperfusion": None}, d5={"C.MALPERFUSION": ["肾"]})
+        )
+        assert outcome.verdicts["D5.2.R02"] is True
+
+    def test_complexity_node_without_a_lesion_returns_the_lesion_verdict(self) -> None:
+        """``R03`` 先判「有没有壁结构病变」，没有时直接把结论传出去。"""
+        from src.tools.guideline_engine.nodes.d5_special import _d52_r03
+
+        assert _d52_r03(_d5_state()) is False
+
+    def test_recorded_handles_lists_and_numbers(self) -> None:
+        from src.tools.guideline_engine.nodes.d5_special import _recorded
+
+        listed = _d5_state(cl={"pau": "明确"}, d5={"D5.PAU_DEPTH": ["深 8mm"]})
+        empty = _d5_state(cl={"pau": "明确"}, d5={"D5.PAU_DEPTH": []})
+        numeric = _d5_state(cl={"pau": "明确"}, d5={"D5.PAU_DEPTH": 8.0})
+        assert _recorded(listed, "D5.PAU_DEPTH") is True
+        assert _recorded(empty, "D5.PAU_DEPTH") is None
+        assert _recorded(numeric, "D5.PAU_DEPTH") is True
+
+    def test_r90_guard_yields_false_once_a_shape_is_established(self) -> None:
+        """拦截函数本身的双向：有亚型 → 不阻断（槽位上它不会被求值，故单测）。"""
+        from src.tools.guideline_engine.nodes.d5_special import _d53_r90
+
+        assert _d53_r90(_d5_state(cl={"saccular": "明确"})) is False
+        assert _d53_r90(_d5_state(cl={"saccular": None}, n={"inflammatory_ctx": None})) is True
+
+    def test_complexity_fallback_is_always_true(self) -> None:
+        """``D5.2.R91`` 是结构兜底：判据恒真，才能在新增字段后仍有人接住。"""
+        from src.tools.guideline_engine.nodes.d5_special import _d52_r91
+
+        assert _d52_r91(_d5_state(cl={"pau": "明确"})) is True
+
+
+# ===========================================================================
+# D6 主动脉修复术后
+# ===========================================================================
+#: 「一次干净的随访」基线 —— 各测试在此基础上单点覆盖。
+_D6_PLAN: dict[str, object] = {
+    "D6.REPAIR_DATE": "2021-05-10（术后约 5.5 年）",
+    "D6.BASELINE_CTA": "已完成",
+    "D6.EVAR_RISK_GROUP": "低风险",
+    "D6.OSR_SURVEILLANCE": "约每5年",
+    "D6.EVAR_SURVEILLANCE": "低风险低频",
+    "D6.SAC_SHRINKAGE": 12.0,
+    "D6.SEAL_LENGTH": "近端 18mm",
+    "D6.NECK_DILATION": "否",
+    "D6.TYPE13_EXCLUDED": "已排除",
+    "D6.TYPE4_CONTEXT": "早期术后",
+    "D6.TYPE5_CONTEXT": "未达到",
+    "D6.OCCULT_LEAK_WORKUP": "未完成",
+    "D6.MIGRATION": "无",
+    "D6.PARA_ANASTOMOTIC": "否",
+    "D6.REINTERVENTION_HISTORY": "未处理",
+    "D6.LIMB_OCCLUSION": "无+无症状",
+    "D6.ANATOMICAL_CHANGE": "无变化",
+    "D6.AEF_POSTOP": ["无"],
+    "D6.PARA_INFECT": "无支持证据",
+}
+
+
+def _d6_state(
+    cl: dict[str, object] | None = None,
+    n: dict[str, object] | None = None,
+    c: dict[str, object] | None = None,
+    s: dict[str, object] | None = None,
+    v: dict[str, object] | None = None,
+    d6: dict[str, object] | None = None,
+) -> GuidelineState:
+    overrides: dict[str, object] = {
+        "cl": {"prev_evor": "EVAR", "post_reason": "常规随访", "diag_multi": None, **(cl or {})},
+        "n": {**_CLEAN_N, **(n or {})},
+        "c": {**_CLEAN_C, **(c or {})},
+    }
+    for key, value in (("s", s), ("v", v)):
+        if value:
+            overrides[key] = value
+    case = make_case(**overrides)
+    channels: dict[str, dict[str, object]] = {}
+    for spec_id, value in {**_D6_PLAN, **(d6 or {})}.items():
+        channels.setdefault(spec_id.split(".", 1)[0], {})[spec_id] = value
+    return GuidelineState(case=case, route=route(case), node_inputs=channels)
+
+
+#: 一次「干净随访」的解剖/CTA 侧基线（内漏无、瘤囊 0、结构无、灌注无）。
+_CLEAN_N: dict[str, object] = {"endoleak_type": "无", "sac_growth": 0.0, "graft_major": "无"}
+_CLEAN_C: dict[str, object] = {"malperfusion": ["无"]}
+
+
+class TestD61FollowUpTriage:
+    """D6.1 是术后随访的分诊台，同时是**随访计划的生成点**。
+
+    本组守两件事：① 出口优先级（急症 > 结构/感染 > 内漏 > 常规）；② 常规出口的
+    计划文案必须与「修复类型 + 风险组」一致——那是这个节点唯一真正的交付物。
+    """
+
+    def test_clean_follow_up_reaches_the_monitoring_exit(self) -> None:
+        outcome = d6_1(_d6_state())
+        assert outcome.verdicts["D6.1.R91"] is True
+        assert outcome.terminal is not None and "低风险" in outcome.terminal
+
+    def test_low_risk_plan_mentions_the_five_year_review(self) -> None:
+        outcome = d6_1(_d6_state())
+        assert outcome.terminal is not None and "5 年复查" in outcome.terminal
+
+    def test_high_risk_plan_asks_for_annual_imaging(self) -> None:
+        outcome = d6_1(_d6_state(d6={"D6.EVAR_RISK_GROUP": "高风险"}))
+        assert outcome.terminal is not None and "至少年度" in outcome.terminal
+
+    def test_missing_baseline_cta_blocks_the_low_frequency_plan(self) -> None:
+        """30 天基线 CTA 没做 → 不许直接给「低频随访」方案。"""
+        outcome = d6_1(_d6_state(d6={"D6.BASELINE_CTA": "未完成"}))
+        assert outcome.verdicts["D6.1.R04"] is False
+        assert outcome.terminal is not None and "基线 CTA 未完成" in outcome.terminal
+        assert any("D6.BASELINE_CTA" in gap for gap in outcome.gaps)
+
+    def test_osr_gets_the_five_year_surveillance_plan(self) -> None:
+        outcome = d6_1(_d6_state(cl={"prev_evor": "OSR"}, d6={"D6.OSR_SURVEILLANCE": "约每5年"}))
+        assert outcome.verdicts["D6.1.R06"] is True
+        assert outcome.terminal is not None and "OSR 术后" in outcome.terminal
+
+    def test_complex_evar_gets_its_own_plan(self) -> None:
+        """分支表为空 → 归「其他复杂构型」（R07），不是 FEVAR/BEVAR（R08）。"""
+        outcome = d6_1(_d6_state(d6={"D6.EVAR_SURVEILLANCE": "复杂EVAR个体化"}))
+        assert outcome.verdicts["D6.1.R07"] is True
+        assert outcome.terminal is not None and "个体化长期影像" in outcome.terminal
+
+    def test_unstratified_risk_group_is_named_in_the_plan(self) -> None:
+        outcome = d6_1(_d6_state(d6={"D6.EVAR_RISK_GROUP": "未分层"}))
+        assert outcome.terminal is not None and "未分层" in outcome.terminal
+        assert any("D6.EVAR_RISK_GROUP" in gap for gap in outcome.gaps)
+
+    def test_endoleak_goes_to_d62(self) -> None:
+        outcome = d6_1(_d6_state(n={"endoleak_type": "II"}))
+        assert outcome.verdicts["D6.1.R02"] is True
+        assert outcome.next_node == "D6.2"
+
+    def test_sac_change_alone_goes_to_d62(self) -> None:
+        outcome = d6_1(_d6_state(cl={"post_reason": "瘤囊变化"}, n={"sac_growth": 12.0}))
+        assert outcome.verdicts["D6.1.R02"] is True
+        assert outcome.next_node == "D6.2"
+
+    def test_graft_failure_goes_to_d63(self) -> None:
+        outcome = d6_1(_d6_state(n={"endoleak_type": "III", "graft_major": "组件分离"}))
+        assert outcome.verdicts["D6.1.R03"] is True
+        assert outcome.next_node == "D6.3"
+
+    def test_graft_failure_outranks_the_endoleak_branch(self) -> None:
+        """结构故障与内漏并存时先走 D6.3：D6.2 处理不了组件分离。"""
+        outcome = d6_1(_d6_state(n={"endoleak_type": "II", "graft_major": "移位"}))
+        assert outcome.next_node == "D6.3"
+        assert "D6.1.R02" not in outcome.verdicts
+
+    def test_infection_goes_to_d63_then_d43(self) -> None:
+        """感染的完整链路：D6.1 → D6.3 → D4.3（单值是 next_node 的限制）。"""
+        case = _d6_state(n={"endoleak_type": "无", "infection_ctx": "高度怀疑"}).case
+        report = run(ToolRequest(case=case, route_result=route(case), node_inputs={"D6": _D6_PLAN}))
+        assert report.path == ("D1.1", "D6.1", "D6.3", "D4.3")
+
+    def test_new_rupture_escalates(self) -> None:
+        outcome = d6_1(_d6_state(cl={"aaa_rupture": "明确"}))
+        assert outcome.verdicts["D6.1.R01"] is True
+        assert outcome.escalation == "G05"
+
+    def test_active_gi_bleed_escalates(self) -> None:
+        outcome = d6_1(_d6_state(s={"gi_bleed": ["黑便"]}))
+        assert outcome.verdicts["D6.1.R01"] is True
+        assert outcome.escalation == "G05"
+
+    def test_shock_alone_escalates(self) -> None:
+        outcome = d6_1(_d6_state(v={"sbp": 70.0}))
+        assert outcome.verdicts["D6.1.R01"] is True
+
+    def test_unknown_endoleak_blocks_the_routine_exit(self) -> None:
+        outcome = d6_1(_d6_state(n={"endoleak_type": None, "sac_growth": 0.0, "graft_major": "无"}))
+        assert outcome.verdicts["D6.1.R90"] is True
+        assert outcome.terminal is not None and "人工复核" in outcome.terminal
+
+    def test_missing_repair_date_does_not_block(self) -> None:
+        """手术日期缺失只影响随访间隔，不改变「这次有没有并发症」——故只进缺口。
+
+        照规格 F 列的字面把它列进阻断，会把所有未录日期的首次导入病例都停在
+        人工复核，而其中多数只是随访间隔算不出来。
+        """
+        outcome = d6_1(_d6_state(d6={"D6.REPAIR_DATE": None}))
+        assert outcome.verdicts["D6.1.R91"] is True
+        assert any("D6.REPAIR_DATE" in gap for gap in outcome.gaps)
+
+    def test_shrinkage_supports_the_low_risk_downgrade_only_with_other_conditions(self) -> None:
+        outcome = d6_1(_d6_state())
+        assert outcome.verdicts["D6.1.R09"] is True
+        off = d6_1(_d6_state(d6={"D6.EVAR_RISK_GROUP": "高风险"}))
+        assert off.verdicts["D6.1.R09"] is False
+
+    def test_post_reason_is_a_single_value_in_the_model(self) -> None:
+        """规格写多选，模型只收单值 —— 传列表会被类型系统挡住。"""
+        with pytest.raises(ValidationError):
+            make_case(cl={"post_reason": ["内漏"]})
+
+
+class TestD62Endoleak:
+    """D6.2 按内漏类型分流。三个 10 mm 阈值都来自 ``SAC_GROWTH_MM``。"""
+
+    def test_type_one_goes_to_reintervention(self) -> None:
+        outcome = d6_2(_d6_state(n={"endoleak_type": "I"}))
+        assert outcome.verdicts["D6.2.R01"] is True
+        assert outcome.terminal is not None and "再干预" in outcome.terminal
+
+    def test_type_three_takes_the_same_branch(self) -> None:
+        outcome = d6_2(_d6_state(n={"endoleak_type": "III"}))
+        assert outcome.verdicts["D6.2.R01"] is True
+
+    def test_type_two_with_growth_and_exclusion_goes_to_intervention(self) -> None:
+        outcome = d6_2(_d6_state(n={"endoleak_type": "II", "sac_growth": 12.0}))
+        assert outcome.verdicts["D6.2.R02"] is True
+        assert outcome.terminal is not None and "Type II" in outcome.terminal
+
+    def test_type_two_without_growth_is_not_an_indication(self) -> None:
+        outcome = d6_2(_d6_state(n={"endoleak_type": "II", "sac_growth": 3.0}))
+        assert outcome.verdicts["D6.2.R02"] is False
+
+    def test_type_two_growth_without_excluding_one_three_is_held(self) -> None:
+        """未排除 I/III 型 → 不得把增长归因于 Type II。"""
+        outcome = d6_2(
+            _d6_state(
+                n={"endoleak_type": "II", "sac_growth": 12.0},
+                d6={"D6.TYPE13_EXCLUDED": "未排除"},
+            )
+        )
+        assert outcome.verdicts["D6.2.R02"] is False
+        assert any("TYPE13_EXCLUDED" in gap for gap in outcome.gaps)
+
+    def test_type_four_early_is_observed(self) -> None:
+        outcome = d6_2(
+            _d6_state(
+                n={"endoleak_type": "IV", "sac_growth": 1.0},
+                d6={"D6.TYPE4_CONTEXT": "早期术后"},
+            )
+        )
+        assert outcome.verdicts["D6.2.R05"] is True
+        assert outcome.terminal is not None and "观察" in outcome.terminal
+
+    def test_type_four_with_growth_does_not_get_the_observe_exit(self) -> None:
+        outcome = d6_2(_d6_state(n={"endoleak_type": "IV", "sac_growth": 12.0}))
+        assert outcome.verdicts["D6.2.R05"] is False
+
+    def test_no_visible_leak_but_growth_escalates_the_imaging(self) -> None:
+        outcome = d6_2(_d6_state(n={"endoleak_type": "无", "sac_growth": 12.0}))
+        assert outcome.verdicts["D6.2.R06"] is True
+        assert outcome.terminal is not None and "多模态" in outcome.terminal
+
+    def test_no_visible_leak_growth_with_active_infection_is_not_attributed_to_leak(self) -> None:
+        outcome = d6_2(
+            _d6_state(
+                n={"endoleak_type": "无", "sac_growth": 12.0, "infection_ctx": "高度怀疑"},
+            )
+        )
+        assert outcome.verdicts["D6.2.R06"] is False
+
+    def test_migration_goes_to_the_structure_node(self) -> None:
+        outcome = d6_2(
+            _d6_state(n={"endoleak_type": "无"}, d6={"D6.MIGRATION": "相对固定标志 >10mm"})
+        )
+        assert outcome.verdicts["D6.2.R07"] is True
+        assert outcome.next_node == "D6.3"
+
+    def test_short_seal_without_leak_needs_seal_improvement(self) -> None:
+        outcome = d6_2(_d6_state(n={"endoleak_type": "无"}, d6={"D6.SEAL_LENGTH": "近端 8mm"}))
+        assert outcome.verdicts["D6.2.R03"] is True
+        assert outcome.terminal is not None and "密封" in outcome.terminal
+
+    def test_neck_dilation_alone_triggers_the_seal_branch(self) -> None:
+        outcome = d6_2(_d6_state(n={"endoleak_type": "无"}, d6={"D6.NECK_DILATION": "是"}))
+        assert outcome.verdicts["D6.2.R03"] is True
+
+    def test_suspected_type_is_treated_as_unresolved(self) -> None:
+        outcome = d6_2(_d6_state(n={"endoleak_type": "疑似"}))
+        assert outcome.verdicts["D6.2.R04"] is True
+        assert outcome.terminal is not None and "人工复核" in outcome.terminal
+
+    def test_no_leak_no_growth_reaches_observation(self) -> None:
+        outcome = d6_2(_d6_state())
+        assert outcome.verdicts["D6.2.R91"] is True
+
+    def test_missing_seal_length_is_a_gap_not_a_silent_normal(self) -> None:
+        outcome = d6_2(_d6_state(n={"endoleak_type": "无"}, d6={"D6.SEAL_LENGTH": None}))
+        assert any("D6.SEAL_LENGTH" in gap for gap in outcome.gaps)
+
+
+class TestD63StructureAndTargetVessel:
+    """D6.3 的两个 P0-A 先于一切：术后 AEF 出血与急性缺血。"""
+
+    def test_graft_infection_goes_to_d43(self) -> None:
+        outcome = d6_3(_d6_state(n={"infection_ctx": "医师明确"}))
+        assert outcome.verdicts["D6.3.R01"] is True
+        assert outcome.next_node == "D4.3"
+
+    def test_fistula_goes_to_d43(self) -> None:
+        outcome = d6_3(_d6_state(cl={"fistula": "主动脉肠瘘"}))
+        assert outcome.verdicts["D6.3.R01"] is True
+        assert outcome.next_node == "D4.3"
+
+    def test_target_vessel_occlusion_goes_to_revascularisation(self) -> None:
+        """闭塞但**无临床灌注障碍** → 及时评估再血管化，不是急症（后者由 R06 接）。"""
+        outcome = d6_3(_d6_state(c={"branch": {"左肾动脉": "闭塞"}}))
+        assert outcome.verdicts["D6.3.R02"] is True
+        assert outcome.terminal is not None and "再血管化" in outcome.terminal
+
+    def test_target_vessel_occlusion_with_malperfusion_is_a_p0(self) -> None:
+        outcome = d6_3(_d6_state(c={"branch": {"左肾动脉": "闭塞"}, "malperfusion": ["肾"]}))
+        assert outcome.verdicts["D6.3.R06"] is True
+        assert outcome.escalation == "G05"
+
+    def test_para_anastomotic_aneurysm_goes_to_reintervention_review(self) -> None:
+        outcome = d6_3(
+            _d6_state(
+                cl={"prev_evor": "OSR"},
+                d6={"D6.PARA_ANASTOMOTIC": "明确", "D6.PARA_INFECT": None},
+            )
+        )
+        assert outcome.verdicts["D6.3.R03"] is True
+        assert any("感染" in gap for gap in outcome.gaps)
+
+    def test_graft_component_separation_needs_reintervention_review(self) -> None:
+        outcome = d6_3(_d6_state(n={"graft_major": "组件分离"}))
+        assert outcome.verdicts["D6.3.R04"] is True
+
+    def test_postop_aef_with_bleeding_escalates_and_goes_to_d43(self) -> None:
+        outcome = d6_3(
+            _d6_state(
+                s={"gi_bleed": ["黑便"]},
+                n={"infection_ctx": "医师明确"},
+                d6={"D6.AEF_POSTOP": ["GI出血", "腔外气体"]},
+            )
+        )
+        assert outcome.verdicts["D6.3.R08"] is True
+        assert outcome.escalation == "G05"
+        assert outcome.next_node == "D4.3"
+
+    def test_acute_limb_ischemia_escalates(self) -> None:
+        outcome = d6_3(_d6_state(s={"limb": ["苍白", "运动障碍"]}))
+        assert outcome.verdicts["D6.3.R06"] is True
+        assert outcome.escalation == "G05"
+
+    def test_clean_structure_reaches_follow_up(self) -> None:
+        outcome = d6_3(_d6_state())
+        assert outcome.verdicts["D6.3.R91"] is True
+        assert outcome.terminal is not None and "随访" in outcome.terminal
+
+    def test_unknown_structure_blocks_the_clean_conclusion(self) -> None:
+        outcome = d6_3(_d6_state(n={"graft_major": "疑似"}))
+        assert outcome.verdicts["D6.3.R90"] is True
+
+    def test_empty_branch_table_is_not_a_gap(self) -> None:
+        """标准 EVAR 没有分支靶血管要评估，空 ``C.BRANCH`` 不该报缺口。"""
+        outcome = d6_3(_d6_state())
+        assert not any("C.BRANCH" in gap for gap in outcome.gaps)
+
+    def test_recorded_branch_without_patency_is_a_gap(self) -> None:
+        outcome = d6_3(_d6_state(c={"branch": {"左肾动脉": "不可评价"}, "malperfusion": ["无"]}))
+        assert any("C.BRANCH" in gap for gap in outcome.gaps)
+
+
+class TestD6EdgeBranches:
+    """D6 的边角取舍 —— 「判不了」与「不适用」必须能分开。"""
+
+    def test_complex_non_branching_repair_gets_the_individualised_plan(self) -> None:
+        """分支表空 → 非分支复杂构型（R07），文案里没有「30 天 + 1 年」。"""
+        outcome = d6_1(_d6_state(d6={"D6.EVAR_SURVEILLANCE": "复杂EVAR个体化"}))
+        assert outcome.verdicts["D6.1.R07"] is True
+        assert outcome.verdicts["D6.1.R08"] is False
+        assert outcome.terminal is not None and "个体化长期影像" in outcome.terminal
+        assert "30 天内与 1 年" not in outcome.terminal
+
+    def test_branching_repair_gets_the_30_day_plus_1_year_plan(self) -> None:
+        outcome = d6_1(
+            _d6_state(
+                c={"branch": {"左肾动脉": "通畅"}},
+                d6={"D6.EVAR_SURVEILLANCE": "复杂EVAR个体化"},
+            )
+        )
+        assert outcome.verdicts["D6.1.R08"] is True
+        assert outcome.terminal is not None and "30 天内与 1 年 CTA" in outcome.terminal
+
+    def test_failure_group_is_routed_to_reintervention_not_routine(self) -> None:
+        outcome = d6_1(_d6_state(d6={"D6.EVAR_RISK_GROUP": "失败组"}))
+        assert outcome.terminal is not None and "再干预评估" in outcome.terminal
+
+    def test_unrepaired_case_is_reported_as_a_gap(self) -> None:
+        """没有既往修复史却走到术后节点 —— 前提缺失必须点名。"""
+        outcome = d6_1(_d6_state(cl={"prev_evor": "无"}))
+        assert any("CL.PREV_EVOR" in gap for gap in outcome.gaps)
+
+    def test_osr_without_a_plan_is_a_gap(self) -> None:
+        outcome = d6_1(_d6_state(cl={"prev_evor": "OSR"}, d6={"D6.OSR_SURVEILLANCE": None}))
+        assert any("D6.OSR_SURVEILLANCE" in gap for gap in outcome.gaps)
+
+    def test_suspected_fistula_type_is_named(self) -> None:
+        outcome = d6_1(_d6_state(cl={"fistula": "疑似"}))
+        assert any("CL.FISTULA_TYPE" in gap for gap in outcome.gaps)
+
+    def test_all_follow_up_state_missing_is_listed_field_by_field(self) -> None:
+        outcome = d6_1(
+            _d6_state(
+                n={
+                    "endoleak_type": None,
+                    "sac_growth": None,
+                    "graft_major": None,
+                    "infection_ctx": None,
+                },
+                c={"malperfusion": None},
+            )
+        )
+        joined = " ".join(outcome.gaps)
+        assert "N.ENDOLEAK_TYPE" in joined
+        assert "N.SAC_GROWTH" in joined
+        assert "N.GRAFT_MAJOR" in joined
+        assert "N.INFECTION_CTX" in joined
+        assert "C.MALPERFUSION" in joined
+
+    def test_growth_alone_with_incomparable_growth_still_reaches_d62(self) -> None:
+        """就诊原因写了「瘤囊变化」但增长值不可比 → 仍进 D6.2 去把数值补出来。
+
+        「不可比」不是「没变化」：把它挡在分诊台上，等于让唯一的客观依据消失。
+        """
+        outcome = d6_1(_d6_state(cl={"post_reason": "瘤囊变化"}, n={"sac_growth": None}))
+        assert outcome.verdicts["D6.1.R02"] is True
+        assert outcome.next_node == "D6.2"
+
+    def test_risk_group_unrecorded_is_unknown_not_low(self) -> None:
+        from src.tools.guideline_engine.nodes.d6_postop import _d61_r05
+
+        assert _d61_r05(_d6_state(d6={"D6.EVAR_RISK_GROUP": None})) is None
+
+    def test_shrinkage_below_threshold_does_not_support_the_downgrade(self) -> None:
+        outcome = d6_1(_d6_state(d6={"D6.SAC_SHRINKAGE": 4.0}))
+        assert outcome.verdicts["D6.1.R09"] is False
+
+    def test_missing_shrinkage_is_unknown(self) -> None:
+        from src.tools.guideline_engine.nodes.d6_postop import _d61_r09
+
+        assert _d61_r09(_d6_state(d6={"D6.SAC_SHRINKAGE": None})) is None
+
+    def test_number_parser_rejects_booleans_and_text_without_digits(self) -> None:
+        from src.tools.guideline_engine.nodes.d6_postop import _number
+
+        assert _number(True) is None
+        assert _number("未测") is None
+        assert _number("近端 8mm") == 8.0
+
+    def test_uncertain_migration_is_unknown_not_negative(self) -> None:
+        from src.tools.guideline_engine.nodes.d6_postop import _migration_significant
+
+        assert _migration_significant(_d6_state(d6={"D6.MIGRATION": "未知"})) is None
+        assert _migration_significant(_d6_state(d6={"D6.MIGRATION": None})) is None
+
+    def test_negative_branch_values_are_not_occlusion(self) -> None:
+        from src.tools.guideline_engine.nodes.d6_postop import _branch_occlusion
+
+        assert _branch_occlusion(_d6_state(c={"branch": {"左肾动脉": "通畅"}})) is False
+
+    def test_type_four_without_context_asks_for_it(self) -> None:
+        outcome = d6_2(
+            _d6_state(n={"endoleak_type": "IV", "sac_growth": 2.0}, d6={"D6.TYPE4_CONTEXT": None})
+        )
+        assert any("D6.TYPE4_CONTEXT" in gap for gap in outcome.gaps)
+
+    def test_unresolved_endoleak_is_diagnostic_uncertainty(self) -> None:
+        """已知有内漏（就诊原因写了）但分不出型 → 不能按 Type II 归因。"""
+        from src.tools.guideline_engine.nodes.d6_postop import _d62_r04
+
+        state = _d6_state(cl={"post_reason": "内漏"}, n={"endoleak_type": None})
+        assert _d62_r04(state) is True
+
+    def test_no_endoleak_means_no_diagnostic_uncertainty(self) -> None:
+        from src.tools.guideline_engine.nodes.d6_postop import _d62_r04
+
+        assert _d62_r04(_d6_state(n={"endoleak_type": None})) is False
+
+    def test_missing_seal_and_migration_are_reported(self) -> None:
+        outcome = d6_2(
+            _d6_state(n={"endoleak_type": "无"}, d6={"D6.SEAL_LENGTH": None, "D6.MIGRATION": None})
+        )
+        joined = " ".join(outcome.gaps)
+        assert "D6.SEAL_LENGTH" in joined
+        assert "D6.MIGRATION" in joined
+
+    def test_structure_node_skips_p0_without_a_repair_history(self) -> None:
+        from src.tools.guideline_engine.nodes.d6_postop import _d63_r08
+
+        assert _d63_r08(_d6_state(cl={"prev_evor": "无"}, s={"gi_bleed": ["黑便"]})) is False
+
+    def test_structure_gaps_cover_infection_fistula_and_perfusion(self) -> None:
+        outcome = d6_3(
+            _d6_state(
+                n={"infection_ctx": None},
+                c={"malperfusion": None},
+            )
+        )
+        joined = " ".join(outcome.gaps)
+        assert "N.INFECTION_CTX" in joined
+        assert "C.MALPERFUSION" in joined
+
+    def test_unresolved_fistula_status_is_named(self) -> None:
+        outcome = d6_3(_d6_state(cl={"fistula": "未知"}))
+        assert any("CL.FISTULA" in gap for gap in outcome.gaps)
+
+    def test_reintervention_history_gap_for_para_anastomotic_aneurysm(self) -> None:
+        outcome = d6_3(
+            _d6_state(
+                cl={"prev_evor": "OSR"},
+                d6={"D6.PARA_ANASTOMOTIC": "明确", "D6.REINTERVENTION_HISTORY": None},
+            )
+        )
+        assert any("D6.REINTERVENTION_HISTORY" in gap for gap in outcome.gaps)
+
+
+class TestSharedEmergencyPrimitives:
+    """公共层的急诊原语 —— D2/D3/D4/D6 共用同一份口径。"""
+
+    def test_empty_malperfusion_list_is_unknown(self) -> None:
+        from src.tools.guideline_engine.nodes.common import malperfusion
+
+        state = _d6_state(c={"malperfusion": []})
+        assert malperfusion(state) is None
+
+    def test_sac_growth_is_none_when_incomparable(self) -> None:
+        from src.tools.guideline_engine.nodes.common import sac_growth
+
+        assert sac_growth(_d6_state(n={"sac_growth": None})) is None
+
+    def test_sac_growing_is_unknown_without_a_value(self) -> None:
+        from src.tools.guideline_engine.nodes.common import sac_growing
+
+        assert sac_growing(_d6_state(n={"sac_growth": None})) is None
+
+    def test_multi_field_wraps_a_scalar(self) -> None:
+        from src.tools.guideline_engine.nodes.common import multi_field
+
+        state = _d6_state(d6={"D6.AEF_POSTOP": 7})
+        assert multi_field(state, "D6.AEF_POSTOP") == [7]
+
+
+# ===========================================================================
+# D7 髂动脉瘤
+# ===========================================================================
+#: 「一次干净的监测随访」基线 —— 各测试在此基础上单点覆盖。
+_D7_PLAN: dict[str, object] = {
+    "D7.SYMPTOM_COMPRESSION": ["无"],
+    "D7.ANEURYSM_TYPE": ["退变性"],
+    "D7.DIAM_METHOD": "超声",
+    "D7.LIFE_EXPECTANCY": "较长",
+    "D7.PREFERENCE": "倾向监测",
+    "D7.GROWTH_RATE": "0",
+    "D7.SURVEILLANCE_ELIGIBILITY": "有潜在修复获益",
+    "D7.TARGET_SEAL": "可用",
+    "D7.PELVIC_PLAN": "不适用",
+    "D7.IIA_PRESERVATION": "双侧保留",
+    "D7.IBE_IFU": "CE；X 型号；IFU v2.1；符合",
+    "D7.OPEN_RECON": "近远端吻合区",
+}
+
+
+def _d7_state(
+    cl: dict[str, object] | None = None,
+    n: dict[str, object] | None = None,
+    d7: dict[str, object] | None = None,
+) -> GuidelineState:
+    """构造 D7 病例：默认「左侧 CIA 28 mm、无症状、退变性」。
+
+    三处基线偏离 ``make_case()``，每一处都有理由：
+
+    · ``iliac_site = ["左侧", "CIA"]`` —— 基线是 ``["无"]``，那是「明确没有」；
+    · ``aaa_reported = "否定"`` 且 ``diag_multi = None`` —— 基线写「确认」会让
+      ``D7.1.R02`` 恒为 True（变成测「合并 AAA」而不是测本组想测的分流），
+      ``diag_multi = ["D1"]`` 会先跑一遍 D1 链并污染 ``path``；
+    · ``iliac_diam = {"左侧CIA": 28.0}`` —— 基线是空字典（无直径）。
+    """
+    overrides: dict[str, object] = {
+        "cl": {
+            "iliac_site": ["左侧", "CIA"],
+            "iliac_diam": {"左侧CIA": 28.0},
+            "aaa_reported": "否定",
+            "diag_multi": None,
+            **(cl or {}),
+        },
+    }
+    if n:
+        overrides["n"] = n
+    case = make_case(**overrides)
+    channels: dict[str, dict[str, object]] = {}
+    for spec_id, value in {**_D7_PLAN, **(d7 or {})}.items():
+        channels.setdefault(spec_id.split(".", 1)[0], {})[spec_id] = value
+    return GuidelineState(case=case, route=route(case), node_inputs=channels)
+
+
+class TestD71Triage:
+    """D7.1 是髂动脉瘤的分诊台：先排除急症，再分病种，最后进 D7.2。"""
+
+    def test_confirmed_aneurysm_with_diameter_goes_to_d72(self) -> None:
+        outcome = d7_1(_d7_state())
+        assert outcome.verdicts["D7.1.R03"] is True
+        assert outcome.next_node == "D7.2"
+
+    def test_missing_diameter_still_goes_to_d72(self) -> None:
+        """直径没测 → R03 不成立，由 R91 接住（补测是 D7.2 的事，不是分诊台的）。"""
+        outcome = d7_1(_d7_state(cl={"iliac_diam": {}}))
+        assert outcome.verdicts["D7.1.R03"] is False
+        assert outcome.verdicts["D7.1.R91"] is True
+        assert outcome.next_node == "D7.2"
+
+    def test_side_without_segment_is_unresolved(self) -> None:
+        """只有「左侧」不知道哪一段 —— 不猜，转人工复核。"""
+        outcome = d7_1(_d7_state(cl={"iliac_site": ["左侧"]}))
+        assert outcome.verdicts["D7.1.R90"] is True
+        assert outcome.terminal is not None and "人工复核" in outcome.terminal
+
+    def test_segment_without_side_is_unresolved(self) -> None:
+        """只有「CIA」不知道哪一侧 —— 同上。"""
+        outcome = d7_1(_d7_state(cl={"iliac_site": ["CIA"]}))
+        assert outcome.verdicts["D7.1.R90"] is True
+
+    def test_explicit_no_iliac_aneurysm_does_not_block(self) -> None:
+        """明确写「无」不是「判不了」—— R90 为 False，落到全局兜底。"""
+        outcome = d7_1(_d7_state(cl={"iliac_site": ["无"]}))
+        assert outcome.verdicts["D7.1.R90"] is False
+        assert outcome.terminal is not None and "人工复核" in outcome.terminal
+
+    def test_rupture_escalates(self) -> None:
+        outcome = d7_1(_d7_state(cl={"aaa_rupture": "明确"}))
+        assert outcome.verdicts["D7.1.R01"] is True
+        assert outcome.escalation == "G05"
+
+    def test_shock_escalates(self) -> None:
+        case = make_case(cl={"iliac_site": ["右侧", "IIA"], "diag_multi": None}, v={"sbp": 70.0})
+        outcome = d7_1(GuidelineState(case=case, route=route(case), node_inputs={}))
+        assert outcome.verdicts["D7.1.R01"] is True
+        assert outcome.escalation == "G05"
+
+    def test_unresolved_rupture_status_blocks(self) -> None:
+        outcome = d7_1(_d7_state(cl={"aaa_rupture": "无法评价"}))
+        assert outcome.verdicts["D7.1.R90"] is True
+        # 「无法评价」不是「未见」—— R01 只能给 UNKNOWN，不能给 False
+        assert outcome.verdicts["D7.1.R01"] is not True
+
+    def test_pseudoaneurysm_goes_to_d5(self) -> None:
+        outcome = d7_1(_d7_state(cl={"pseudo": "明确"}))
+        assert outcome.verdicts["D7.1.R05"] is True
+        assert outcome.next_node == "D5.1"
+
+    def test_infection_goes_to_d4(self) -> None:
+        outcome = d7_1(_d7_state(cl={"infection": "原生感染明确"}))
+        assert outcome.verdicts["D7.1.R05"] is True
+        assert outcome.next_node == "D4.1"
+
+    def test_doctor_infection_judgement_also_routes_to_d4(self) -> None:
+        """``CL.INFECTION`` 写「无证据」、但医生在 ``N.INFECTION_CTX`` 写「高度怀疑」。
+
+        D4 与 D6 都把这种病例当感染处理（``_infection_signal`` / ``_infection_suspected``
+        读医生判断）。D7 若只看分型字段，会把它当退变性病变一路走到 D7.3，
+        在报告里给出「髂动脉腔内修复：可行候选」——与 D4 的「EVAR 仅作桥接」相反。
+        """
+        outcome = d7_1(_d7_state(cl={"infection": "无证据"}, n={"infection_ctx": "高度怀疑"}))
+        assert outcome.verdicts["D7.1.R05"] is True
+        assert outcome.next_node == "D4.1"
+
+    def test_postop_anastomotic_goes_to_d6(self) -> None:
+        outcome = d7_1(
+            _d7_state(
+                n={"prev_repair": "EVAR"},
+                d7={"D7.ANEURYSM_TYPE": ["术后吻合口旁"]},
+            )
+        )
+        assert outcome.verdicts["D7.1.R05"] is True
+        assert outcome.next_node == "D6.1"
+
+    def test_r05_entry_records_the_actual_target(self) -> None:
+        """留痕里的去向必须与实际一致 —— 否则报告说「去 D4.1」而实际去了 D5.1。"""
+        outcome = d7_1(_d7_state(cl={"pseudo": "明确"}))
+        entry = next(e for e in outcome.entries if e.rule_id == "D7.1.R05")
+        assert entry.next_node == outcome.next_node == "D5.1"
+
+    def test_repair_history_alone_does_not_trigger_r05(self) -> None:
+        """有修复史 ≠ 吻合口旁瘤：类型没记录时只进缺口，不改道。"""
+        outcome = d7_1(_d7_state(n={"prev_repair": "EVAR"}))
+        assert outcome.verdicts["D7.1.R05"] is False
+        assert outcome.next_node == "D7.2"
+
+    def test_aaa_comorbidity_is_display_only(self) -> None:
+        """合并 AAA 是并行信号，不是改道 —— R02 留痕为真，出口仍是 D7.2。"""
+        outcome = d7_1(_d7_state(cl={"aaa_reported": "确认"}))
+        assert outcome.verdicts["D7.1.R02"] is True
+        assert outcome.next_node == "D7.2"
+        assert any("D1/D2/D3 病种并行" in gap for gap in outcome.gaps)
+
+    def test_repaired_aaa_is_not_a_current_comorbidity(self) -> None:
+        """「既往已修复」不等于当前并存 AAA（规格 CL.AAA_REPORTED 原话）。"""
+        case = make_case(
+            cl={"iliac_site": ["左侧", "CIA"], "aaa_reported": "未述及", "diag_multi": None},
+            d={"dx_context": "既往已修复"},
+        )
+        state = GuidelineState(case=case, route=route(case), node_inputs={})
+        assert d7_1(state).verdicts["D7.1.R02"] is not True
+
+    def test_symptom_is_display_only(self) -> None:
+        """有症状改变的是「阈值还成不成立」，不是「去哪」。"""
+        outcome = d7_1(_d7_state(d7={"D7.SYMPTOM_COMPRESSION": ["盆腔/腹股沟疼痛"]}))
+        assert outcome.verdicts["D7.1.R04"] is True
+        assert outcome.next_node == "D7.2"
+
+
+class TestD72ThresholdAndSurveillance:
+    """D7.2 的两条硬口径：40 mm 是修复评估入口，监测间隔按 Rec134 三档。"""
+
+    def test_40mm_goes_to_d73(self) -> None:
+        outcome = d7_2(_d7_state(cl={"iliac_diam": {"左侧CIA": 40.0}}))
+        assert outcome.verdicts["D7.2.R02"] is True
+        assert outcome.next_node == "D7.3"
+
+    def test_39mm_stays_in_surveillance(self) -> None:
+        outcome = d7_2(_d7_state(cl={"iliac_diam": {"左侧CIA": 39.0}}))
+        assert outcome.verdicts["D7.2.R03"] is True
+        assert outcome.terminal is not None and "每年超声随访" in outcome.terminal
+
+    def test_28mm_gets_the_two_year_interval(self) -> None:
+        outcome = d7_2(_d7_state(cl={"iliac_diam": {"左侧CIA": 28.0}}))
+        assert outcome.terminal is not None and "每 2 年超声随访" in outcome.terminal
+
+    def test_22mm_gets_the_three_year_interval(self) -> None:
+        outcome = d7_2(_d7_state(cl={"iliac_diam": {"左侧CIA": 22.0}}))
+        assert outcome.terminal is not None and "每 3 年超声随访" in outcome.terminal
+
+    def test_18mm_does_not_use_the_standard_interval(self) -> None:
+        outcome = d7_2(_d7_state(cl={"iliac_diam": {"左侧CIA": 18.0}}))
+        assert outcome.verdicts["D7.2.R07"] is True
+        assert outcome.terminal is not None and "不套用既定间隔" in outcome.terminal
+
+    def test_symptom_below_threshold_goes_to_d73(self) -> None:
+        """未达 40 mm 但有症状 → 不自动进普通监测（R06 是 P0-A）。"""
+        outcome = d7_2(
+            _d7_state(
+                cl={"iliac_diam": {"左侧CIA": 28.0}},
+                d7={"D7.SYMPTOM_COMPRESSION": ["神经压迫"]},
+            )
+        )
+        assert outcome.verdicts["D7.2.R06"] is True
+        assert outcome.next_node == "D7.3"
+
+    def test_complex_etiology_below_threshold_goes_to_d73(self) -> None:
+        outcome = d7_2(
+            _d7_state(
+                cl={"iliac_diam": {"左侧CIA": 28.0}, "pseudo": "疑似"},
+            )
+        )
+        assert outcome.verdicts["D7.2.R06"] is True
+        assert outcome.next_node == "D7.3"
+
+    def test_r06_does_not_shadow_r02_above_threshold(self) -> None:
+        """R06 的判据带「低于阈值」前提，否则达阈值的病例会全被它截走。"""
+        outcome = d7_2(
+            _d7_state(
+                cl={"iliac_diam": {"左侧CIA": 45.0}},
+                d7={"D7.SYMPTOM_COMPRESSION": ["栓塞"]},
+            )
+        )
+        assert outcome.verdicts["D7.2.R06"] is False
+        assert outcome.verdicts["D7.2.R02"] is True
+
+    def test_acute_ischemia_escalates_and_still_reaches_d73(self) -> None:
+        """急症回流与术式评估是「同时」，不是「改道」。"""
+        outcome = d7_2(
+            _d7_state(
+                cl={"iliac_diam": {"左侧CIA": 28.0}},
+                d7={"D7.SYMPTOM_COMPRESSION": ["急性肢体缺血"]},
+            )
+        )
+        assert outcome.escalation == "G03"
+        assert outcome.next_node == "D7.3"
+
+    def test_incomparable_growth_asks_for_remeasure(self) -> None:
+        outcome = d7_2(_d7_state(d7={"D7.GROWTH_RATE": "不可比"}))
+        assert outcome.verdicts["D7.2.R05"] is True
+        assert outcome.terminal is not None and "不可比" in outcome.terminal
+
+    def test_comparable_growth_does_not_trigger_remeasure(self) -> None:
+        """R05 的判据是「不可比才命中」—— 取反写错会让每个病例都被打回复测。"""
+        outcome = d7_2(_d7_state())
+        assert outcome.verdicts["D7.2.R05"] is False
+        assert outcome.verdicts["D7.2.R03"] is True
+
+    def test_missing_method_asks_for_remeasure(self) -> None:
+        outcome = d7_2(_d7_state(d7={"D7.DIAM_METHOD": None, "D7.GROWTH_RATE": None}))
+        assert outcome.verdicts["D7.2.R04"] is True
+        assert outcome.terminal is not None and "复测" in outcome.terminal
+
+    def test_missing_diameter_blocks(self) -> None:
+        outcome = d7_2(_d7_state(cl={"iliac_diam": {}}))
+        assert outcome.verdicts["D7.2.R90"] is True
+        assert outcome.terminal is not None and "人工复核" in outcome.terminal
+
+    def test_unrecorded_symptom_blocks(self) -> None:
+        outcome = d7_2(_d7_state(d7={"D7.SYMPTOM_COMPRESSION": ["未知"]}))
+        assert outcome.verdicts["D7.2.R90"] is True
+
+    def test_life_expectancy_modifies_the_plan(self) -> None:
+        outcome = d7_2(_d7_state(d7={"D7.LIFE_EXPECTANCY": "有限"}))
+        assert outcome.terminal is not None and "寿命预期有限" in outcome.terminal
+
+    def test_limited_surveillance_eligibility_prompts_discussion(self) -> None:
+        outcome = d7_2(_d7_state(d7={"D7.SURVEILLANCE_ELIGIBILITY": "有限"}))
+        assert outcome.terminal is not None and "实际获益有限" in outcome.terminal
+
+    def test_patient_preference_reaches_the_plan(self) -> None:
+        outcome = d7_2(_d7_state(d7={"D7.PREFERENCE": "倾向修复"}))
+        assert outcome.terminal is not None and "共同决策" in outcome.terminal
+
+    def test_single_segment_is_flagged(self) -> None:
+        """只测了一段 → 最大径可能取自非目标段，必须提示逐段测量。"""
+        outcome = d7_2(_d7_state(cl={"iliac_diam": {"左侧CIA": 28.0}}))
+        assert any("只记录了 1 个血管段" in gap for gap in outcome.gaps)
+
+    def test_maximal_segment_decides_the_threshold(self) -> None:
+        """多段并存时取最大段 —— 38 mm 与 41 mm 并存要判达阈值。"""
+        outcome = d7_2(_d7_state(cl={"iliac_diam": {"左侧CIA": 41.0, "右侧CIA": 22.0}}))
+        assert outcome.verdicts["D7.2.R02"] is True
+
+
+class TestD73Candidates:
+    """D7.3 的三列候选 + 盆腔灌注保护这条硬线。"""
+
+    def test_all_conditions_met_lists_feasible_endovascular(self) -> None:
+        outcome = d7_3(_d7_state())
+        status = {c.procedure: c.status for c in outcome.candidates}
+        assert status["髂动脉腔内修复"] is CandidateStatus.FEASIBLE
+
+    def test_seal_insufficient_excludes_endovascular(self) -> None:
+        outcome = d7_3(_d7_state(d7={"D7.TARGET_SEAL": "不足"}))
+        status = {c.procedure: c.status for c in outcome.candidates}
+        assert status["髂动脉腔内修复"] is CandidateStatus.EXCLUDED
+
+    def test_bilateral_occlusion_excludes_endovascular(self) -> None:
+        outcome = d7_3(_d7_state(n={"access_occlusion": "双侧闭塞"}))
+        status = {c.procedure: c.status for c in outcome.candidates}
+        assert status["髂动脉腔内修复"] is CandidateStatus.EXCLUDED
+
+    def test_bilateral_iia_without_a_plan_pauses_for_mdt(self) -> None:
+        outcome = d7_3(
+            _d7_state(
+                n={"iliac_bilat": "双侧"},
+                d7={"D7.PELVIC_PLAN": "未确定", "D7.IIA_PRESERVATION": "未定"},
+            )
+        )
+        assert outcome.verdicts["D7.3.R03"] is True
+        assert outcome.terminal is not None and "MDT" in outcome.terminal
+
+    def test_bilateral_iia_with_a_branch_plan_proceeds(self) -> None:
+        outcome = d7_3(
+            _d7_state(
+                n={"iliac_bilat": "双侧"},
+                d7={"D7.PELVIC_PLAN": "分支器械"},
+            )
+        )
+        assert outcome.verdicts["D7.3.R03"] is False
+
+    def test_pelvic_risk_downgrades_a_feasible_candidate(self) -> None:
+        """内髂方案没定，「可行」就建立在一个未成立的前提上 —— 降为条件性。"""
+        outcome = d7_3(
+            _d7_state(
+                n={"iliac_bilat": "双侧"},
+                d7={"D7.PELVIC_PLAN": "未确定", "D7.IIA_PRESERVATION": "未定"},
+            )
+        )
+        status = {c.procedure: c.status for c in outcome.candidates}
+        assert status["髂动脉腔内修复"] is CandidateStatus.CONDITIONAL
+
+    def test_ifu_verified_makes_branch_feasible(self) -> None:
+        outcome = d7_3(_d7_state())
+        status = {c.procedure: c.status for c in outcome.candidates}
+        assert status["髂分支器械（IBE/IBD）"] is CandidateStatus.FEASIBLE
+
+    def test_ifu_unverified_makes_branch_conditional(self) -> None:
+        outcome = d7_3(_d7_state(d7={"D7.IBE_IFU": "CE；X 型号；IFU v2.1；未核验"}))
+        status = {c.procedure: c.status for c in outcome.candidates}
+        assert status["髂分支器械（IBE/IBD）"] is CandidateStatus.CONDITIONAL
+
+    def test_ifu_not_matching_is_false_not_unknown(self) -> None:
+        """「不符合」里含「符合」—— 先判不符合再判符合，否则每个都成「适配」。"""
+        from src.tools.guideline_engine.nodes.d7_iliac import _ifu_ok
+
+        state = _d7_state(d7={"D7.IBE_IFU": "CE；X 型号；IFU v2.1；不符合"})
+        assert _ifu_ok(state) is False
+
+    def test_seal_blocked_offers_open_reconstruction(self) -> None:
+        outcome = d7_3(_d7_state(d7={"D7.TARGET_SEAL": "病变累及"}))
+        status = {c.procedure: c.status for c in outcome.candidates}
+        assert status["开放/杂交髂动脉重建"] is CandidateStatus.MDT
+
+    def test_no_open_indication_excludes_open(self) -> None:
+        outcome = d7_3(_d7_state())
+        status = {c.procedure: c.status for c in outcome.candidates}
+        assert status["开放/杂交髂动脉重建"] is CandidateStatus.EXCLUDED
+
+    def test_cta_unevaluable_withholds_all_candidates(self) -> None:
+        """连 CTA 都不可评价时，三列候选全是猜的 —— 空元组本身就是结论。"""
+        outcome = d7_3(_d7_state(n={"cta_status": "缺失"}))
+        assert outcome.verdicts["D7.3.R90"] is True
+        assert outcome.candidates == ()
+
+    @pytest.mark.parametrize("status", ["部分", "冲突"])
+    def test_incomplete_cta_gives_draft_candidates(self, status: str) -> None:
+        """CTA 部分可评价 / 结果冲突 —— 给草案，但必须说清「为什么是草案」。
+
+        修前：``R91`` 拿 ``cta_evaluable`` 当判据，这两种状态返回 ``None`` →
+        本节点一条规则都不命中 → 落到全局兜底，报告上是**通用「人工复核」文案 +
+        三条完整候选**。读者既看不出被复核的原因，也看不出候选来自残缺影像。
+        """
+        outcome = d7_3(_d7_state(n={"cta_status": status}))
+        assert outcome.verdicts["D7.3.R90"] is False
+        assert outcome.verdicts["D7.3.R04"] is True
+        assert outcome.terminal is not None and "候选草案" in outcome.terminal
+        assert outcome.candidates
+        assert any("部分可评价或结果冲突" in gap for gap in outcome.gaps)
+
+    def test_incomplete_cta_marks_candidates_conditional(self) -> None:
+        """草案里的候选只能是「条件性」——影像没看全，说「可行」越权。"""
+        outcome = d7_3(_d7_state(n={"cta_status": "部分"}))
+        statuses = {c.procedure: c.status for c in outcome.candidates}
+        assert statuses["髂动脉腔内修复"] is CandidateStatus.CONDITIONAL
+
+    def test_unverified_detail_gives_draft_only(self) -> None:
+        outcome = d7_3(_d7_state(d7={"D7.IBE_IFU": "未核验"}))
+        assert outcome.verdicts["D7.3.R90"] is False
+        assert outcome.verdicts["D7.3.R04"] is True
+        assert outcome.terminal is not None and "候选草案" in outcome.terminal
+
+    def test_symptom_note_reaches_the_gaps(self) -> None:
+        outcome = d7_3(_d7_state(d7={"D7.SYMPTOM_COMPRESSION": ["静脉压迫"]}))
+        assert any("不受 40 mm 阈值限制" in gap for gap in outcome.gaps)
+
+    def test_symptom_note_reaches_the_terminal(self) -> None:
+        """18 mm 但有压迫时，终点不能只写「术式方向已列出」——会被读成「按直径该修」。"""
+        outcome = d7_3(_d7_state(d7={"D7.SYMPTOM_COMPRESSION": ["输尿管梗阻"]}))
+        assert outcome.terminal is not None and "不依赖 40 mm 直径阈值" in outcome.terminal
+
+    def test_non_degenerative_lesion_is_capped_at_mdt(self) -> None:
+        """感染性/假性/吻合口旁：解剖再「合适」也不给「可行候选」。
+
+        否则报告会同时出现「髂动脉腔内修复：可行候选」与 D4 的「EVAR 仅作桥接」，
+        两条相反结论并列（规格 D7.1.R05：不按普通阈值独立决定）。
+        """
+        outcome = d7_3(_d7_state(cl={"infection": "原生感染明确"}))
+        statuses = {c.procedure: c.status for c in outcome.candidates}
+        assert statuses["髂动脉腔内修复"] is CandidateStatus.MDT
+        assert statuses["髂分支器械（IBE/IBD）"] is CandidateStatus.MDT
+        assert any("封顶在「需 MDT 评估」" in gap for gap in outcome.gaps)
+
+
+class TestD7ModelVocabGuards:
+    """规格写法 ≠ 模型 ``Literal`` —— 这些测试防「为对齐规格去改模型字面量」。
+
+    改模型字面量不会让任何测试变红（判定层用 ``eq`` 比对，写错只是恒 False），
+    所以必须显式钉死「模型实际收哪些值」。这条注释是给未来的自己看的：
+    **不要**为了让规则看起来「对得上规格」而改 ``Literal``。
+    """
+
+    def test_iliac_site_is_a_list_of_sides_and_segments(self) -> None:
+        """规格写复合值「左CIA」，模型是侧别+段两个元素。"""
+        with pytest.raises(ValidationError):
+            make_case(cl={"iliac_site": ["左CIA"]})
+        case = make_case(cl={"iliac_site": ["左侧", "CIA"]})
+        assert case.cl.iliac_site == ["左侧", "CIA"]
+
+    def test_iliac_diam_is_a_mapping_not_a_scalar(self) -> None:
+        with pytest.raises(ValidationError):
+            make_case(cl={"iliac_diam": 28.0})
+        case = make_case(cl={"iliac_diam": {"左侧CIA": 28.0}})
+        assert case.cl.iliac_diam == {"左侧CIA": 28.0}
+
+    def test_iia_has_no_suspected_value(self) -> None:
+        """规格有「可疑/不可评价」，模型只有四态。"""
+        with pytest.raises(ValidationError):
+            make_case(n={"iia_left": "可疑"})
+
+    def test_iliac_bilat_uses_buxiang_not_weizhi(self) -> None:
+        with pytest.raises(ValidationError):
+            make_case(n={"iliac_bilat": "未知"})
+        assert make_case(n={"iliac_bilat": "不详"}).n.iliac_bilat == "不详"
+
+    def test_aaa_reported_uses_queren_not_mingque(self) -> None:
+        """规格写「明确」，模型写「确认」—— 照规格抄会让 D7.1.R02 恒 False。"""
+        with pytest.raises(ValidationError):
+            make_case(cl={"aaa_reported": "明确"})
+        assert make_case(cl={"aaa_reported": "确认"}).cl.aaa_reported == "确认"
+
+
+class TestD7DegradedInputs:
+    """``D7.*`` 通道全空时不得崩，且结论必须落到「待补」而不是编一个默认值。"""
+
+    def test_d71_survives_an_empty_channel(self) -> None:
+        case = make_case(cl={"iliac_site": ["左侧", "CIA"], "diag_multi": None})
+        outcome = d7_1(GuidelineState(case=case, route=route(case), node_inputs={}))
+        assert outcome.next_node == "D7.2"
+        assert any("D7.SYMPTOM_COMPRESSION" in gap for gap in outcome.gaps)
+
+    def test_d72_with_an_empty_channel_reports_gaps(self) -> None:
+        case = make_case(
+            cl={"iliac_site": ["左侧", "CIA"], "iliac_diam": {"左侧CIA": 28.0}, "diag_multi": None}
+        )
+        outcome = d7_2(GuidelineState(case=case, route=route(case), node_inputs={}))
+        assert outcome.verdicts["D7.2.R90"] is True
+        assert any("D7.DIAM_METHOD" in gap for gap in outcome.gaps)
+
+    def test_d73_with_an_empty_channel_gives_draft_candidates(self) -> None:
+        case = make_case(
+            cl={"iliac_site": ["左侧", "CIA"], "iliac_diam": {"左侧CIA": 42.0}, "diag_multi": None}
+        )
+        outcome = d7_3(GuidelineState(case=case, route=route(case), node_inputs={}))
+        assert outcome.verdicts["D7.3.R04"] is True
+        assert outcome.candidates
+        assert any("D7.TARGET_SEAL" in gap for gap in outcome.gaps)
+
+    def test_site_falls_back_to_the_channel(self) -> None:
+        """模型字段为空时读通道 —— 评估时现场补录侧别/段的场景。"""
+        case = make_case(
+            cl={"iliac_site": None, "iliac_diam": {"左侧CIA": 28.0}, "diag_multi": None}
+        )
+        state = GuidelineState(
+            case=case,
+            route=route(case),
+            node_inputs={"CL": {"CL.ILIAC_SITE": ["左侧", "CIA"]}},
+        )
+        assert d7_1(state).next_node == "D7.2"
+
+    def test_diameters_fall_back_to_the_channel(self) -> None:
+        case = make_case(cl={"iliac_site": ["左侧", "CIA"], "iliac_diam": None, "diag_multi": None})
+        state = GuidelineState(
+            case=case,
+            route=route(case),
+            node_inputs={"CL": {"CL.ILIAC_DIAM": {"左侧CIA": 42.0}}},
+        )
+        assert d7_2(state).next_node == "D7.3"
+
+    def test_diameters_accept_a_single_number_in_the_channel(self) -> None:
+        """通道里写单个数字时归一成「未标注段」——不静默丢掉。"""
+        from src.tools.guideline_engine.nodes.d7_iliac import _iliac_diameter
+
+        case = make_case(cl={"iliac_site": ["左侧", "CIA"], "iliac_diam": None})
+        state = GuidelineState(
+            case=case, route=route(case), node_inputs={"CL": {"CL.ILIAC_DIAM": 41.0}}
+        )
+        assert _iliac_diameter(state) == ("未标注段", 41.0)
+
+    def test_empty_site_list_is_unresolved_not_negative(self) -> None:
+        outcome = d7_1(_d7_state(cl={"iliac_site": []}))
+        assert outcome.verdicts["D7.1.R90"] is True
+
+    def test_empty_symptom_list_is_unresolved(self) -> None:
+        outcome = d7_2(_d7_state(d7={"D7.SYMPTOM_COMPRESSION": []}))
+        assert outcome.verdicts["D7.2.R90"] is True
+
+    def test_aaa_context_confirms_the_comorbidity(self) -> None:
+        """报告未述及时看 D.DX_CONTEXT：确认/疑似都算并存。"""
+        case = make_case(
+            cl={"iliac_site": ["左侧", "CIA"], "aaa_reported": "未述及", "diag_multi": None},
+            d={"dx_context": "疑似"},
+        )
+        state = GuidelineState(case=case, route=route(case), node_inputs={})
+        assert d7_1(state).verdicts["D7.1.R02"] is True
+
+    def test_missing_iia_status_makes_pelvic_risk_unknown(self) -> None:
+        outcome = d7_3(_d7_state(n={"iia_left": None, "iia_right": None}))
+        assert outcome.verdicts["D7.3.R90"] is True
+        assert outcome.candidates == ()
+
+    def test_repair_history_without_a_type_is_named_in_the_gaps(self) -> None:
+        outcome = d7_1(_d7_state(n={"prev_repair": "EVAR"}, d7={"D7.ANEURYSM_TYPE": None}))
+        assert any("N.PREV_REPAIR 阳性" in gap for gap in outcome.gaps)
+
+    def test_plan_without_a_diameter_asks_for_measurement(self) -> None:
+        from src.tools.guideline_engine.nodes.d7_iliac import _surveillance_plan
+
+        case = make_case(cl={"iliac_site": ["左侧", "CIA"], "iliac_diam": {}})
+        plan = _surveillance_plan(GuidelineState(case=case, route=route(case)))
+        assert "直径未测" in plan
+
+    def test_plan_names_every_unrecorded_modifier(self) -> None:
+        """三个修饰项都没记时，计划要把它们逐项点名，而不是只给间隔。"""
+        outcome = d7_2(
+            _d7_state(
+                d7={
+                    "D7.LIFE_EXPECTANCY": None,
+                    "D7.SURVEILLANCE_ELIGIBILITY": None,
+                    "D7.PREFERENCE": "未讨论",
+                }
+            )
+        )
+        assert outcome.terminal is not None
+        assert "生命预期未评估" in outcome.terminal
+        assert "监测适宜性未评价" in outcome.terminal
+        assert "共同决策" in outcome.terminal
+
+    def test_bilateral_disease_with_a_branch_plan_keeps_the_candidate_feasible(self) -> None:
+        """有分支器械方案时 R03 不暂停，腔内仍是可行候选。
+
+        这条同时守住「不要再加一层降级」：R01/R06 的判据里已经含盆腔灌注前提，
+        再叠一次「双侧就降档」会把已经规划好保髂的病例误降。
+        """
+        outcome = d7_3(_d7_state(n={"iliac_bilat": "双侧"}, d7={"D7.PELVIC_PLAN": "分支器械"}))
+        statuses = {c.procedure: c.status for c in outcome.candidates}
+        assert outcome.verdicts["D7.3.R03"] is False
+        assert statuses["髂动脉腔内修复"] is CandidateStatus.FEASIBLE
+
+    def test_already_assessed_comorbidity_continues_the_d7_trunk(self) -> None:
+        """D4 标签已先跑过时，D7.1.R05 不再重复进入 —— 继续 D7 主干。"""
+        case = make_case(
+            cl={
+                "iliac_site": ["左侧", "CIA"],
+                "iliac_diam": {"左侧CIA": 38.0},
+                "infection": "原生感染明确",
+                "diag_multi": None,
+            }
+        )
+        report = run(ToolRequest(case=case, route_result=route(case), node_inputs={"D7": _D7_PLAN}))
+        assert "D4.1" in report.path
+        index = report.path.index("D7.1")
+        assert report.path[index + 1] == "D7.2"
+
+    def test_unassessed_comorbidity_is_named_as_skipped(self) -> None:
+        """目标病种本轮没跑过 → 直接进入它，并把「D7.2/D7.3 未执行」写进缺口。
+
+        端到端不可达：假性髂动脉瘤本身会让 ``G08`` 给出 D5 标签，D5 链在 D7 之前
+        就跑完了。所以这条守的是节点层的出口选择，走单测。
+        """
+        outcome = d7_1(_d7_state(cl={"pseudo": "明确"}))
+        assert outcome.next_node == "D5.1"
+        assert any("D7.2 与 D7.3 本轮未执行" in gap for gap in outcome.gaps)
+
+    def test_end_to_end_path_reaches_d73(self) -> None:
+        """42 mm 的髂动脉瘤：D7.1 → D7.2 → D7.3，一路跑通。"""
+        case = make_case(
+            cl={
+                "iliac_site": ["左侧", "CIA"],
+                "iliac_diam": {"左侧CIA": 42.0},
+                "aaa_reported": "否定",
+                "diag_multi": None,
+            }
+        )
+        report = run(ToolRequest(case=case, route_result=route(case), node_inputs={"D7": _D7_PLAN}))
+        # 基线病例的 AAA 42 mm 会同时拿到 D1 标签（G08 允许多病种），
+        # 所以只断言 D7 这三跳；D1 链跑不跑不影响本条要验的事。
+        assert report.path[-3:] == ("D7.1", "D7.2", "D7.3")
+        assert report.terminal is not None
+        assert report.candidates
+
+
+class TestD7InternalBranches:
+    """``D7`` 内部判据的边角分支 —— 多数被更高优先级规则遮蔽，只能单测。"""
+
+    def test_unrecorded_site_everywhere_is_unknown(self) -> None:
+        from src.tools.guideline_engine.nodes.d7_iliac import _iliac_confirmed
+
+        case = make_case(cl={"iliac_site": None, "diag_multi": None})
+        state = GuidelineState(case=case, route=route(case), node_inputs={})
+        assert _iliac_confirmed(state) is None
+
+    def test_other_measurement_method_is_incomparable(self) -> None:
+        from src.tools.guideline_engine.nodes.d7_iliac import _growth_comparable
+
+        assert _growth_comparable(_d7_state(d7={"D7.DIAM_METHOD": "其他"})) is False
+
+    def test_unrecorded_access_is_unknown(self) -> None:
+        from src.tools.guideline_engine.nodes.d7_iliac import _access_ok
+
+        assert _access_ok(_d7_state(n={"access_occlusion": None})) is None
+        assert _access_ok(_d7_state(n={"access_occlusion": "未知"})) is None
+
+    def test_a_named_side_alone_counts_as_a_preservation_plan(self) -> None:
+        """``PELVIC_PLAN`` 还没定，但 ``IIA_PRESERVATION`` 已写明保留哪侧 → 有方案。"""
+        from src.tools.guideline_engine.nodes.d7_iliac import _pelvic_protected
+
+        state = _d7_state(d7={"D7.PELVIC_PLAN": "未确定", "D7.IIA_PRESERVATION": "左侧保留"})
+        assert _pelvic_protected(state) is True
+
+    def test_ifu_text_without_a_verdict_is_unknown(self) -> None:
+        from src.tools.guideline_engine.nodes.d7_iliac import _ifu_ok
+
+        assert _ifu_ok(_d7_state(d7={"D7.IBE_IFU": "CE；X 型号"})) is None
+
+    def test_r03_yields_false_once_rupture_is_established(self) -> None:
+        """破裂时 R03 必须为 False —— 槽位上它本来就不会被求值（R01 先命中）。"""
+        from src.tools.guideline_engine.nodes.d7_iliac import _d71_r03
+
+        assert _d71_r03(_d7_state(cl={"aaa_rupture": "明确"})) is False
+
+    def test_r04_yields_false_when_the_method_is_recorded(self) -> None:
+        from src.tools.guideline_engine.nodes.d7_iliac import _d72_r04
+
+        assert _d72_r04(_d7_state()) is False
+
+    def test_r90_blocks_on_a_half_recorded_site(self) -> None:
+        from src.tools.guideline_engine.nodes.d7_iliac import _d72_r90
+
+        assert _d72_r90(_d7_state(cl={"iliac_site": ["左侧"]})) is True
+
+    def test_r90_blocks_on_an_unresolved_rupture(self) -> None:
+        from src.tools.guideline_engine.nodes.d7_iliac import _d72_r90
+
+        assert _d72_r90(_d7_state(cl={"aaa_rupture": "无法评价"})) is True
+
+    def test_r91_catches_a_case_whose_etiology_cannot_be_judged(self) -> None:
+        """病因整块判不了时 R03 给 None，由 R91 这个恒真兜底接住。"""
+        outcome = d7_2(
+            _d7_state(
+                cl={"pseudo": None, "infection": None},
+                n={"prev_repair": None},
+                d7={"D7.ANEURYSM_TYPE": None},
+            )
+        )
+        assert outcome.verdicts["D7.2.R03"] is None
+        assert outcome.verdicts["D7.2.R91"] is True
+        assert outcome.terminal is not None and "每 2 年超声随访" in outcome.terminal
+
+    def test_r04_triggers_on_an_undecided_pelvic_plan(self) -> None:
+        from src.tools.guideline_engine.nodes.d7_iliac import _d73_r04
+
+        state = _d7_state(
+            d7={"D7.TARGET_SEAL": "可用", "D7.PELVIC_PLAN": "未确定", "D7.IIA_PRESERVATION": "未定"}
+        )
+        assert _d73_r04(state) is True
+
+
+class TestClosingAdvice:
+    """``_closing_advice`` 的四条分支 —— 报告的最后一句话从哪来。"""
+
+    def _state(self, *outcomes):
+        from src.tools.guideline_engine.engine import _closing_advice
+        from src.tools.guideline_engine.state import GuidelineState
+
+        state = GuidelineState(case=make_case(), route=route(make_case()))
+        state.visited.extend(outcomes)
+        return _closing_advice(state)
+
+    def test_no_visit_yields_nothing(self) -> None:
+        assert self._state() is None
+
+    def test_the_last_terminal_wins(self) -> None:
+        from src.tools.guideline_engine.state import NodeOutcome
+
+        first = NodeOutcome(node_id="D1.1", verdicts={}, entries=(), terminal="先前的终点")
+        last = NodeOutcome(node_id="D1.2", verdicts={}, entries=(), terminal="末端终点")
+        assert self._state(first, last) == "末端终点"
+
+    def test_a_node_without_any_hit_yields_nothing(self) -> None:
+        """既没终点也没命中规则 —— 宁可空着，也不编一句。"""
+        from src.tools.guideline_engine.state import NodeOutcome
+
+        last = NodeOutcome(node_id="D1.2", verdicts={"D1.2.R91": None}, entries=())
+        assert self._state(last) is None
+
+    def test_an_escalation_only_node_speaks_for_itself(self) -> None:
+        from src.tools.guideline_engine.state import GuidelineEntry, NodeOutcome
+
+        entry = GuidelineEntry(
+            node_id="D1.2",
+            rule_id="D1.2.R05",
+            source_row="D1.2!9",
+            statement="某条判据成立 → 去某处",
+            verdict=True,
+        )
+        assert (
+            self._state(NodeOutcome(node_id="D1.2", verdicts={"D1.2.R05": True}, entries=(entry,)))
+            == "D1.2：某条判据成立 → 去某处"
+        )
+
+
+class TestEngineWideContracts:
+    """跨节点的结构契约 —— 单条规则都对、组合起来却断链的那类缺陷。"""
+
+    def test_report_terminal_names_the_last_node_that_escalated(self) -> None:
+        """末端节点只给回流信号时，终点必须描述**它**，不是上游节点的结论。
+
+        ``D4.1.R91``（无感染证据 → 回 G08）是 ``exit_kind="escalate"`` 且无
+        ``also_next``：它没有 ``terminal``。修复前报告会退回去取上一个带终点的
+        节点，于是「回 G08」的病例，末尾写的是 D1.1 的「特殊形态/病因：转 D5.3
+        或 D4.1 专项评估」——描述另一条分支，读者会当成结论。
+        """
+        case = make_case(
+            cl={
+                "iliac_site": ["左侧", "CIA"],
+                "iliac_diam": {"左侧CIA": 42.0},
+                "aaa_reported": "否定",
+                "diag_multi": None,
+                "infection": "无证据",
+            },
+            n={"infection_ctx": "高度怀疑"},
+        )
+        report = run(ToolRequest(case=case, route_result=route(case), node_inputs={"D7": _D7_PLAN}))
+        assert report.path[-1] == "D4.1"
+        assert report.terminal is not None
+        assert report.terminal.startswith("D4.1：")
+        assert "已回流 G08" in report.terminal
+
+    def test_infection_verdicts_are_monotonic_across_nodes(self) -> None:
+        """公共判据为真时，D4/D6/D7 三处都不得说「没有感染」。
+
+        三者问的是同一件事，只是各自在公共判据上多收或少收一档（D4 加影像组合
+        证据、D6 加「仅非特异征象」、D7 只用公共判据）。所以**不允许**出现
+        「公共判据说有、某个病种说没有」——那正是修复前 D7 的错。
+        """
+        from src.tools.guideline_engine.nodes.common import infection_typed
+        from src.tools.guideline_engine.nodes.d4_infected import _infection_signal
+        from src.tools.guideline_engine.nodes.d6_postop import _infection_suspected
+        from src.tools.guideline_engine.nodes.d7_iliac import _infection_present
+
+        samples = [
+            {"cl": {"infection": "无证据"}, "n": {"infection_ctx": "高度怀疑"}},
+            {"cl": {"infection": "无证据"}, "n": {"infection_ctx": "医师明确"}},
+            {"cl": {"infection": "原生感染疑似"}, "n": {"infection_ctx": "无相关征象"}},
+            {"cl": {"infection": "移植物感染疑似"}, "n": {"infection_ctx": "未知"}},
+            {"cl": {"infection": "无证据"}, "n": {"infection_ctx": "无相关征象"}},
+        ]
+        for overrides in samples:
+            case = make_case(**overrides)
+            state = GuidelineState(case=case, route=route(case))
+            typed = infection_typed(state)
+            if typed is True:
+                assert _infection_signal(state) is True, overrides
+                assert _infection_suspected(state) is True, overrides
+                assert _infection_present(state) is True, overrides
+
+    def test_every_next_exit_names_a_real_node(self) -> None:
+        """``exit_kind="next"`` 的 ``exit_value`` 必须是 ``NODES`` 里的键。
+
+        ``GuidelineEntry.next_node`` 直接取自这里，``engine._walk`` 拿它查
+        ``NODES``；查不到就报「该节点尚未实现」。所以写病种名（``"D4"``）而
+        不写节点键（``"D4.1"``），报告里就会出现一条**根本不存在的缺口**。
+        D7.1.R05 曾犯过这个错，靠运行期 ``replace`` 兜住 —— 声明与行为不一致，
+        改一处兜底就漏。
+        """
+        import importlib
+        import pkgutil
+
+        import src.tools.guideline_engine.nodes as nodes_pkg
+
+        bad: list[str] = []
+        for info in pkgutil.iter_modules(nodes_pkg.__path__):
+            module = importlib.import_module(f"{nodes_pkg.__name__}.{info.name}")
+            for attr, value in vars(module).items():
+                if not attr.endswith("_SLOTS"):
+                    continue
+                for slot in value:
+                    if slot.exit_kind == "next" and slot.exit_value not in NODES:
+                        bad.append(f"{slot.rule_id} -> {slot.exit_value}")
+        assert bad == []
+
+    def test_every_case_field_read_is_declared_as_consumed(self) -> None:
+        """代码里读的 ``case.<域>.<字段>`` 必须出现在 ``SPEC.consumes``。
+
+        ``consumes`` 是输入契约：上游改字段名时靠它判断影响面。漏声明的字段
+        一旦改名，工具A 会静默读到 ``None``，规则全部退化成「判不了」而不报错。
+        （反向不检查：``case.inf.*`` 与 ``iia_left/right`` 是经 ``getattr`` 动态
+        读的，正则抓不到 —— 那种情况由字段存在性断言覆盖。）
+        """
+        import pathlib
+        import re
+
+        from src.tools.guideline_engine.spec import SPEC
+
+        root = pathlib.Path(__file__).resolve().parents[1] / "src/tools/guideline_engine/nodes"
+        pattern = re.compile(r"state\.case\.([a-z]+)\.([a-z_0-9]+)")
+        used = {
+            f"case.{m.group(1)}.{m.group(2)}"
+            for path in root.glob("*.py")
+            for m in pattern.finditer(path.read_text(encoding="utf-8"))
+        }
+        assert sorted(used - set(SPEC.consumes)) == []

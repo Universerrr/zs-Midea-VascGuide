@@ -108,5 +108,10 @@ def run_tool(
             f"{spec.label} 需要已路由出模式的病例；请在 router_layer 之后、且结论为「进入模式」时调用。"
         )
 
-    request = ToolRequest(case=case, route_result=result, upstream=upstream or {})
+    request = ToolRequest(
+        case=case,
+        route_result=result,
+        upstream=upstream or {},
+        node_inputs=state.get("node_inputs") or {},
+    )
     return RUNNER_BY_KEY[key](request)

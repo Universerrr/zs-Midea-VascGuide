@@ -191,8 +191,14 @@ def _format_validation_error(path: Path, exc: ValidationError) -> str:
     return "\n".join(lines)
 
 
-def _load_case(path: Path) -> VascCase:
-    """读病例 JSON → :class:`VascCase`。所有失败都转成 :class:`CaseLoadError`。"""
+def _load_case(path: Path) -> tuple[VascCase, dict[str, Any]]:
+    """读病例 JSON → ``(VascCase, node_inputs)``。所有失败转成 :class:`CaseLoadError`。
+
+    为什么要分成两个返回值：``node_inputs``（``D1.DIAM_METHOD`` 这类病种域字段）
+    **不能**进 ``VascCase`` —— 后者是路由专用且 ``extra="forbid"``，塞进去会被
+    拒绝；更根本的原因是它属于专科评估记录，不该混进路由输入。两者在 JSON 里
+    平级，读取时分开即可。
+    """
     if not path.exists():
         raise CaseLoadError(f"病例文件不存在：{path}")
     if not path.is_file():
@@ -215,8 +221,15 @@ def _load_case(path: Path) -> VascCase:
             f"{path} 的顶层必须是 JSON 对象（{{...}}），实际是 {type(data).__name__}"
         )
 
+    raw_inputs = data.pop("node_inputs", {})
+    if not isinstance(raw_inputs, dict):
+        raise CaseLoadError(
+            f"{path} 的 node_inputs 必须是 JSON 对象（按病种分组），"
+            f"实际是 {type(raw_inputs).__name__}"
+        )
+
     try:
-        return VascCase.model_validate(data)
+        return VascCase.model_validate(data), raw_inputs
     except ValidationError as exc:
         raise CaseLoadError(_format_validation_error(path, exc)) from exc
 
@@ -400,12 +413,16 @@ def _ensure_repo_root() -> None:
     os.chdir(REPO_ROOT)
 
 
-def _run(case: VascCase, args: argparse.Namespace) -> PreopRunResult:
+def _run(
+    case: VascCase, args: argparse.Namespace, node_inputs: dict[str, Any] | None = None
+) -> PreopRunResult:
     kwargs: dict[str, Any] = {}
     if args.no_persist:
         kwargs["checkpointer"] = None
     if args.thread_id:
         kwargs["thread_id"] = args.thread_id
+    if node_inputs:
+        kwargs["node_inputs"] = node_inputs
     return run_preop(case, **kwargs)
 
 
@@ -438,13 +455,13 @@ def main(argv: list[str] | None = None) -> int:
     _ensure_repo_root()
 
     try:
-        case = _load_case(Path(args.case))
+        case, node_inputs = _load_case(Path(args.case))
     except CaseLoadError as exc:
         print(f"✗ {exc}", file=sys.stderr)
         return 1
 
     try:
-        state = _run(case, args)
+        state = _run(case, args, node_inputs)
     except Exception as exc:  # noqa: BLE001 —— CLI 顶层兜底，必须给出可读消息
         print(f"✗ 运行失败：{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

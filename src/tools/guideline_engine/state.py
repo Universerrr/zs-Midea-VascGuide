@@ -149,16 +149,31 @@ class GuidelineState:
     case: VascCase
     route: RouteResult
     visited: list[NodeOutcome] = field(default_factory=list)
-    d3: Mapping[str, object] = field(default_factory=dict)
-    """病种域字段通道（``D3.*`` 等）。
+    node_inputs: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    """病种域字段通道，按病种前缀分组::
 
-    为什么单开一个 dict 而不是往 ``VascCase`` 加字段：``VascCase`` 是**路由专用**
-    （161 字段，进哈希），而病种域字段是工具A 的执行细节——``D3.ACCESS_PLAN``
-    「左右股髂直径/钙化/迂曲」这类既不影响路由，也不需要进路由哈希。
+        {"D1": {"D1.DIAM_METHOD": "超声AP内-内", "D1.MEASURE_VALID": "可比"},
+         "D3": {"D3.TEAM_RESOURCE": "…"}}
 
-    当前规格里这些字段**没有抽取来源**（G02 的抽取清单不含 ``D3.*``），所以生产
+    为什么单开一个通道而不是往 ``VascCase`` 加字段：``VascCase`` 是**路由专用**
+    （161 字段，进哈希），而病种域字段是专科评估时医生的记录——``D1.DIAM_METHOD``
+    既不影响路由，也不需要进路由哈希。
+
+    为什么按前缀分组：规格的字段 ID 自带病种前缀（``D1.`` / ``D3.``），分组让
+    「哪个节点的字段」在数据结构上就成立，不必靠调用方约定。
+
+    当前规格里这些字段**没有抽取来源**（G02 的抽取清单不含 ``D*.``），所以生产
     调用时通常为空；各节点据此报「待补关键资料」，而不是编一个默认值。
     """
+
+    def node_field(self, spec_id: str) -> object:
+        """按规格 ID 取病种字段值（``"D1.DIAM_METHOD"``）。
+
+        取不到返回 ``None`` —— 「未记录」与「记录为空」在本层不可区分，这与三值
+        语义一致：缺失只能产生 UNKNOWN，不能产生 ``False``。
+        """
+        prefix = spec_id.split(".", 1)[0]
+        return self.node_inputs.get(prefix, {}).get(spec_id)
 
     @property
     def entries(self) -> tuple[GuidelineEntry, ...]:

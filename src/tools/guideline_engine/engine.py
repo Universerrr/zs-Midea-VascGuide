@@ -61,6 +61,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ..base import ToolRequest
 from .registry import NODES, SPEC_NODE_SHEETS
 from .state import GuidelineReport, GuidelineState, NodeOutcome
@@ -127,13 +129,61 @@ def _walk(state: GuidelineState) -> None:
         outcome = fn(state)
         state.visited.append(outcome)
 
-        if (
-            outcome.terminal is None
-            and outcome.next_node
-            and outcome.next_node in NODES
-            and outcome.next_node not in seen
-        ):
-            queue.insert(0, outcome.next_node)
+        if outcome.terminal is not None or not outcome.next_node:
+            continue
+
+        target = outcome.next_node
+        if target in NODES:
+            if target not in seen:
+                queue.insert(0, target)
+            continue
+
+        # 下一节点尚未实现：把缺口挂在**当前节点**上，让它看得见。
+        #
+        # 为什么不静默跳过：D1.1 判出「达阈值 → 转 D1.2」，而 D1.2 还没写。若
+        # 直接 `continue`，输出里既没有 D1.2 的条目也没有任何提示，读者会以为
+        # 流程到此为止——而实际上它断在一个未实现的分支上。
+        #
+        # 为什么不往 ``path`` 里塞一个假节点：``path`` 的语义是「**真正执行过**
+        # 的节点」，未实现的节点没执行过，塞进去会让审计误以为跑过。
+        note = (
+            f"{target}：病种节点尚未实现"
+            f"（规格 {len(SPEC_NODE_SHEETS)} 个，当前已实现 {len(NODES)} 个）"
+        )
+        state.visited[-1] = replace(
+            outcome,
+            gaps=(*outcome.gaps, note),
+            # 补一个可读的终点：否则主建议会输出「病种流程未给出结论」，
+            # 而实际情况是「有结论，但下一站还没修好」。
+            terminal=outcome.terminal or f"待进入 {target}（该节点尚未实现）",
+        )
+
+
+def _closing_advice(state: GuidelineState) -> str | None:
+    """本次运行停在哪、为什么停——报告的 ``terminal``。
+
+    先看末端节点自己的 ``terminal``；没有就用它**命中的那条规则**拼一句。
+
+    为什么不能退回去找更早节点的 ``terminal``（修复前的写法）：14 条
+    ``exit_kind="escalate"`` 且无 ``also_next`` 的规则（``D1.1.R01`` 回 G03、
+    ``D4.3.R01`` 回 G05、``D4.1.R91`` 回 G08…）都只给回流信号、不给终点。
+    此时上游节点还留着它的终点，于是一份「无感染证据 → 回 G08」的病例，
+    报告末尾写的是 D1.1 的「特殊形态/病因：转 D5.3 或 D4.1 专项评估」——
+    描述的是另一条分支，读起来像结论，其实什么都没说。
+    """
+    if not state.visited:
+        return None
+
+    last = state.visited[-1]
+    if last.terminal:
+        return last.terminal
+
+    hit = next((entry for entry in last.entries if entry.verdict is True), None)
+    if hit is None:
+        return None
+    if last.escalation:
+        return f"{last.node_id}：{hit.statement}（已回流 {last.escalation}）"
+    return f"{last.node_id}：{hit.statement}"
 
 
 def run(request: ToolRequest) -> GuidelineReport:
@@ -152,14 +202,28 @@ def run(request: ToolRequest) -> GuidelineReport:
         · 病种节点未实现 → 记一条「未实现」缺口，继续处理其余标签；
         · 任何情况下都不写回 ``case`` —— 病种流程的产物属于本次运行。
     """
-    state = GuidelineState(case=request.case, route=request.route_result)
+    state = GuidelineState(
+        case=request.case,
+        route=request.route_result,
+        node_inputs=request.node_inputs,
+    )
     _walk(state)
 
     return GuidelineReport(
         entries=state.entries,
         gaps=state.gaps,
         path=state.path,
-        terminal=next((o.terminal for o in state.visited if o.terminal), None),
+        # 多病种标签时取**路径末端**的那个终点（见 ``_closing_advice``）。
+        #
+        # 为什么不取第一个：``G08`` 允许多标签，且标签顺序固定是 D1 → D7，
+        # 于是「D1 无症状 AAA + D4 感染」这类病例的 D1 链先跑完，它的终点是
+        # 「监测／随访」或「候选已列出」——那是**基础病种**的结论。真正决定本例
+        # 处置的是随后跑出来的附加病种结论（感染要控制感染源，不是继续监测）。
+        # 取末端节点即「本次运行实际停在哪里」，与 ``path`` 的语义一致。
+        #
+        # ``escalation`` 仍取第一个：它回答的是「要不要回流判定层」这件是非题，
+        # 多个节点同时给出回流信号时，最早的那个已经足以定性。
+        terminal=_closing_advice(state),
         escalation=next((o.escalation for o in state.visited if o.escalation), None),
         candidates=state.candidates,
     )

@@ -1047,10 +1047,25 @@ class TestGraphEndToEnd:
             assert previous.output_hash == following.input_hash
 
     def test_input_hash_covers_pure_input(self) -> None:
-        """首环输入哈希应等于「纯输入 case」的状态投影哈希。"""
+        """首环输入哈希 = 纯输入投影（``case`` + ``node_inputs``），不含派生量。"""
         case = make_case()
         trail = run_preop(case, checkpointer=None)["audit_trail"]
-        assert trail[0].input_hash == stable_hash(_project({"case": case}))
+        assert trail[0].input_hash == stable_hash(_project({"case": case, "node_inputs": {}}))
+
+    def test_node_inputs_change_the_input_hash(self) -> None:
+        """病种域字段是**输入事实**：填了不同的测量方法，输入哈希必须不同。
+
+        为什么守这一条：D1 的阈值结论取决于测量方法是否可比
+        （``D1.SEX_THRESHOLD_SOURCE``「仅有 CTA 外径不可直接套用超声阈值」）。
+        若它不进哈希，就成了「输入变了但审计看不出来」——复现时无法解释结论差异。
+        """
+        base = run_preop(make_case(), checkpointer=None)["audit_trail"][0].input_hash
+        filled = run_preop(
+            make_case(),
+            checkpointer=None,
+            node_inputs={"D1": {"D1.DIAM_METHOD": "超声AP内-内"}},
+        )["audit_trail"][0].input_hash
+        assert base != filled
 
     def test_hashes_are_reproducible_across_runs(self) -> None:
         """同输入 + 同规则版本 → 同哈希（时间戳不同不影响）。"""
@@ -1068,12 +1083,14 @@ class TestGraphEndToEnd:
         assert case.r.next is None
         assert case.k.classifiable is None
 
-    def test_tool_outputs_empty_reflects_real_gap(self) -> None:
+    def test_tool_outputs_reflect_gaps_without_inventing_conclusions(self) -> None:
+        """已实现节点给条目、未实现节点给缺口 —— 两者并存才是诚实状态。"""
         outputs = run_preop(make_case(), checkpointer=None)["tool_outputs"]
         assert set(outputs) == {"guideline_engine"}
-        # D1 标签 → D1.1 尚未实现 ⇒ 有缺口、无结论，绝不凭空编条目
-        assert outputs["guideline_engine"].entries == ()
-        assert outputs["guideline_engine"].gaps
+        report = outputs["guideline_engine"]
+        assert report.entries, "D1.1 已实现，应当产出条目"
+        # 未提供测量方法 → 阈值不可判 → 必须留缺口说明差什么
+        assert any("测量方法" in gap for gap in report.gaps)
 
 
 # ===========================================================================
