@@ -439,7 +439,7 @@ class TestVersionContract:
         这不是重复劳动 —— 它的作用是让「版本变了」成为一个需要人确认的动作，
         而不是顺手改一个常量就悄悄过关。
         """
-        assert RULESET_VERSION == "v362@v3.6.2"
+        assert RULESET_VERSION == "v362.2@v3.6.2"
 
     def test_spec_version_appears_in_ruleset_version(self) -> None:
         assert SPEC_VERSION in RULESET_VERSION

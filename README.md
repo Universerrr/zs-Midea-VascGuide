@@ -50,7 +50,8 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
   口径：170（169 + 补入 `N.ACCESS_TORTUOSITY`）− 7 判定产物 − 3 物化派生 = 160。
   域子模型共用一个 `_StrictDomain` 基类（`extra="forbid"`）：抽取层拼错字段名会立刻报错，
   而不是静默丢事实。
-- **规则**：`router.py` 就地重写为 **55 条判定规则**（G03 21 + G04 19 + G08 11 + G09 4）。
+- **规则**：`router.py` 就地重写为 **66 条判定规则**（G03 21 + G04 21 + G08 15 + G09 9；
+  其中 65 条对应 V3.6.2 规格，`G04.R21` 是工程补齐）。**V3.6.2 的 11 条新增已全部补齐**（`PENDING_RULES` 已清空）。
   G00–G02 的 9 条属「读取资料 / 证据质量 / 事实抽取」，归 LLM 抽取层，不进路由。
   `RULESET.md` 逐条登记 `rule_id ↔ 函数 ↔ V3.1(2) 源行`，测试守着两边不漂移。
 - **为什么要写进代码而不是数据表**：V3.1(2) 的判据是自然语言（「允许值」列一列四义、
@@ -62,7 +63,7 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 - **两个非规则标识**：`MANUAL.URGENCY`（医生置位 `urgency_flag` 越级）与
   `FALLBACK.VERIFY`（没有任何规则能判定 → 资料核实）。兜底不借 `G03.R15` / `G04.R14` 的 id，
   否则 `RULESET.md` 的出口列会说谎。
-- **验收标准**（不再是「测试全绿」这一条）：55 条规则的三态用例、161 字段契约断言、
+- **验收标准**（不再是「测试全绿」这一条）：66 条规则的三态用例、161 字段契约断言、
   架构守卫（判定层禁 LLM / 审计哈希链闭合 / 进哈希模型无时间戳）。
 
 ### ✅ 已完成
@@ -72,9 +73,9 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 | **术前数据模型（5 个）** | `VascCase`（**161 字段 / 14 个按域子模型**）、`VascMeasurement`、`AnatomyScore`、`RiskAssessment`、`FinalRecommendation` |
 | **枚举（2 个，各归其位）** | `FieldWriter`（写入者归责，定义在 `audit.py`）、`RouteMode`（路由模式三值，定义在 `recommendation.py`）。事实字段的取值域改用字段级 `Literal`（中文值直写）——V3.1(2) 的「允许值」列一列四义，单个 `StrEnum` 表达不了 |
 | **审计留痕结构** | `FieldProvenance`（字段原文出处 / 写入者 / 是否被人工覆写）、`UrgencyFlagAudit` |
-| **确定性规则层** | `router.py`（V3.1(2) 的 55 条判定规则 + 三值求值）+ `RULESET.md`（规则↔源行对照）+ `version.py`（规则版本），详见「四」 |
+| **确定性规则层** | `router.py`（V3.6.2 的 66 条判定规则 + 三值求值）+ `RULESET.md`（规则↔源行对照）+ `version.py`（规则版本），详见「四」 |
 | **编排层（LangGraph）** | 四层节点 `input → router → execution → output` 串成 `StateGraph` 并接 SQLite Checkpoint；每节点自动留痕（节点名 / 起止时间 / 输入输出哈希），审计链可**逐环校验**，详见「五」 |
-| **测试与工具链** | **1079 项测试**（86 路由基线 + 84 数据契约 + 115 编排层 + 220 规则分支 + 121 结论自证契约 + 12 CLI + 445 工具A）、`ruff` 无告警、覆盖率 **99%**（`router.py` 99%、`audit.py` 与 `recommendation.py` 100%、病种节点全部 ≥97%） |
+| **测试与工具链** | **1131 项测试**（86 路由基线 + 84 数据契约 + 126 编排层 + 220 规则分支 + 117 结论自证契约 + 12 CLI + 486 工具A）、`ruff` 无告警、覆盖率 **99%**（`router.py` 99%、`audit.py` 与 `recommendation.py` 100%、病种节点全部 ≥97%） |
 
 ### ⏳ 尚未开始
 
@@ -83,13 +84,22 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 
 **① 等外部资源（技术缺口）**
 
-- **工具A 已实现 D1–D7 全部 21 个病种节点（169 / 172 条规则）；B/C/D/E 仍未实现**（实现位置 `src/tools/<tool>.py`；工具A 是 `src/tools/guideline_engine/` 包）。未实现的工具都在
+- **工具A 已登记 D1–D7 全部 21 个病种节点、172 条规则；B/C/D/E 仍未实现**
+  **「登记」不等于「在真实路径上可执行」**，这两个数不要混：
+  **165 条在真实运行路径上可达**；**7 条结构上不可达**——
+  `D3.1.R03/R04`（`class_output` 含 `D3` 只来自 G03 九条，而那九条全部落在
+  `R01`/`R02` 的判据集合里，P0-A 命中即 return）、`D3.3.R01–R03/R90/R91`（规格该 sheet 的 M 列
+  每行都是「人工决策／医生确认／终点动作」，没有一条 `next_node`，系统只提供判据、
+  不自动进入）。**这 7 条的判据都是完整的**，只由单测覆盖。
+  另有 3 条从未在测试中命中但结构可达：`D1.1.R06` 手写条目不走规则机、
+  `D2.2.R91`/`D5.2.R91` 是恒真兜底（输入空间被前置规则分完，保留是为了新增字段时不漏兜底）（实现位置 `src/tools/<tool>.py`；工具A 是 `src/tools/guideline_engine/` 包）。未实现的工具都在
   自己的 `SPEC` 里写明了**具体缺什么**：指南引擎缺「接入哪部指南 + 条目结构化方式」、
   影像量化器缺「CTA 数据 + 分割与中心线算法」、解剖评分器与风险计算器缺「临床量表与模型系数」、
   记忆检索器缺「历史病例库与检索索引」。
   因此 `tool_outputs` 目前只含工具A 一项 —— **其余宁可空着，也不凭空造评分**。
   执行层已按路由模式调度（`execution_layer/plan.py` 的 `MODE_PLANS`）：
-  **急诊 ∅ / 指南 A+B / 复杂全量**，三者是包含关系，不是并列关系。
+  **急诊全 5 但全 `BEST_EFFORT`**（G05：按可用性取用，不等非必要分析）/ 指南 A+B `REQUIRED` /
+  复杂全量 `REQUIRED`，前者是后者的子集。
 
 **② 等临床口径（内容缺口）**
 
@@ -134,17 +144,17 @@ zs-Midea VascGuide/
 │   │   ├── intraop.py           # IntraOpIntent（预留，空占位）
 │   │   └── postop.py            # PostOpCase / FollowUpPlan / FollowUpStatus（预留，空占位）
 │   ├── rules/                   # ✅ 确定性规则层（详见「四」；无 __init__.py）
-│   │   ├── router.py            # ✅ 路由判定流水线（V3.1(2)：55 条判定规则 + 三值求值）
+│   │   ├── router.py            # ✅ 路由判定流水线（V3.6.2：66 条判定规则 + 三值求值）
 │   │   ├── version.py           # ✅ 规则版本号（RULESET_VERSION = v362@v3.6.2，进哈希）
-│   │   └── RULESET.md           # ✅ 55 条规则 ↔ 函数名 ↔ V3.1(2) 源行 对照表（防规格漂移）
+│   │   └── RULESET.md           # ✅ 66 条规则 ↔ 函数名 ↔ V3.6.2 源行 对照表（防规格漂移）
 │   ├── tools/                   # ✅ 5 个确定性工具（一工具一模块，全部未实现）
 │   │   ├── base.py              # ✅ ToolSpec / ToolRequest / MissingUpstreamError
-│   │   ├── guideline_engine/    # ✅ 工具A · 指南引擎（21 节点 / 172 条中已实现 21 / 169，差 D3.3 的三条裁决留痕规则）
+│   │   ├── guideline_engine/    # ✅ 工具A · 指南引擎（21 节点 / 172 条全部实现）
 │   │   │   ├── __init__.py      # ✅ 公开接口：只 re-export SPEC / run（零逻辑）
 │   │   │   ├── spec.py          # ✅ ToolSpec 实例（单列以避免 __init__ ↔ engine 循环导入）
 │   │   │   ├── engine.py        # ✅ 节点遍历（深度优先 + 去重）+ 出口汇总
 │   │   │   ├── state.py         # ✅ GuidelineState / NodeOutcome / GuidelineReport
-│   │   │   ├── registry.py      # ✅ 规格 21 sheet / 172 条 与 已实现规模 的对照
+│   │   │   ├── registry.py      # ✅ 规格 21 sheet / 172 条 的登记表 + 按 sheet 的计数校验
 │   │   │   └── nodes/           # 病种节点（按规格 sheet 分文件）
 │   │   │       ├── common.py    # ✅ 优先级求值（P0→P3）+ 缺口 + 出户口径
 │   │   │       ├── d1_asymptomatic.py # ✅ D1.1–D1.3（31 条全实现：阈值分层 / 获益风险 / 术式候选）
@@ -152,7 +162,7 @@ zs-Midea VascGuide/
 │   │   │       ├── d4_infected.py    # ✅ D4.1–D4.3（25 条全实现：感染分型 / 感染源控制 / MAGIC）
 │   │   │       ├── d5_special.py     # ✅ D5.1–D5.3（20 条全实现：特殊病变分诊 / 复杂性 / 炎症与形态）
 │   │   │       ├── d6_postop.py      # ✅ D6.1–D6.3（28 条全实现：术后分诊 / 内漏与瘤囊 / 结构与靶血管）
-│   │   │       └── d3_ruptured.py # ✅ D3.1–D3.3（20 条中实现 17 条）
+│   │   │       └── d3_ruptured.py # ✅ D3.1–D3.3（20 条全登记；D3.3 无自动入边，见模块注释）
 │   │   ├── imaging_quantifier.py # 工具B · 影像量化器（阻塞：CTA 数据 + 分割算法）
 │   │   ├── anatomy_scorer.py    # 工具C · 解剖评分器（阻塞：评分量表）
 │   │   ├── memory_retriever.py  # 工具D · 记忆检索器（阻塞：历史病例库）
@@ -182,9 +192,9 @@ zs-Midea VascGuide/
 │   ├── test_preop.py            # ✅ 86 项路由端到端基线（五出口 / 同桶优先级 / 标签）
 │   ├── test_model_contract.py   # ✅ 84 项数据契约（161 字段 / 不确定值白名单 / 严格模式）
 │   ├── test_preop_graph.py      # ✅ 115 项编排层 + 调度表 + 依赖排序 + Checkpoint 往返 + 架构守卫
-│   ├── test_router_branches.py  # ✅ 220 项规则分支（55 条逐条命中 + 三值语义 + 派生量）
+│   ├── test_router_branches.py  # ✅ 242 项规则分支（66 条逐条命中 + 三值语义 + 派生量）
 │   ├── test_router_note_contract.py # ✅ 121 项结论自证契约（rule_id / reason / gaps / trace）
-│   ├── test_guideline_engine.py # ✅ 445 项工具A 契约（D1–D7 七条路径 + 粒度红线 / 不越权 / 缺口可见）
+│   ├── test_guideline_engine.py # ✅ 486 项工具A 契约（D1–D7 七条路径 + 粒度红线 / 不越权 / 缺口可见）
 │   └── test_main.py             # ✅ 12 项 CLI 契约（错误提示可读性 / JSON 与文本同源 / 副作用边界）
 ├── cases/                       # 病例样例（JSON，直接喂给 main.py）
 │   └── example.json             # ✅ 完整病例：走指南模式、零缺口、含 3 条原文出处
@@ -227,9 +237,9 @@ zs-Midea VascGuide/
 
 | 文件 | 职责 | 状态 |
 |---|---|---|
-| `router.py` | 路由判定流水线（纯函数，无副作用、无 IO、无全局状态） | ✅ V3.1(2) 的 55 条判定规则（G03 21 / G04 19 / G08 11 / G09 4） |
+| `router.py` | 路由判定流水线（纯函数，无副作用、无 IO、无全局状态） | ✅ V3.6.2 的 66 条判定规则（G03 21 / G04 21 / G08 15 / G09 9） |
 | `version.py` | 规则版本号注册表（审计必需，进哈希） | ✅ `RULESET_VERSION = v362@v3.6.2` |
-| `RULESET.md` | 55 条规则 ↔ 函数名 ↔ V3.1(2) 源行 的对照表 | ✅ 与代码逐条对应（测试守着） |
+| `RULESET.md` | 66 条规则 ↔ 函数名 ↔ V3.6.2 源行 的对照表 | ✅ 与代码逐条对应（测试守着） |
 
 ### 2. 路由做什么（以及不做什么）
 

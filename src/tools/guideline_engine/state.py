@@ -109,6 +109,14 @@ class GuidelineEntry:
     statement: str
     verdict: Verdict
     next_node: str | None = None
+    priority: str | None = None
+    """规格里的优先级（``P0-A``/``P1``/``P2``/``P3``）；展示性规则为 ``None``。
+
+    为什么把它带进条目：出口规则用不上它（求值时已按优先级排序），但**输出层**
+    需要 —— 急诊五段式的「危险提示」就是「命中的 P0 规则」，而输出层不能
+    import ``src.tools``（工具层可替换）。不带这一项，展示层只能靠规则号前缀
+    猜哪条是危险规则，那是第二处判据。
+    """
 
 
 @dataclass(frozen=True, slots=True)

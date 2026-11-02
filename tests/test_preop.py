@@ -87,10 +87,6 @@ class TestEmergency:
         result = _route(v={"spo2": 91.0, "rr": 22.0, "sbp": 105.0, "hr": 95.0})
         assert (result.mode, result.rule_id) == (RouteMode.EMERGENCY, "G03.R10")
 
-    def test_no_enhanced_cta_with_clues(self) -> None:
-        result = _route(s={"syncope": "肯定"}, q={"cta_enhance": "不足"})
-        assert (result.mode, result.rule_id) == (RouteMode.EMERGENCY, "G03.R12")
-
     def test_severe_hypotension_without_known_aaa(self) -> None:
         """R20 不依赖是否已知 AAA —— 血压本身就是急症指征。"""
         result = _route(v={"sbp": 70.0})
@@ -108,6 +104,20 @@ class TestEmergency:
 # 二、人工复核（G03 → 人工复核）
 # ===========================================================================
 class TestReview:
+    def test_no_enhanced_cta_with_clues_goes_to_review(self) -> None:
+        """``G03.R12`` 影像不可靠 → **人工复核**，不是急诊模式。
+
+        V3.6.2 把它的出口从 ``G05`` 改成 ``REVIEW``（``G03!20``：「紧急复核，
+        不能降为常规」）。修前它进急诊模式，D3.2 会拿那份「增强不足」的 CTA
+        判出「解剖符合 EVAR」——用系统自己认为不可靠的影像给出术式方向。
+        这条测试守的是「不给候选」，所以断言 ``mode is None`` 与零工具产物。
+        """
+        result = _route(s={"syncope": "肯定"}, q={"cta_enhance": "不足"})
+        assert (result.kind, result.rule_id) == (RouteKind.REVIEW, "G03.R12")
+        assert result.mode is None
+        # 复核出口不预置病种标签：没有可靠影像就没有可进的病种流程。
+        assert "D3" not in result.class_output
+
     def test_hb_drop_comparable(self) -> None:
         result = _route(
             lab={"hb": 85.0, "hb_prev": 120.0, "hb_comparable": True, "hb_confound": False}
@@ -293,6 +303,22 @@ class TestComplex:
         result = _route(cl={"infection": "原生感染明确"}, n={"inflammatory_ctx": "影像高度提示"})
         assert result.mode is RouteMode.COMPLEX
         assert {"D4", "D5"} <= set(result.class_output)
+
+    def test_inflammation_with_unknown_infection_blocks_release(self) -> None:
+        """``G04.R18`` 标 P0-A：感染是否并存**未知**时不许放行到 G07。
+
+        修前它在「加分型」组，而该组的规格约定是「UNKNOWN 不算命中、也不阻断」。
+        于是一个炎症性 AAA 病人，只要感染状态没写，就会被当成低复杂择期处理。
+        V3.6.2 的缺失列明写「关键输入缺失/未知/冲突时转 VERIFY/REVIEW，不按阴性
+        处理」——它属于阻断型，不属于加分型。
+        """
+        blocked = _route(n={"inflammatory_ctx": "可疑", "infection_ctx": None})
+        assert blocked.mode is None
+        assert blocked.kind is RouteKind.VERIFY
+
+        # 对照：感染明确为无 → 不阻断，可进指南模式。
+        released = _route(n={"inflammatory_ctx": "可疑", "infection_ctx": "无相关征象"})
+        assert released.mode is RouteMode.GUIDELINE
 
     def test_same_bucket_takes_lowest_rule_id(self) -> None:
         """G03 的 P01 桶：造影剂外溢（R01）与低血压（R20）同时成立 → 取 R01。

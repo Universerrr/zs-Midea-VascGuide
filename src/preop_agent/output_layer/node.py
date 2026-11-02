@@ -62,8 +62,10 @@ from pydantic import BaseModel
 from ...models.preop.case import VascCase
 from ...models.preop.recommendation import (
     DecisionStep,
+    EmergencyBrief,
     EvidenceItem,
     FinalRecommendation,
+    RouteMode,
     ToolFinding,
 )
 from ...rules.router import RULES, RouteKind, RouteResult, RuleTrace, _read_path
@@ -106,7 +108,9 @@ DISEASE_LABELS: Final[dict[str, str]] = {
     "D3": "破裂／疑似破裂 AAA",
     "D4": "感染／相关瘘",
     "D5": "PAU／IMH／IAAD／囊状／假性／炎症性病变",
-    "D6": "术后并发症",
+    # 「术后并发症」是 D6 的一部分而不是它的全部：常规随访的术后病人没有
+    # 并发症，用「并发症」命名会让一句话结论读起来像已经确诊了。
+    "D6": "主动脉修复术后",
     "D7": "髂动脉瘤",
 }
 
@@ -368,6 +372,13 @@ def _build_primary_recommendation(result: RouteResult, tool_outputs: Mapping[str
         return f"人工复核：{result.reason}"
     if result.kind is RouteKind.VERIFY:
         return f"资料核实：{result.reason}"
+    if result.kind is RouteKind.NO_TARGET:
+        # 「查清了没有」与「查不清」是两句话：前者不需要人再复核分类，
+        # 只需要临床继续找其他病因。措辞照抄 G09.R07 的出口动作，不自拟。
+        return (
+            "无目标病变：目标主动脉及髂动脉区域已充分评价，未见本项目目标病变"
+            "（暂定；由临床团队继续其他病因诊断）"
+        )
 
     head = result.mode.value if result.mode is not None else "未定模式"
     diseases = (
@@ -409,6 +420,121 @@ def _build_treatment_options(tool_outputs: Mapping[str, Any]) -> list[str]:
     ]
 
 
+#: 交接接收方 ← 由哪个 ``D3.*`` 字段的状态决定。
+#:
+#: 只报「这一方确认了没有」，不写医嘱 —— 「通知手术室」是流程，不是本系统的
+#: 输出；系统能说的是「资源栏里有没有这一项」。
+_HANDOFF_SOURCES: tuple[tuple[str, str], ...] = (
+    ("血管外科（术者）· 手术室 · ICU", "D3.TEAM_RESOURCE"),
+    ("输血科（备血/大量输血）", "D3.BLOOD_PREP"),
+    ("麻醉（生理策略）", "D3.ANAESTHESIA_PLAN"),
+)
+
+#: 「已知事实」最多摘几条 —— 急诊场景下超过这个数读者不会往下看。
+_MAX_BRIEF_FACTS: Final = 6
+
+
+def _d3_input(node_inputs: Mapping[str, Any], spec_id: str) -> Any:
+    """取一个 ``D3.*`` 录入值；没有就是 ``None``（不猜、不补默认）。"""
+    channel = node_inputs.get("D3")
+    return channel.get(spec_id) if isinstance(channel, Mapping) else None
+
+
+def _build_danger(result: RouteResult, report: Any) -> list[str]:
+    """危险提示 —— 命中的 P0 规则，**照抄规格措辞**。
+
+    两处来源，都不重写文案：
+
+    · 路由层的触发规则（``RULES[rule_id].name`` 就是规格 F 列那句话）；
+    · 工具A 里 ``priority == "P0-A"`` 且命中为真的条目 —— 取 ``statement``
+      箭头**之前**那半句，规格的 statement 一律写成「条件 → 动作」，
+      前半句就是危险本身。
+
+    为什么不自己写「主动脉破裂，立即通知…」这类短句：那是诊疗建议文案，
+    属于项目三处留白之一，本层无权编写。照抄规格至少保证「说的和写的是同一句」。
+    """
+    lines: list[str] = []
+    spec = RULES.get(result.rule_id)
+    if spec is not None:
+        # 紧急级别（``明确危险/高度疑似/不能排除``）与病种层的 ``P0-A`` 是**两套刻度**，
+        # 放在同一位置会读成「同一件事的两个等级」。故级别放括号里做注。
+        lines.append(f"{spec.name}（{result.rule_id} · {result.emergency_level}）")
+
+    for entry in getattr(report, "entries", ()) or ():
+        if entry.priority != "P0-A" or entry.verdict is not True:
+            continue
+        head = str(entry.statement).split("→")[0].strip()
+        if head:
+            lines.append(f"{entry.priority}｜{head}（{entry.rule_id}）")
+    return lines
+
+
+def _vital_fact(case: VascCase) -> str | None:
+    """本次生命体征 —— 只报数值，**不判**是否达到休克阈值。
+
+    为什么放在「已知事实」而不是「危险提示」：判「SBP 70 算不算危险」是
+    ``router.SBP_SHOCK`` 的职责，展示层再做一次比较就是第二处判据。但数值本身
+    必须出现 —— 破裂病例的报告里看不到血压，等于让读者自己去翻病历。
+    """
+    parts: list[str] = []
+    if case.v.sbp is not None:
+        parts.append(f"收缩压 {case.v.sbp} mmHg")
+    if case.v.hr is not None:
+        parts.append(f"心率 {case.v.hr} 次/分")
+    if case.v.conscious_change is not None:
+        parts.append(f"意识状态 {case.v.conscious_change}")
+    return f"本次生命体征：{'；'.join(parts)}" if parts else None
+
+
+def _build_handoff(node_inputs: Mapping[str, Any]) -> list[str]:
+    """交接 —— 每个接收方「确认了没有」，按字段实际状态说，不编内容。"""
+    lines: list[str] = []
+    for role, spec_id in _HANDOFF_SOURCES:
+        value = _d3_input(node_inputs, spec_id)
+        status = "未记录 → 待确认" if value is None else f"已记录：{value}"
+        lines.append(f"{role}：{status}")
+    return lines
+
+
+def build_emergency_brief(
+    result: RouteResult,
+    tool_outputs: Mapping[str, Any],
+    evidence: Sequence[EvidenceItem],
+    node_inputs: Mapping[str, Any],
+    case: VascCase,
+) -> EmergencyBrief | None:
+    """急诊五段式出口 —— 只在急诊模式下生成，其余模式返回 ``None``。
+
+    为什么择期不给 ``None`` 以外的值：五段的结构是「先报危险」。择期病例没有
+    危险段可填，硬填一个空列表会让报告出现一个空标题，读者会理解成
+    「系统检查过，没有危险」——而实际上系统根本没做这项检查。
+    """
+    if result.mode is not RouteMode.EMERGENCY:
+        return None
+
+    report = tool_outputs.get("guideline_engine")
+    facts = [item.statement for item in evidence if item.statement]
+    vital = _vital_fact(case)
+    if vital is not None:
+        facts.insert(0, vital)
+    candidates = [
+        candidate.render()
+        for candidate in (getattr(report, "candidates", ()) or ())
+        if callable(getattr(candidate, "render", None))
+    ]
+    terminal = getattr(report, "terminal", None)
+
+    return EmergencyBrief(
+        danger=_build_danger(result, report),
+        known_facts=facts[:_MAX_BRIEF_FACTS],
+        # 缺口不截断：它就是「还差什么才能动手」的清单，少一条都是漏。
+        pending=list(getattr(report, "gaps", ()) or ()),
+        # 有候选就列候选；一个候选都没有时退到终点一句话，避免空段。
+        rapid_assessment=candidates or ([str(terminal)] if terminal else []),
+        handoff=_build_handoff(node_inputs),
+    )
+
+
 def output_node(state: PreopState) -> dict[str, Any]:
     """输出层节点：聚合出 :class:`FinalRecommendation`。
 
@@ -421,6 +547,9 @@ def output_node(state: PreopState) -> dict[str, Any]:
     """
     case = state["case"]
     result = state["route_result"]
+    # 证据链只算一次：``evidence_chain`` 与「已知事实」段读的是同一份，
+    # 各算一遍会让两处有机会分叉。
+    evidence = _build_evidence(case, result)
 
     recommendation = FinalRecommendation(
         case_id=case.case_id,
@@ -434,12 +563,21 @@ def output_node(state: PreopState) -> dict[str, Any]:
         treatment_options=_build_treatment_options(state.get("tool_outputs") or {}),
         confidence_level=result.confidence_level,
         manual_review_required=result.kind is RouteKind.REVIEW,
-        evidence_chain=_build_evidence(case, result),
+        evidence_chain=evidence,
         decision_path=_to_decision_steps(result.trace),
         # 工具产物 → 呈现条目；未跑的工具不出现在这里（不编造「跑了但没结果」）。
         tool_findings=build_tool_findings(state.get("tool_outputs") or {}),
         ruleset_version=result.ruleset_version,
         input_snapshot_hash=state.get("input_snapshot_hash"),
+        # 急诊五段式：危险提示 / 已知事实 / 待补关键资料 / 快速评估 / 交接。
+        # 择期与人工复核路径为 None（见 build_emergency_brief 的理由）。
+        emergency_brief=build_emergency_brief(
+            result,
+            state.get("tool_outputs") or {},
+            evidence,
+            state.get("node_inputs") or {},
+            case,
+        ),
         # 留白二：等主建议措辞经临床确认后再接 LLM 转译。
         translated_text=None,
     )

@@ -43,7 +43,9 @@ from src.rules.router import (
     route,
 )
 
-VALID_EXITS = {"G05", "G06", "G07", "人工复核", "资料核实"}
+VALID_EXITS = {"G05", "G06", "G07", "G08", "人工复核", "资料核实", "无目标病变"}
+"""规则行 M 列声明过的出口。``G08`` 只被 ``G04.R20`` 用（它属于分类阶段）；
+``无目标病变`` 只被 ``G09.R07`` 用（V3.6.2 新增的终末出口）。"""
 
 
 def verdict_of(rule_id: str, **overrides: object) -> bool | None:
@@ -55,11 +57,16 @@ def verdict_of(rule_id: str, **overrides: object) -> bool | None:
 # 一、注册表守卫
 # ===========================================================================
 class TestRuleRegistry:
-    def test_rule_count_is_55(self) -> None:
-        assert len(RULES) == 55
+    def test_rule_count_is_66(self) -> None:
+        """V3.6.2 判定层 65 条 + 工程补齐 1 条（``G04.R21``）= 66。
+
+        55 → 66 的变化全部来自规格升级：``G04.R19/R20``、``G08.R12–R15``、
+        ``G09.R05–R09`` 共 11 条，由 ``PENDING_RULES`` 清空来证明已补齐。
+        """
+        assert len(RULES) == 66
 
     @pytest.mark.parametrize(
-        ("domain", "expected"), [("G03", 21), ("G04", 19), ("G08", 11), ("G09", 4)]
+        ("domain", "expected"), [("G03", 21), ("G04", 21), ("G08", 15), ("G09", 9)]
     )
     def test_rule_count_per_domain(self, domain: str, expected: int) -> None:
         assert sum(1 for rid in RULES if rid.startswith(f"{domain}.")) == expected
@@ -112,11 +119,14 @@ class TestRuleRegistry:
         assert not missing, f"RULESET.md 缺：{missing}"
 
     def test_every_rule_is_reachable_in_pipeline(self) -> None:
-        """54 条都必须被某个编排桶调用；漏进桶 = 永远不执行。"""
+        """每条规则都必须被某个编排桶或显式调用点覆盖；漏进桶 = 永远不执行。"""
         covered = set(G03_P01) | set(G03_P02) | set(G03_P03) | set(G04_BLOCKING) | set(G04_EXTRA)
         covered |= set(G08_RULES)
-        covered |= {"G03.R15", "G04.R13", "G04.R14", "G08.R09", "G08.R10", "G08.R11"}
+        covered |= {"G03.R15", "G04.R13", "G04.R14", "G04.R19", "G04.R20"}
+        covered |= {"G08.R09", "G08.R10", "G08.R11", "G08.R12", "G08.R13", "G08.R14", "G08.R15"}
         covered |= {"G09.R01", "G09.R02", "G09.R03", "G09.R04"}
+        covered |= {"G09.R05", "G09.R06", "G09.R07", "G09.R08", "G09.R09"}
+        # G04.R20 在 ``_finish_mode`` 的分类阶段复记（出口写的就是 G08）
         missing = sorted(set(RULES) - covered)
         assert not missing, f"未进任何桶：{missing}"
 
@@ -138,8 +148,13 @@ class TestRuleSourceRegistry:
         assert not bad, bad
 
     def test_non_esvs_rules_carry_no_section(self) -> None:
-        """反向也要守：工程规则挂一个章节号，等于给自拟规则盖章成指南原文。"""
-        bad = [rid for rid, (kind, sec) in RULE_SOURCE.items() if kind != "ESVS原文" and sec]
+        """反向也要守：**工程规则**挂一个章节号，等于给自拟规则盖章成指南原文。
+
+        「其他指南」例外 —— 它本来就指别家指南的条款（ACC/AHA 推荐号、
+        ESVS 2026 VGEI 共识），章节号正是它可溯源的凭据。所以这里只查
+        ``工程安全规则``，不查 ``其他指南``。
+        """
+        bad = [rid for rid, (kind, sec) in RULE_SOURCE.items() if kind == "工程安全规则" and sec]
         assert not bad, bad
 
     def test_source_kind_distribution_matches_v36(self) -> None:
@@ -147,7 +162,7 @@ class TestRuleSourceRegistry:
         tally = {"ESVS原文": 0, "工程安全规则": 0, "其他指南": 0}
         for kind, _ in RULE_SOURCE.values():
             tally[kind] += 1
-        assert tally == {"ESVS原文": 29, "工程安全规则": 23, "其他指南": 3}
+        assert tally == {"ESVS原文": 31, "工程安全规则": 29, "其他指南": 6}
 
     def test_emergency_tier_is_mostly_engineering_rules(self) -> None:
         """G03 急诊层只有 6 条是 ESVS 原文 —— 这条断言的意义是防止有人
@@ -231,8 +246,13 @@ class TestThreeValuedPrimitives:
         assert _eq(None, "明确") is None
 
 
+#: 空病例上**应当**命中的规则 —— 它们回答的正是「什么都没有」这件事本身。
+#: ``G09.R08``：没有任何可信标签 → 未分类，这是正确结论，不是「未知当成成立」。
+EMPTY_CASE_HITS: frozenset[str] = frozenset({"G09.R08"})
+
+
 class TestUnknownDoesNotShortCircuit:
-    @pytest.mark.parametrize("rule_id", sorted(RULES))
+    @pytest.mark.parametrize("rule_id", sorted(set(RULES) - EMPTY_CASE_HITS))
     def test_empty_case_never_hits(self, rule_id: str) -> None:
         """空病例：所有规则都不得返回 True —— 未知绝不能当成立。"""
         verdict = RULES[rule_id].func(_Ctx(VascCase(case_id="EMPTY")))
@@ -363,9 +383,38 @@ HITS: list[tuple[str, dict[str, object]]] = [
     # ---- G09 收尾（4，R03/R04 另行测试）----
     ("G09.R01", {"k": {"new_urgent": "是"}}),
     ("G09.R02", {"q": {"idmatch": "不一致"}}),
+    # ---- V3.6.2 新增（9 条可直接命中；G09.R07/R09 见 STATEFUL_RULES）----
+    ("G04.R19", {"cl": {"prev_evor": "EVAR"}}),
+    ("G04.R20", {"n": {"inflammatory_ctx": "影像高度提示"}}),
+    ("G08.R12", {"cl": {"infection": "原生感染明确"}}),
+    ("G08.R13", {"cl": {"prev_evor": "EVAR"}}),
+    (
+        "G08.R14",
+        {
+            "cl": {
+                "aaa_reported": "否定",
+                "aaa_rupture": "未见相关证据",
+                "symptom_aaa": "无当前症状",
+                "infection": "无证据",
+                "fistula": "否",
+                "iliac_site": ["无"],
+                "prev_evor": "无",
+            }
+        },
+    ),
+    ("G08.R15", {"n": {"cta_status": "部分"}}),
+    ("G09.R05", {"cl": {"infection": "原生感染明确"}}),
+    ("G09.R06", {"cl": {"prev_evor": "EVAR"}, "n": {"endoleak_type": "I"}}),
+    ("G09.R08", {}),
 ]
 
-STATEFUL_RULES = frozenset({"G04.R14", "G08.R09", "G09.R03", "G09.R04"})
+STATEFUL_RULES = frozenset({"G04.R14", "G08.R09", "G09.R03", "G09.R04", "G09.R07", "G09.R09"})
+"""依赖前置运行时状态、无法用单个病例直接命中的规则。
+
+``G09.R07`` 读 ``no_target_candidate``（由 G08.R14 在分类阶段写入）；
+``G09.R09`` 读 ``labels``（多标签是前序规则累积的结果）。两者的命中证据
+由 ``TestMultilabelAndNoTarget`` 用完整 ``route()`` 覆盖。
+"""
 
 
 class TestEveryRuleHits:
@@ -562,6 +611,45 @@ class TestLabelsAndConfidence:
 
     def test_inflammatory_yields_d5_subtype(self) -> None:
         assert "D5" in route(make_case(n={"inflammatory_ctx": "影像高度提示"})).class_output
+
+    def test_suspected_rupture_gets_d3_label(self) -> None:
+        """``G03.R16`` 医生明确怀疑破裂 —— 该进 D3，不是「病种未分类」。
+
+        修前 ``class_output`` 只认 ``D3_EMERGENCY_RULES`` 那八条，R16 不在其中，
+        于是「医生写着疑似破裂」的病例进急诊模式后工具A 一个节点都跑不了，
+        输出退化成「病种未分类：病种流程未给出结论」。规格 D3 sheet 的对象
+        本就包含「疑似破裂」，这条必须归 D3。
+        """
+        result = route(make_case(d={"dx_context": "疑似"}))
+        assert result.rule_id == "G03.R16"
+        assert result.mode is RouteMode.EMERGENCY
+        assert result.class_output == ["D3"]
+
+    def test_graft_with_gi_bleed_gets_d6_label(self) -> None:
+        """``G03.R08`` 移植物史 + 消化道出血 —— 主动脉肠瘘是**术后**并发症。
+
+        归 D6 不是新判断：``D6.3.R01`` 的判据里本来就有 ``active_gi_bleed``，
+        ``D6.1`` 也把「感染/瘘」路由到 ``D6.3``。修前预置标签写死成 ``D3``，
+        这条根本拿不到标签。
+        """
+        result = route(make_case(d={"surg": ["EVAR"]}, s={"gi_bleed": ["黑便"]}, c={"graft": "有"}))
+        assert result.rule_id == "G03.R08"
+        assert result.mode is RouteMode.EMERGENCY
+        assert result.class_output == ["D6"]
+
+    def test_every_emergency_trigger_has_a_decided_label(self) -> None:
+        """``G03.P01`` 的每条规则都必须「有病种标签」或「明确登记无病种」。
+
+        这是防复发的那一条：留空与「忘了登记」在运行期看起来一样，
+        两者都会让工具A 静默空转。``router`` 的导入期自检守同一件事，
+        这里再从外部断言一次，确保自检本身没被悄悄删掉。
+        """
+        from src.rules.router import EMERGENCY_LABELS, EMERGENCY_NO_LABEL, G03_P01
+
+        undecided = set(G03_P01) - set(EMERGENCY_LABELS) - set(EMERGENCY_NO_LABEL)
+        assert undecided == set(), f"这些急诊规则命中后会空转：{sorted(undecided)}"
+        # 两侧不得重叠：同一规则既预置标签又声明「无病种」是自相矛盾。
+        assert set(EMERGENCY_LABELS) & set(EMERGENCY_NO_LABEL) == set()
 
     def test_genetic_does_not_add_d8(self) -> None:
         """遗传只作病因修饰标签，**不新增 D8**（D1–D7 编号必须保持）。"""

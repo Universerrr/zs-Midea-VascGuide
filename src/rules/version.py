@@ -24,7 +24,7 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 SPEC_VERSION: str = "v3.6.2"  # V3.6.2 规格：300 个字段 ID（首列去重）/ 246 条规则
 
-RULESET_VERSION: str = f"v362@{SPEC_VERSION}"
+RULESET_VERSION: str = f"v362.2@{SPEC_VERSION}"
 """当前生效的规则集版本。单一版本串，不再是 v1.x 的 table1+table2 复合串。
 
 变更必须 bump 本串并写 ``RULESET_CHANGELOG``：它进审计哈希，历史结论靠它复现。
@@ -34,6 +34,26 @@ RULESET_VERSION: str = f"v362@{SPEC_VERSION}"
 # 变更日志（审计用：说明每次 bump 的原因）
 # ---------------------------------------------------------------------------
 RULESET_CHANGELOG: dict[str, str] = {
+    "v362.2@v3.6.2": (
+        "判定层补齐 V3.6.2 的 11 条新增规则（2026-11-02）。"
+        "**新增**：G04.R19（既往修复无异常→G07/D6）、G04.R20（病因与主病种并存→G08）、"
+        "G08.R12（感染来源定档）、G08.R13（术后标签≠并发症确诊）、"
+        "G08.R14/R15（无目标病变/未分类候选）、G09.R05（分类中的感染/瘘）、"
+        "G09.R06（术后异常）、G09.R07/R08（无标签终审）、G09.R09（共存 vs 冲突）。"
+        "规则数 55→66（规格 65 + 工程补齐 1），PENDING_RULES 清空。"
+        "**出口变更**：(1) G03.R12 出口 G05→REVIEW —— 影像不可靠时不给术式方向；"
+        "(2) 新增 RouteKind.NO_TARGET「无目标病变」，NextNode 增同名出口，"
+        "OUTCOME_PRIORITY 中垫底（任何危险证据都不该被「没病」盖掉）。"
+        "**判据变更**：(3) G03.R04 收窄为「R16 前提 + 不稳定」，不再接受"
+        "「AAA+急性疼痛/晕厥」独立触发（那是 R05/R06 的事）；"
+        "(4) G08.R18 由加分型移入阻断型（P0-A，UNKNOWN 须阻断 G07 放行）；"
+        "(5) G08.R06 去掉 CL.POST_REASON 前置 —— 有 EVAR 史即进 D6，否则术后病人"
+        "被当成原发 AAA 拿到按直径的随访间隔；"
+        "(6) G08.R01/R02 增加「未做过修复」前置，避免术后病人同时得 D1+D6 双入口。"
+        "**源行重对齐**：V3.6.2 在 G04/G08/G09 前部插入新行，29 条规则的 source "
+        "整体后移，已按 Excel 实际行号逐条校正（check_rows 探针 0 偏差）。"
+        "影响面：规则数与路由结论均变，历史 checkpoint 不再可比。"
+    ),
     "v362@v3.6.2": (
         "对齐 V3.6.2 规格（2026-10-29）。**规格侧**：genetic_syndrome → N.GENETIC_CTX、"
         "inflammatory_evidence → N.INFLAMMATORY_CTX、D5.MALPERFUSION 与 C.MALPERFUSION "

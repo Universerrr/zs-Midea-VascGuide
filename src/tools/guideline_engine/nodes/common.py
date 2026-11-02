@@ -148,6 +148,7 @@ def evaluate_node(
                 statement=slot.statement,
                 verdict=verdict,
                 next_node=slot.also_next or (slot.exit_value if slot.exit_kind == "next" else None),
+                priority=slot.priority,
             )
         )
         if verdict is True:

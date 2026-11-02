@@ -1013,6 +1013,164 @@ class TestOutputLayer:
 # ===========================================================================
 # 端到端
 # ===========================================================================
+class TestEmergencyBrief:
+    """急诊五段式出口 —— 危险提示 / 已知事实 / 待补关键资料 / 快速评估 / 交接。"""
+
+    def _brief(self, *, d3: dict[str, Any] | None = None, case: VascCase | None = None):
+        case = case or make_case(
+            case_id="GRAPH-EMERG",
+            c={"extrav": "明确", "extrav_contig": "明确连续"},
+            q={"cta_enhance": "适当", "cta_phase": "动脉期"},
+            v={"sbp": 70.0, "hr": 120},
+        )
+        state: dict[str, Any] = {"case": case, "node_inputs": {"D3": d3 or {}}}
+        state.update(input_node(state))  # type: ignore[arg-type]
+        state.update(router_node(state))  # type: ignore[arg-type]
+        state.update(execution_node(state))  # type: ignore[arg-type]
+        return output_node(state)  # type: ignore[arg-type]
+
+    def test_an_emergency_case_fills_all_five_sections(self) -> None:
+        brief = self._brief(d3={"D3.TEAM_RESOURCE": "两者可用"})[
+            "final_recommendation"
+        ].emergency_brief
+        assert brief is not None
+        assert brief.danger
+        assert brief.known_facts
+        assert brief.pending
+        assert brief.rapid_assessment
+        assert brief.handoff
+
+    def test_an_elective_case_gets_no_brief(self) -> None:
+        """择期不给空壳 —— 空标题会被读成「查过，没有危险」。"""
+        recommendation = self._brief(case=make_rich_case())["final_recommendation"]
+        assert recommendation.route_mode is not RouteMode.EMERGENCY
+        assert recommendation.emergency_brief is None
+
+    def test_a_verify_case_gets_no_brief(self) -> None:
+        """资料核实也没有危险段 —— 它连模式都没进。"""
+        case = make_case(case_id="GRAPH-VERIFY", cl={"aaa_rupture": None})
+        recommendation = self._brief(case=case)["final_recommendation"]
+        assert recommendation.emergency_brief is None
+
+    def test_danger_names_the_triggering_router_rule(self) -> None:
+        """第一条危险提示来自判定层的触发规则，措辞取规格 F 列原文。"""
+        brief = self._brief()["final_recommendation"].emergency_brief
+        assert brief is not None
+        assert "G03.R01" in brief.danger[0]
+        assert RULES["G03.R01"].name in brief.danger[0]
+
+    def test_danger_includes_the_p0_guideline_entries(self) -> None:
+        """工具A 命中的 P0-A 条目也要出现 —— 它说的是「哪条判据成立」。"""
+        brief = self._brief()["final_recommendation"].emergency_brief
+        assert brief is not None
+        assert any(entry.startswith("P0-A｜") for entry in brief.danger)
+        assert any("D3.1.R0" in entry for entry in brief.danger)
+
+    def test_pending_mirrors_the_tool_gaps(self) -> None:
+        """待补段与工具A 的 gaps 同源 —— 两处都列会让读者对不上数。"""
+        update = self._brief()
+        report = update["final_recommendation"]
+        assert report.emergency_brief is not None
+        assert len(report.emergency_brief.pending) >= 1
+
+    def test_rapid_assessment_lists_the_candidates(self) -> None:
+        brief = self._brief(d3={"D3.TEAM_RESOURCE": "两者可用"})[
+            "final_recommendation"
+        ].emergency_brief
+        assert brief is not None
+        assert any(item.startswith("EVAR") for item in brief.rapid_assessment)
+
+    def test_handoff_reports_each_receiver_status(self) -> None:
+        """交接只说「这一方确认了没有」，不写具体人。"""
+        brief = self._brief(d3={"D3.TEAM_RESOURCE": "两者可用", "D3.BLOOD_PREP": "O 型 4U"})[
+            "final_recommendation"
+        ].emergency_brief
+        assert brief is not None
+        assert len(brief.handoff) == 3
+        assert any("已记录：两者可用" in line for line in brief.handoff)
+        assert any("已记录：O 型 4U" in line for line in brief.handoff)
+        assert any("未记录 → 待确认" in line for line in brief.handoff)
+
+    def test_vitals_lead_the_known_facts(self) -> None:
+        """破裂病例的报告里看不到血压，等于让读者自己翻病历。"""
+        brief = self._brief()["final_recommendation"].emergency_brief
+        assert brief is not None
+        assert brief.known_facts[0].startswith("本次生命体征：")
+        assert "70" in brief.known_facts[0]
+
+    def test_missing_vitals_produce_no_line(self) -> None:
+        case = make_case(
+            case_id="GRAPH-EMERG-NOVITAL",
+            c={"extrav": "明确", "extrav_contig": "明确连续"},
+            q={"cta_enhance": "适当", "cta_phase": "动脉期"},
+            v={"sbp": None, "hr": None, "conscious_change": None},
+        )
+        brief = self._brief(case=case)["final_recommendation"].emergency_brief
+        assert brief is not None
+        assert not any("本次生命体征" in fact for fact in brief.known_facts)
+
+    def test_the_brief_is_deterministic(self) -> None:
+        """五段里不得有随时间变化的字段 —— 它随最终建议进哈希。"""
+        first = self._brief()["final_recommendation"].emergency_brief
+        second = self._brief()["final_recommendation"].emergency_brief
+        assert first is not None and second is not None
+        assert first.model_dump() == second.model_dump()
+
+
+class TestEmergencyDiseaseEntry:
+    """急诊命中后**必须进得了病种流程** —— 它是「给出术式候选」的前提。
+
+    修前 ``class_output`` 只认八条破裂规则，而 ``G03.P01`` 有 13 条：另外 5 条
+    命中后工具A 一个节点都跑不了，``path`` 为空，主建议退化成
+    「急诊模式 · 病种未分类：病种流程未给出结论」——有危险提示，但没有术式方向。
+    那 5 条里两条是遗漏（``R16`` 疑似破裂、``R08`` 主动脉肠瘘），三条无病种可归。
+    """
+
+    def _run(self, case: VascCase) -> dict[str, Any]:
+        state: dict[str, Any] = {"case": case, "node_inputs": {}}
+        state.update(input_node(state))  # type: ignore[arg-type]
+        state.update(router_node(state))  # type: ignore[arg-type]
+        state.update(execution_node(state))  # type: ignore[arg-type]
+        state.update(output_node(state))  # type: ignore[arg-type]
+        return state
+
+    def test_suspected_rupture_reaches_the_d3_path(self) -> None:
+        """``G03.R16``：医生写「疑似破裂」→ 走 D3.1 → D3.2 并给得出候选。"""
+        state = self._run(make_case(case_id="GRAPH-R16", d={"dx_context": "疑似"}))
+        report = state["tool_outputs"]["guideline_engine"]
+        assert report.path[:2] == ("D3.1", "D3.2")
+        assert report.candidates, "疑似破裂必须给出 EVAR/OSR 两列候选"
+        assert "病种未分类" not in state["final_recommendation"].primary_recommendation
+
+    def test_graft_with_gi_bleed_reaches_the_d6_path(self) -> None:
+        """``G03.R08``：主动脉肠瘘属术后并发症，走 D6 并记 D6 的缺口。"""
+        state = self._run(
+            make_case(
+                case_id="GRAPH-R08",
+                d={"surg": ["EVAR"]},
+                s={"gi_bleed": ["黑便"]},
+                c={"graft": "有"},
+            )
+        )
+        report = state["tool_outputs"]["guideline_engine"]
+        assert report.path[0] == "D6.1"
+        assert any(gap.startswith("D6.") for gap in report.gaps)
+        assert "病种未分类" not in state["final_recommendation"].primary_recommendation
+
+    def test_a_general_emergency_has_no_disease_path_by_design(self) -> None:
+        """``G03.R20`` 严重低血压：确实无病种可归 —— 空转是边界，不是缺陷。
+
+        但危险提示必须照给：五段式的第一段只读路由结论，不依赖病种流程。
+        这条测试把「合理的空」与「该有却没有」区分开——前者不许被当成 bug 修掉。
+        """
+        state = self._run(make_case(case_id="GRAPH-R20", v={"sbp": 70.0, "hr": 118.0}))
+        report = state["tool_outputs"]["guideline_engine"]
+        assert report.path == ()
+        brief = state["final_recommendation"].emergency_brief
+        assert brief is not None
+        assert brief.danger
+
+
 class TestGraphEndToEnd:
     def test_run_produces_valid_recommendation(self) -> None:
         state = run_preop(make_case(), checkpointer=None)

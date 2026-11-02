@@ -177,8 +177,15 @@ class TestTraceIsHonest:
 
     @pytest.mark.parametrize("label", sorted(SCENARIOS))
     def test_trace_declares_its_exit(self, label: str) -> None:
+        """每条留痕都要写明它指向哪个节点，且必须是规格 M 列出现过的出口。
+
+        ``G08`` 在集合里是因为 ``G04.R20``（遗传/炎症/感染与主病种并存）的
+        出口就是分类阶段 —— 它不是模式出口，但确实是 M 列写的去向。
+        ``无目标病变`` 是 V3.6.2 新增的终末出口（``G09.R07``）。
+        """
+        allowed = {"G05", "G06", "G07", "G08", "G09", "人工复核", "资料核实", "无目标病变"}
         for entry in _results()[label].trace:
-            assert entry.exit in {"G05", "G06", "G07", "人工复核", "资料核实"}
+            assert entry.exit in allowed, f"{entry.rule_id} 声明了未知出口 {entry.exit}"
 
     def test_trace_stops_at_the_hit(self) -> None:
         """命中即返回：命中的规则在 trace 里必须是**最后一条**，后面不许再有求值。"""

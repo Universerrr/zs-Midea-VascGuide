@@ -94,6 +94,45 @@ class ToolFinding(BaseModel):
     )
 
 
+class EmergencyBrief(BaseModel):
+    """急诊五段式出口 —— 只有 ``route_mode`` 是急诊时才有值。
+
+    为什么单独成型而不是把五段拼进 ``primary_recommendation``：
+        G05 要求「安全规则通知先行、不等待非必要分析」。拼成一句话后，
+        「危险提示」会与「术式方向」平铺在一起，读者要读到第二句才知道
+        病人正在出血。分段之后，顺序本身携带优先级。
+
+    五段与数据源的对应（**全部是既有结论的重排，本模型不含新判断**）：
+
+    ================  ====================================================
+    字段              来源
+    ================  ====================================================
+    ``danger``        命中的 P0 规则（路由层标签 + 工具A 条目），规格原文
+    ``known_facts``   ``evidence_chain`` 的前若干条
+    ``pending``       工具A 的 ``gaps``（待补关键资料）
+    ``rapid_assessment`` 工具A 的术式候选 + 终点
+    ``handoff``       资源类字段**是否已确认**，按接收方分行
+    ================  ====================================================
+
+    ⚠️ 不含任何时间戳：本对象随 ``FinalRecommendation`` 进 ``HASHED_KEYS``，
+    加时间会让「同一输入两次运行」产出不同哈希。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    danger: list[str] = Field(
+        default_factory=list, description="危险提示：命中的 P0 规则（规格原文，不重写措辞）。"
+    )
+    known_facts: list[str] = Field(default_factory=list, description="已知事实（判定依据摘录）。")
+    pending: list[str] = Field(default_factory=list, description="待补关键资料（工具A 缺口）。")
+    rapid_assessment: list[str] = Field(
+        default_factory=list, description="快速评估：术式方向与终点（不等完整分析）。"
+    )
+    handoff: list[str] = Field(
+        default_factory=list, description="交接：接收方 + 该方资源是否已确认（不写具体人）。"
+    )
+
+
 class FinalRecommendation(BaseModel):
     """术前决策最终输出。"""
 
@@ -138,6 +177,15 @@ class FinalRecommendation(BaseModel):
         ),
     )
 
+    emergency_brief: EmergencyBrief | None = Field(
+        default=None,
+        description=(
+            "急诊五段式出口。**仅急诊模式非空**；其余模式为 None —— "
+            "择期病例没有「不等待分析」的时限要求，用同一套结构会把"
+            "「危险提示」写成空段，读起来像「没有危险」。"
+        ),
+    )
+
     ruleset_version: str = Field(
         ...,
         description="规则版本号（如 'v36@v3.6'）。审计必需。",
@@ -149,4 +197,11 @@ class FinalRecommendation(BaseModel):
     )
 
 
-__all__ = ["DecisionStep", "EvidenceItem", "FinalRecommendation", "RouteMode", "ToolFinding"]
+__all__ = [
+    "DecisionStep",
+    "EmergencyBrief",
+    "EvidenceItem",
+    "FinalRecommendation",
+    "RouteMode",
+    "ToolFinding",
+]

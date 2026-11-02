@@ -1,7 +1,9 @@
-"""术前路由判定流水线 —— V3.1(2) 的 **55 条判定规则**。
+"""术前路由判定流水线 —— V3.6.2 的 **66 条判定规则**。
 
 对照表见 ``src/rules/RULESET.md``（rule_id ↔ 函数 ↔ 源行）。本模块是规格的**第二真源**：
-``RULES`` 字典里的 ``source`` 指向 V3.1(2) 的具体单元格，改规则必须同步改表。
+``RULES`` 字典里的 ``source`` 指向 V3.6.2 的具体单元格，改规则必须同步改表。
+
+66 = 规格 65 条（G03 21 / G04 20 / G08 15 / G09 9）+ 工程补齐 1 条（``G04.R21``）。
 
 三条语义（不可妥协）
 --------------------
@@ -10,15 +12,16 @@
 2. **不确定值**（可疑/疑似/未评价/不可评价/未知…）先折成 ``UNKNOWN``，永不参与「成立/不成立」。
 3. **未提及 ≠ 阴性**：缺字段只能是 ``UNKNOWN``，不得当 ``False`` 放行。
 
-出口（五值，与 ``RouteKind`` 对应）
+出口（六值，与 ``RouteKind`` 对应）
 ----------------------------------
 ``G05`` 急诊 / ``G06`` 复杂 / ``G07`` 指南 → ``MODE``；
-``人工复核`` → ``REVIEW``；``资料核实`` → ``VERIFY``。
-优先级：**G03 回流 > G06 > VERIFY**；``G07`` 是排他分支，**兜底是 VERIFY**。
+``人工复核`` → ``REVIEW``；``资料核实`` → ``VERIFY``；
+``无目标病变`` → ``NO_TARGET``（V3.6.2 新增的终末出口：**查清了没有病** ≠ **查不清**）。
+优先级：**G03 回流 > G06 > VERIFY > NO_TARGET**；``G07`` 是排他分支，**兜底是 VERIFY**。
 
 范围
 ----
-只实现 G03(21) / G04(19) / G08(11) / G09(4) = **55 条**。
+只实现 G03(21) / G04(21) / G08(15) / G09(9) = **66 条**（规格 65 + 工程补齐 1）。
 G00–G02 的 9 条属「读取资料 / 证据质量 / 事实抽取」，归 LLM 抽取层，不进本模块。
 """
 
@@ -40,7 +43,7 @@ from .version import RULESET_VERSION
 Verdict = bool | None
 """``None`` 表示 UNKNOWN —— 不是「没命中」，也不是「阴性」。"""
 
-NextNode = Literal["G05", "G06", "G07", "人工复核", "资料核实"]
+NextNode = Literal["G05", "G06", "G07", "人工复核", "资料核实", "无目标病变"]
 EmergencyLevel = Literal["明确危险", "高度疑似", "不能排除", "未触发", "冲突"]
 ConfidenceLevel = Literal["高", "中", "低"]
 TaaaGrade = Literal["符合", "疑似", "不符合", "不可评价"]
@@ -53,7 +56,7 @@ TaaaGrade = Literal["符合", "疑似", "不符合", "不可评价"]
 SourceKind = Literal["ESVS原文", "工程安全规则", "其他指南"]
 """规则来源性质（V3.6 起）。
 
-为什么要有这一层：55 条判定规则里有一部分并非 ESVS 2024 原文，而是工程为
+为什么要有这一层：66 条判定规则里有一部分并非 ESVS 2024 原文，而是工程为
 安全自行拟定的分流规则（另有少数取自 ACC/AHA、NEWS2、KDIGO 等）。不标注
 来源，输出层就无法告诉医生「这条依据是不是指南说的」—— 而这正是临床采纳
 与论文溯源时最需要的一句话。
@@ -61,11 +64,18 @@ SourceKind = Literal["ESVS原文", "工程安全规则", "其他指南"]
 
 
 class RouteKind(StrEnum):
-    """路由结论的大类。与 ``NextNode`` 五值一一对应。"""
+    """路由结论的大类。与 ``NextNode`` 六值一一对应。"""
 
     MODE = "进入模式"
     REVIEW = "人工复核"
     VERIFY = "资料核实"
+    NO_TARGET = "无目标病变"
+    """V3.6.2 新增的终末出口：目标区域已充分评价且确实没有目标病变。
+
+    为什么不能并进「人工复核」：复核的含义是「系统判不了，请人看」；这个出口
+    的含义是「系统查清了，确实没有」——后者不需要人再复核一遍分类，只需要
+    临床继续找其他病因。两者的责任归属与后续动作完全不同。
+    """
 
 
 FALLBACK_VERIFY = "FALLBACK.VERIFY"
@@ -83,17 +93,32 @@ OUTCOME_PRIORITY: dict[RouteKind, int] = {
     RouteKind.REVIEW: 3,  # 人工复核压过一切模式
     RouteKind.MODE: 2,
     RouteKind.VERIFY: 1,
+    RouteKind.NO_TARGET: 0,  # 最低：任何一条危险证据都不该被「没病」盖掉
 }
-"""冲突时取优先级高者。**VERIFY 最低**：能进模式就不因资料瑕疵退回核查。"""
+"""冲突时取优先级高者。**VERIFY 最低**：能进模式就不因资料瑕疵退回核查。
+
+``NO_TARGET`` 比 VERIFY 还低 —— 它是「查清了没有病」的结论，优先级必须垫底，
+否则一个已被其它规则标出急症线索的病例会被「无目标病变」抢先终止。
+"""
 
 
-@dataclass(frozen=True)
+TraceExit = Literal["G05", "G06", "G07", "G08", "G09", "人工复核", "资料核实", "无目标病变"]
+"""单条规则留痕能声明的去向 —— 比 :data:`NextNode` 多 ``G08``/``G09``。
+
+为什么留痕比路由出口宽：``NextNode`` 是**路由结论**的取值域（这一例去哪），
+而留痕记录的是**这条规则**在规格 M 列写的去向。``G04.R20`` 写的就是 G08
+（分类阶段）、``G08.R14/R15`` 写的就是 G09（交分类收尾）—— 它们都不是路由
+出口，但审计时必须如实记下「这条规则把人送到了哪一步」。
+"""
+
+
+@dataclass
 class RuleTrace:
     """单条规则的求值留痕（审计用；不要塞进 case）。"""
 
     rule_id: str
     verdict: Verdict
-    exit: NextNode
+    exit: TraceExit
 
 
 @dataclass
@@ -113,7 +138,7 @@ class RouteResult:
     ``D7.2.R91`` 甚至可以从病种流程反向跳回 ``G03``。单值 ``next_node``
     表达不了这种「同时/依次走多处」。
 
-    为什么保留 ``next_node``：现有 55 条规则各走一个节点，它是**主出口**；
+    为什么保留 ``next_node``：现有 66 条规则各走一个节点，它是**主出口**；
     全部改写成序列会让「本次到底去哪」这个主语丢失，输出层无从判断。
     约定：``len(next_nodes) == 1`` 时与旧语义完全等价。
     """
@@ -296,6 +321,12 @@ class _Ctx:
         self.g04_blocking: list[Verdict] = []
         self.gaps_extra: list[str] = []
         self.taaa_iv: TaaaGrade | None = None
+        # G08.R14 / R15 的候选标记：G09.R07 / R08 据此终审。
+        # 两个都是「暂定」，所以只进气种层终审，不直接改出口。
+        self.no_target_candidate: Verdict = False
+        self.unclassifiable_candidate: Verdict = False
+        # G09.R05 / R06 的命中记录（任一为真 → 不得「先把分类做完」）
+        self.reflow_evidence: str | None = None
 
 
 def _news2(v: object) -> tuple[float | None, bool | None]:
@@ -496,9 +527,24 @@ def g03_r03_rupture_reported(x: _Ctx) -> Verdict:
 
 
 def g03_r04_suspected_rupture_unstable(x: _Ctx) -> Verdict:
-    trigger = _or(
-        _eq(x.d.dx_context, "疑似"),
-        _and(_aaa_confirmed(x), _or(_acute_abd_back_pain(x), _eq(x.s.syncope, "肯定", "可疑"))),
+    """疑似破裂背景 + 血流动力学不稳定 → 最高紧急响应。
+
+    **V3.6.2 收窄了本条**：它不再独立触发，只在「本次医生/影像报告明确疑似
+    破裂」（即 ``G03.R16`` 的前提）成立时，用 ``SBP<80`` 或新发意识下降标记
+    「严重不稳定」。规格原句：「本条不独立诊断破裂；若没有主动脉疑虑，严重
+    低血压由 ``G03.R20`` 触发一般危重响应」。
+
+    修前它还接受「AAA + 急性腹痛/晕厥」作为触发，于是「症状性未破裂 AAA +
+    一过性低血压」也会被记成「疑似破裂伴不稳定」——把两种完全不同的临床情形
+    （可能破了 vs 没破但疼）压成同一个 ``rule_id``，急诊团队读报告时无法区分。
+
+    与 ``R16`` 的关系：两者前提相同，区别只在是否不稳定。谁先命中取决于
+    ``G03_P01`` 的顺序（R04 在 R16 之前），所以「疑似破裂 + 低血压」报 R04、
+    「疑似破裂 + 血压正常」报 R16 —— 两条互补，不会同时出现。
+    """
+    trigger = _and(
+        _eq(x.q.idmatch, "一致"),
+        _or(_eq(x.d.dx_context, "疑似"), _eq(x.c.rupture_report, "疑似破裂")),
     )
     unstable = _or(_lt(x.v.sbp, SBP_SHOCK), _eq(x.v.conscious_change, "新发下降"))
     return _and(trigger, unstable)
@@ -775,15 +821,94 @@ def g04_r21_malperfusion(x: _Ctx) -> Verdict:
     return x.malperfusion
 
 
+# ---- G04.R19 / R20（V3.6.2 新增）----
+REPAIR_KINDS: tuple[str, ...] = ("EVAR", "OSR", "其他")
+"""``CL.PREV_EVOR`` / ``N.PREV_REPAIR`` 里表示「做过修复」的取值。"""
+
+
+def _has_prior_repair(x: _Ctx) -> Verdict:
+    """有既往主动脉修复史。「无」是明确阴性；「未知」/未填是 UNKNOWN。"""
+    return _or(
+        _eq(x.cl.prev_evor, *REPAIR_KINDS),
+        _eq(x.n.prev_repair, *REPAIR_KINDS),
+    )
+
+
+def g04_r19_prior_repair_unremarkable(x: _Ctx) -> Verdict:
+    """P3：仅有既往修复史、本次无危险征象或重要异常 —— 不因手术史判复杂。
+
+    规格 ``G04.R19``：「仅有既往修复史且本次为常规随访、无危险征象或重要异常时，
+    不单凭既往手术史判为复杂模式；按 G08 进入 D6 随访路由」。
+
+    出口与 ``R14`` 相同（``G07``），本规则只是给出**更具体的依据**：``R14``
+    回答「所有阻断项都清了」，``R19`` 回答「清了，而且这人是术后随访」。
+    审计时前者看不出病人做过手术。
+
+    「无异常」是**合取且要求明确阴性**：任一异常项缺失即返回 ``None``，
+    不按「没记录＝没有」放行（``G04.R19`` 缺失列：「任一关键条件缺失/冲突→
+    不得按阴性处理」）。
+    """
+    repaired = _has_prior_repair(x)
+    if repaired is not True:
+        return repaired
+    abnormal = _or(
+        _not(_eq(x.n.endoleak_type, "无")),
+        _not(_eq(x.n.graft_major, "无")),
+        _ge(x.n.sac_growth, SAC_GROWTH_MM),
+        _eq(x.cl.infection, "原生感染明确", "原生感染疑似", "移植物感染明确", "移植物感染疑似"),
+        _eq(x.cl.fistula, "主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似"),
+    )
+    return _not(abnormal)
+
+
+def g04_r20_comorbidity_with_primary(x: _Ctx) -> Verdict:
+    """P1：遗传/炎症/感染线索与主病种并存 —— 病因标签不取代主病种。
+
+    出口是 ``G08``（多标签分类），**不进复杂模式**：它说的是「别把病因标签当成
+    主病种的替代」，不是「这条比别的更危险」。所以求值后只记 trace 与标签，
+    不改变路由出口。
+
+    与 ``R15``/``R16`` 的分工：那两条回答「有遗传/炎症**所以要判复杂**」，
+    本条回答「即使已经判了复杂/指南，病因与主病种**仍要各记一个标签**」。
+    两者可以同时成立，不冲突。
+    """
+    primary = _aaa_confirmed(x)
+    if primary is not True:
+        return primary
+    return _or(
+        _eq(x.genetic_ctx, "确诊", "疑似遗传背景"),
+        _eq(x.inflammatory_ctx, "临床确认", "影像高度提示", "可疑"),
+        _eq(x.n.infection_ctx, "医师明确", "高度怀疑"),
+    )
+
+
 # ===========================================================================
-# G08 · 病种分类（11 条）
+# G08 · 病种分类（15 条）
 # ===========================================================================
+def _no_prior_repair(x: _Ctx) -> Verdict:
+    """未做过主动脉修复 —— ``D1``/``D2`` 两个「原发瘤」入口的前置条件。
+
+    已修复的动脉瘤不是「无症状 AAA」，是**术后状态**：它的随访内容是内漏与
+    瘤囊变化（``D6.1``），不是按直径的复查间隔。不加这个前置，术后病人会同时
+    拿到 ``D1`` 与 ``D6`` 两个标签，病种引擎从两个入口各走一遍，报告里出现
+    两套互相矛盾的随访建议。
+
+    ``G08.R13`` 说的「术后状态标签**不等于**并发症确诊」也支持这个方向：
+    术后就是术后，有没有并发症由 D6 内部再分。
+    """
+    repaired = _has_prior_repair(x)
+    if repaired is None:
+        return None
+    return not repaired
+
+
 def g08_r01_d1_asymptomatic(x: _Ctx) -> Verdict:
     aaa = _or(_eq(x.cl.aaa_reported, "确认"), _ge(x.cl.aaa_diam, DIAMETER_AAA_MM))
     return _and(
         aaa,
         _eq(x.cl.symptom_aaa, "无当前症状", "明确归因其他"),
         _eq(x.cl.aaa_rupture, "未见相关证据"),
+        _no_prior_repair(x),
     )
 
 
@@ -793,6 +918,7 @@ def g08_r02_d2_symptomatic_unruptured(x: _Ctx) -> Verdict:
         aaa,
         _eq(x.cl.symptom_aaa, "医师确认相关", "医师怀疑相关"),
         _not(_eq(x.cl.aaa_rupture, "明确")),
+        _no_prior_repair(x),
     )
 
 
@@ -818,7 +944,22 @@ def g08_r05_d5_special(x: _Ctx) -> Verdict:
 
 
 def g08_r06_d6_postop(x: _Ctx) -> Verdict:
-    return _and(_not(_eq(x.cl.prev_evor, "无")), _present(x.cl.post_reason))
+    """既往 EVAR/OSR → ``D6``（术后随访入口）。
+
+    **修前还要求 ``CL.POST_REASON`` 有值**，于是「有 EVAR 史但没写本次就诊原因」
+    的病例落到 ``D1``（原发无症状 AAA），拿到的是按直径的随访间隔 —— 而术后
+    病人需要的是内漏与瘤囊监测，两者在随访内容与频次上完全不同。
+
+    规格 ``G08.R06`` 的原句是「既往EVAR或OSR**且本次为术后随访或术后并发症
+    相关评估**→D6；『既往支架』与『已确诊严重并发症』分开」。后半句是在提醒
+    「有支架 ≠ 有并发症」，即 D6 是**随访入口**而不是并发症结论；前半句的
+    「本次为术后随访」描述的是适用场景，不是「必须有个字段记录就诊原因」。
+    本次具体是什么原因，由 ``D6.1`` 分诊时再问（它的 R01–R03 就是干这个的）。
+
+    所以判据只留「有修复史」这一半，宁可把术后病人按术后管，也不要把他们
+    当成原发 AAA 随访。
+    """
+    return _has_prior_repair(x)
 
 
 def g08_r07_d7_iliac(x: _Ctx) -> Verdict:
@@ -866,8 +1007,111 @@ def g08_r11_genetic_as_modifier(x: _Ctx) -> Verdict:
     return _eq(x.genetic_ctx, "确诊", "疑似遗传背景")
 
 
+# ---- G08.R12 / R13（V3.6.2 新增）----
+def _infection_site(x: _Ctx) -> str | None:
+    """感染部位：``native`` / ``graft`` / ``None``（判不了）。
+
+    单独成函数是因为「部位」不是三值 —— 规格 ``G08.R12`` 要在 D4.2 与 D4.3
+    之间分流，二值表达不了。求值仍走 ``_token``，不确定词折成 ``None``。
+    """
+    v = _token(x.cl.infection)
+    if v in ("原生感染明确", "原生感染疑似"):
+        return "native"
+    if v in ("移植物感染明确", "移植物感染疑似"):
+        return "graft"
+    return None
+
+
+def g08_r12_infection_origin(x: _Ctx) -> Verdict:
+    """P1：能否确定感染发生在原生主动脉还是既往植入物。
+
+    路由层只做**证据定档**，不决定入口节点：``D4.1`` 的分诊本来就要判同一件事
+    （感染/瘘 → D4.2 或 D4.3），在这里再决定一次就是第二处判据。本规则的产出
+    （原生 / 移植物 / 判不了）记进 trace，供审计与下游核对。
+
+    「明确无感染证据 + 有移植物」返回 ``None`` 而不是 ``False``：VGEI 可以没有
+    典型征象，单凭「这次没看到感染」不足以排除 —— 规格的缺失列写的是
+    「任一关键条件缺失/冲突→不得按阴性处理」。
+    """
+    if _infection_site(x) is not None:
+        return True
+    v = _token(x.cl.infection)
+    if v is None or v == "未评价" or _is_uncertain_token(v):
+        return None
+    return None if _has_prior_repair(x) is True else False
+
+
+def g08_r13_postop_label_not_complication(x: _Ctx) -> Verdict:
+    """P1：既往修复 + 本次无**确诊**并发症 → 进 ``D6.1`` 常规随访。
+
+    规格原句：「既往EVAR/OSR且本次常规随访→D6.1；具体内漏/增长/结构异常/感染/瘘
+    **经证据支持**→D6.2/D6.3；未核验异常保留疑似状态」。
+
+    所以本条回答的是「有没有**确诊**的并发症」，不是「是不是术后」——
+    后者由 ``G08.R06`` 回答（它负责给 ``D6`` 标签）。两条同时成立时，
+    标签是 ``D6``、入口是 ``D6.1``，分诊交给 ``D6.1`` 自己按 R01–R03 做。
+    """
+    repaired = _has_prior_repair(x)
+    if repaired is not True:
+        return repaired
+    confirmed = _or(
+        _eq(x.n.endoleak_type, "I", "III", "IV", "V"),
+        _ge(x.n.sac_growth, SAC_GROWTH_MM),
+        _eq(x.n.graft_major, "组件分离", "移位", "明显闭塞"),
+        _eq(x.cl.infection, "原生感染明确", "移植物感染明确"),
+        _eq(x.cl.fistula, "主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘"),
+    )
+    return _not(confirmed)
+
+
+def g08_r14_no_target_candidate(x: _Ctx) -> Verdict:
+    """P3：可靠检查未发现任何目标病变 —— **暂定**候选，交 ``G09.R07`` 终审。
+
+    四个条件缺一不可，任一为 UNKNOWN 都不能当阴性：
+      1. 身份与时间可靠；
+      2. 影像覆盖充分且 CTA 可评价；
+      3. 所有目标病种都没有可靠阳性/疑似证据；
+      4. 无既往修复需要本次随访。
+
+    「未检查 / 覆盖不足 / 报告未述及」**不满足**本条 —— 规格把它们指向
+    ``G08.R15`` / ``G09.R08``（未分类）。所以这里只认 ``aaa_reported == "否定"``，
+    不把「未述及」当阴性。
+    """
+    reliable = _and(_eq(x.q.idmatch, "一致"), _eq(x.q.time, "有效"))
+    if reliable is not True:
+        return None if reliable is None else False
+    covered = _and(_eq(x.q.cta_cover, "完整"), _eq(x.n.cta_status, "完整"))
+    if covered is not True:
+        return None if covered is None else False
+    return _and(
+        _eq(x.cl.aaa_reported, "否定"),
+        _eq(x.cl.aaa_rupture, "未见相关证据"),
+        _eq(x.cl.symptom_aaa, "无当前症状", "明确归因其他"),
+        _eq(x.cl.infection, "无证据"),
+        _eq(x.cl.fistula, "否"),
+        _absent(x.cl.iliac_site, ("左侧", "右侧", "CIA", "IIA", "EIA", "疑似")),
+        _not(_has_prior_repair(x)),
+    )
+
+
+def g08_r15_unclassifiable_candidate(x: _Ctx) -> Verdict:
+    """P2：没能形成任何标签 —— 暂定「未分类」，交 ``G09.R08``。
+
+    与 ``R14`` 的区别：``R14`` 是「查了，确实没有」；``R15`` 是「查不清」。
+    前者可以终止病种路由，后者**不能** —— 「不得默认无病变」是规格原话。
+    """
+    if x.labels:
+        return False
+    return _or(
+        _not(_eq(x.n.cta_status, "完整")),
+        _not(_eq(x.q.cta_cover, "完整")),
+        _eq(x.cl.aaa_reported, "未述及"),
+        _has(x.cl.aorta_location, "未知"),
+    )
+
+
 # ===========================================================================
-# G09 · 分类收尾（4 条）
+# G09 · 分类收尾（9 条）
 # ===========================================================================
 def g09_r01_new_emergency_reflow(x: _Ctx) -> Verdict:
     return _eq(x.k.new_urgent, "是")
@@ -896,8 +1140,108 @@ def g09_r04_classify_and_stop(x: _Ctx) -> Verdict:
     return not x.diag_conflict
 
 
+# ---- G09.R05–R09（V3.6.2 新增）----
+def _active_infection_or_fistula(x: _Ctx) -> Verdict:
+    """当前有感染或主动脉相关瘘证据（含疑似）。"""
+    return _or(
+        _eq(
+            x.cl.infection,
+            "原生感染明确",
+            "原生感染疑似",
+            "移植物感染明确",
+            "移植物感染疑似",
+        ),
+        _eq(x.cl.fistula, "主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似"),
+        _eq(x.n.infection_ctx, "医师明确", "高度怀疑"),
+    )
+
+
+def g09_r05_infection_or_fistula_reflow(x: _Ctx) -> Verdict:
+    """P0-A：分类过程中发现感染/主动脉瘘 —— 保留状态并回流 D4，急症时回 G03。
+
+    与 ``G09.R01`` 的分工：``R01`` 只读 ``K.NEW_URGENT``（抽取层给的「正在恶化」
+    标记），本条读**分类阶段新发现的**感染/瘘证据。两条都可能为真，任一为真都
+    不许「先把分类做完再说」。
+
+    ``True`` 表示「存在需要回流的证据」，具体回 G03 还是只标 D4 由
+    :func:`_finish_mode` 结合生命体征判 —— 本规则不重复判急症等级。
+    """
+    return _active_infection_or_fistula(x)
+
+
+def g09_r06_postop_abnormality(x: _Ctx) -> Verdict:
+    """P1：术后出现内漏/瘤囊增长/移植物故障 —— 进 D6 对应节点，急症回 G03。"""
+    if _has_prior_repair(x) is not True:
+        return None if _has_prior_repair(x) is None else False
+    return _or(
+        _eq(x.n.endoleak_type, "I", "II", "III", "IV", "V", "疑似"),
+        _ge(x.n.sac_growth, SAC_GROWTH_MM),
+        _eq(x.n.graft_major, "组件分离", "移位", "明显闭塞", "疑似"),
+        _eq(x.n.infection_ctx, "医师明确", "高度怀疑"),
+    )
+
+
+def g09_r07_no_target_disease_terminal(x: _Ctx) -> Verdict:
+    """P3：确认「无目标病变」是终末结论，不是「暂时没看见」。
+
+    只有 ``G08.R14`` 的候选成立，且以下全部为真时才成立：覆盖充分、影像可评价、
+    无新急症、身份/时间可信、无既往修复需随访、无未解决冲突。
+
+    任何一项证据不足都落到 ``G09.R08``（未分类），**不可终止目标病种路由**。
+    """
+    if x.no_target_candidate is not True:
+        return x.no_target_candidate
+    confirmed = _and(
+        _eq(x.q.cta_cover, "完整"),
+        _eq(x.n.cta_status, "完整"),
+        _eq(x.q.idmatch, "一致"),
+        _eq(x.q.time, "有效"),
+        _not(_eq(x.k.new_urgent, "是")),
+        _not(_has_prior_repair(x)),
+    )
+    return confirmed
+
+
+def g09_r08_unclassifiable(x: _Ctx) -> Verdict:
+    """P2：无可信标签或证据不足 —— 输出「未分类」并列出待核字段。
+
+    **不能强行选 D1–D7**：没有标签不等于 D1。这一点和 ``G09.R04`` 是一体两面 ——
+    R04 要求「至少一个可信标签」才放行，R08 是它为假时的出口。
+    """
+    if x.labels:
+        # 有标签但冲突未解决 → 也走这里（冲突本身的复核由 R03 承担）
+        return None if x.diag_conflict is None else bool(x.diag_conflict)
+    return True
+
+
+def g09_r09_multilabel_coexistence(x: _Ctx) -> Verdict:
+    """P3：允许共存的多标签 vs 真正互斥的冲突。
+
+    规格列举的共存组合：AAA+髂动脉瘤、感染+动脉瘤、炎症性AAA+感染疑似、
+    术后状态+新病变 —— 都可以同时成立，不自动判冲突。只有**同一病灶/同一时点
+    的互斥状态**（例如「明确破裂」与「同一可靠检查明确排除」）才是真冲突。
+
+    ``G08.R09`` 现在的实现把 D1/D2/D3 两两当互斥，这条规则补上「哪些不算冲突」
+    的白名单。两者合起来才是规格的完整口径。
+    """
+    if len(x.labels) < 2:
+        return False
+    return _mutually_exclusive(x)
+
+
+def _mutually_exclusive(x: _Ctx) -> Verdict:
+    """同一病灶、同一时点的互斥组合 —— 只有这几种才叫真冲突。
+
+    D1（无症状）/D2（症状性未破裂）/D3（破裂）是**同一病灶的三种状态**，
+    天然互斥。其余多标签（感染+动脉瘤、炎症+感染、术后+新病变）都是共存。
+    """
+    seen = set(x.labels)
+    rupture_states = {"D1", "D2", "D3"} & seen
+    return len(rupture_states) >= 2
+
+
 # ===========================================================================
-# 规则登记表（55 条，唯一真源）
+# 规则登记表（66 条，唯一真源）
 # ===========================================================================
 @dataclass(frozen=True)
 class RuleSpec:
@@ -1020,7 +1364,7 @@ RULES: dict[str, RuleSpec] = {
     "G03.R12": RuleSpec(
         g03_r12_no_enhanced_cta_with_clues,
         "G03!20",
-        "G05",
+        "人工复核",
         "无可靠增强 CTA 但有急症线索",
         ("q.cta_enhance", "q.cta_phase", "d.dx_context"),
         "不能排除",
@@ -1092,110 +1436,110 @@ RULES: dict[str, RuleSpec] = {
     # ---- G04（18）----
     "G04.R01": RuleSpec(
         g04_r01_short_neck,
-        "G04!40",
+        "G04!42",
         "G06",
         "短颈型肾下 AAA",
         ("n.neck_len", "n.renal_l", "n.renal_r"),
     ),
     "G04.R02": RuleSpec(
         g04_r02_juxtarenal,
-        "G04!41",
+        "G04!43",
         "G06",
         "近肾型 AAA",
         ("n.neck_len", "n.renal_l", "n.renal_r"),
     ),
     "G04.R03": RuleSpec(
-        g04_r03_pararenal, "G04!42", "G06", "肾旁型 AAA", ("n.renal_l", "n.renal_r", "n.sma")
+        g04_r03_pararenal, "G04!44", "G06", "肾旁型 AAA", ("n.renal_l", "n.renal_r", "n.sma")
     ),
     "G04.R04": RuleSpec(
         g04_r04_visceral_pararenal,
-        "G04!43",
+        "G04!45",
         "G06",
         "内脏旁型 AAA",
         ("n.renal_l", "n.renal_r", "n.sma", "n.ca"),
     ),
     "G04.R05": RuleSpec(
         g04_r05_taaa_iv_extension,
-        "G04!44",
+        "G04!46",
         "G06",
         "Ⅳ型 TAAA 扩展",
         ("n.renal_l", "n.sma", "n.ca", "n.thoracic"),
     ),
     "G04.R06": RuleSpec(
-        g04_r06_beyond_project_boundary, "G04!45", "G06", "超过Ⅳ型 TAAA 项目边界", ("n.thoracic",)
+        g04_r06_beyond_project_boundary, "G04!47", "G06", "超过Ⅳ型 TAAA 项目边界", ("n.thoracic",)
     ),
     "G04.R07": RuleSpec(
         g04_r07_infection_or_fistula,
-        "G04!46",
+        "G04!48",
         "G06",
         "感染或主动脉相关瘘",
         ("n.infection_ctx", "n.fistula_ctx"),
     ),
     "G04.R08": RuleSpec(
-        g04_r08_ifu_mismatch, "G04!47", "G06", "已核验的器械近端 IFU 不适配", ("n.seal_ifu",)
+        g04_r08_ifu_mismatch, "G04!49", "G06", "已核验的器械近端 IFU 不适配", ("n.seal_ifu",)
     ),
     "G04.R09": RuleSpec(
         g04_r09_iliac_limitation,
-        "G04!48",
+        "G04!50",
         "G06",
         "内髂灌注及双侧髂动脉限制",
         ("n.iliac_bilat", "n.iia_left", "n.iia_right"),
     ),
     "G04.R10": RuleSpec(
-        g04_r10_access_occlusion, "G04!49", "G06", "常规股动脉通路受限", ("n.access_occlusion",)
+        g04_r10_access_occlusion, "G04!51", "G06", "常规股动脉通路受限", ("n.access_occlusion",)
     ),
     "G04.R11": RuleSpec(
         g04_r11_prior_repair_reintervention,
-        "G04!50",
+        "G04!52",
         "G06",
         "重要 EVAR/OSR 术后再干预线索",
         ("n.prev_repair", "n.endoleak_type", "n.sac_growth"),
     ),
     "G04.R12": RuleSpec(
         g04_r12_physiologic_risk,
-        "G04!51",
+        "G04!53",
         "G06",
         "重要生理风险需综合评估",
         ("n.egfr", "n.dialysis", "n.heart_class", "n.resp_support"),
     ),
     "G04.R13": RuleSpec(
         g04_r13_insufficient_for_low_complexity,
-        "G04!52",
+        "G04!54",
         "资料核实",
         "资料不足不允许判为低复杂",
         ("n.cta_status", "n.neck_len", "n.renal_l", "n.sma", "n.ca"),
     ),
     "G04.R14": RuleSpec(
         g04_r14_low_complexity_to_guideline,
-        "G04!53",
+        "G04!55",
         "G07",
         "低复杂进入指南模式",
         ("n.cta_status",),
     ),
     "G04.R15": RuleSpec(
         g04_r15_genetic_confirmed,
-        "G04!54",
+        "G04!56",
         "G06",
         "已明确遗传综合征或遗传性主动脉病",
         ("n.genetic_ctx",),
     ),
     "G04.R16": RuleSpec(
         g04_r16_inflammatory,
-        "G04!55",
+        "G04!57",
         "G06",
         "炎症性 AAA 明确或影像高度提示",
         ("n.inflammatory_ctx", "inf.mantle_sign", "inf.wall_fibrosis"),
     ),
     "G04.R17": RuleSpec(
         g04_r17_genetic_suspected,
-        "G04!56",
+        "G04!58",
         "G06",
         "存在遗传评估线索但尚未确诊",
         ("gen.aaa_age_onset", "gen.family_aneurysm", "gen.syndromic_features"),
     ),
     "G04.R18": RuleSpec(
         g04_r18_inflammation_vs_infection,
-        "G04!57",
+        "G04!59",
         "G06",
         "炎症与感染的鉴别",
         ("n.inflammatory_ctx", "n.infection_ctx"),
@@ -1207,130 +1551,200 @@ RULES: dict[str, RuleSpec] = {
         "器官或肢体灌注障碍",
         ("c.malperfusion", "c.branch", "s.limb"),
     ),
-    # ---- G08（11）----
+    "G04.R19": RuleSpec(
+        g04_r19_prior_repair_unremarkable,
+        "G04!61",
+        "G07",
+        "既往 EVAR/OSR 但无异常",
+        ("cl.prev_evor", "n.prev_repair", "n.endoleak_type", "n.sac_growth", "n.graft_major"),
+    ),
+    "G04.R20": RuleSpec(
+        g04_r20_comorbidity_with_primary,
+        "G04!62",
+        "G08",
+        "遗传/炎症/感染与主病种并存",
+        ("genetic_ctx", "inflammatory_ctx", "n.infection_ctx", "cl.aaa_reported"),
+    ),
+    # ---- G08（15）----
     "G08.R01": RuleSpec(
         g08_r01_d1_asymptomatic,
-        "G08!21",
+        "G08!24",
         "G06",
         "D1 无症状 AAA 入口",
         ("cl.aaa_reported", "cl.symptom_aaa", "cl.aaa_rupture"),
     ),
     "G08.R02": RuleSpec(
         g08_r02_d2_symptomatic_unruptured,
-        "G08!22",
+        "G08!25",
         "G06",
         "D2 症状性未破裂 AAA 入口",
         ("cl.aaa_reported", "cl.symptom_aaa", "cl.aaa_rupture"),
     ),
     "G08.R03": RuleSpec(
         g08_r03_d3_ruptured,
-        "G08!23",
+        "G08!26",
         "G06",
         "D3 破裂/疑似破裂 AAA 入口",
         ("cl.aaa_rupture", "cl.aaa_reported"),
     ),
     "G08.R04": RuleSpec(
         g08_r04_d4_infected,
-        "G08!24",
+        "G08!27",
         "G06",
         "D4 感染性主动脉病变入口",
         ("cl.infection", "cl.fistula"),
     ),
     "G08.R05": RuleSpec(
         g08_r05_d5_special,
-        "G08!25",
+        "G08!28",
         "G06",
         "D5 特殊主动脉病变入口",
         ("cl.pau", "cl.imh", "cl.iaad", "cl.saccular", "cl.pseudo"),
     ),
     "G08.R06": RuleSpec(
         g08_r06_d6_postop,
-        "G08!26",
+        "G08!29",
         "G06",
         "D6 EVAR/OSR 术后入口",
         ("cl.prev_evor", "cl.post_reason"),
     ),
     "G08.R07": RuleSpec(
-        g08_r07_d7_iliac, "G08!27", "G06", "D7 髂动脉瘤入口", ("cl.iliac_site", "cl.iliac_diam")
+        g08_r07_d7_iliac, "G08!30", "G06", "D7 髂动脉瘤入口", ("cl.iliac_site", "cl.iliac_diam")
     ),
     "G08.R08": RuleSpec(
         g08_r08_taaa_iv_label,
-        "G08!28",
+        "G08!31",
         "G06",
         "Ⅳ型 TAAA 扩展标签",
         ("n.thoracic", "n.sma", "n.ca"),
     ),
     "G08.R09": RuleSpec(
-        g08_r09_multi_label_conflict, "G08!29", "人工复核", "多标签与冲突处理", ("cl.diag_multi",)
+        g08_r09_multi_label_conflict, "G08!32", "人工复核", "多标签与冲突处理", ("cl.diag_multi",)
     ),
     "G08.R10": RuleSpec(
         g08_r10_inflammatory_as_d5_subtype,
-        "G08!30",
+        "G08!33",
         "G06",
         "炎症性 AAA 归入 D5 特殊病种",
         ("n.inflammatory_ctx", "inf.mantle_sign"),
     ),
     "G08.R11": RuleSpec(
         g08_r11_genetic_as_modifier,
-        "G08!31",
+        "G08!34",
         "G06",
         "遗传综合征保留为病因修饰标签",
         ("n.genetic_ctx", "gen.syndrome_type"),
     ),
-    # ---- G09（4）----
+    "G08.R12": RuleSpec(
+        g08_r12_infection_origin,
+        "G08!36",
+        "G06",
+        "区分感染发生在原生主动脉还是既往植入物",
+        ("cl.infection", "cl.prev_evor", "n.prev_repair"),
+    ),
+    "G08.R13": RuleSpec(
+        g08_r13_postop_label_not_complication,
+        "G08!37",
+        "G06",
+        "术后状态标签不等于并发症确诊",
+        ("cl.prev_evor", "n.endoleak_type", "n.sac_growth", "n.graft_major"),
+    ),
+    "G08.R14": RuleSpec(
+        g08_r14_no_target_candidate,
+        "G08!23",
+        "G06",
+        "可靠检查未发现本项目目标病变",
+        ("cl.aorta_location", "cl.aaa_reported", "cl.iliac_site", "q.cta_cover"),
+    ),
+    "G08.R15": RuleSpec(
+        g08_r15_unclassifiable_candidate,
+        "G08!22",
+        "G06",
+        "目标病变无法分类或证据不足",
+        ("cl.aorta_location", "cl.aaa_reported", "n.cta_status"),
+    ),
+    # ---- G09（9）----
     "G09.R01": RuleSpec(
-        g09_r01_new_emergency_reflow, "G09!7", "G05", "发现新急症立即回流", ("k.new_urgent",)
+        g09_r01_new_emergency_reflow, "G09!10", "G05", "发现新急症立即回流", ("k.new_urgent",)
     ),
     "G09.R02": RuleSpec(
         g09_r02_identity_conflict,
-        "G09!8",
+        "G09!11",
         "资料核实",
         "身份或关键数据冲突",
         ("q.idmatch", "q.conflict"),
     ),
     "G09.R03": RuleSpec(
         g09_r03_diagnosis_conflict,
-        "G09!9",
+        "G09!12",
         "人工复核",
         "病种判断相互矛盾",
         ("cl.diag_multi", "k.diag_conflict"),
     ),
     "G09.R04": RuleSpec(
         g09_r04_classify_and_stop,
-        "G09!10",
+        "G09!13",
         "G06",
         "输出疾病分类并停止",
         ("k.classifiable", "k.class_output"),
     ),
+    "G09.R05": RuleSpec(
+        g09_r05_infection_or_fistula_reflow,
+        "G09!14",
+        "G05",
+        "分类中发现感染或主动脉相关瘘",
+        ("cl.infection", "cl.fistula", "n.infection_ctx"),
+        "明确危险",
+    ),
+    "G09.R06": RuleSpec(
+        g09_r06_postop_abnormality,
+        "G09!15",
+        "G06",
+        "新增内漏/瘤囊增长/移植物故障",
+        ("n.endoleak_type", "n.sac_growth", "n.graft_major", "n.infection_ctx"),
+        "高度疑似",
+    ),
+    "G09.R07": RuleSpec(
+        g09_r07_no_target_disease_terminal,
+        "G09!9",
+        "无目标病变",
+        "无目标病变且目标区域充分评价",
+        ("q.cta_cover", "n.cta_status", "q.idmatch", "q.time", "k.new_urgent"),
+    ),
+    "G09.R08": RuleSpec(
+        g09_r08_unclassifiable,
+        "G09!8",
+        "资料核实",
+        "诊断未定、资料不足或无法分类",
+        ("k.classifiable", "k.diag_conflict", "n.cta_status"),
+    ),
+    "G09.R09": RuleSpec(
+        g09_r09_multilabel_coexistence,
+        "G09!7",
+        "人工复核",
+        "允许共存的多标签与真正冲突的区分",
+        ("k.diag_conflict", "cl.aaa_reported", "cl.infection", "cl.prev_evor"),
+    ),
 }
 
-assert len(RULES) == 55, f"V3.1(2) 有 55 条判定规则，实际 {len(RULES)}"
-
-PENDING_RULES: frozenset[str] = frozenset(
-    {
-        "G04.R19",
-        "G04.R20",
-        "G08.R12",
-        "G08.R13",
-        "G08.R14",
-        "G08.R15",
-        "G09.R05",
-        "G09.R06",
-        "G09.R07",
-        "G09.R08",
-        "G09.R09",
-    }
+assert len(RULES) == 66, (
+    "V3.6.2 有 65 条判定规则（G03 21 / G04 20 / G08 15 / G09 9）"
+    f"外加 1 条工程补齐（G04.R21），应为 66 条，实际 {len(RULES)}"
 )
-"""V3.6.2 规格有、当前尚未实现的判定层规则（11 条）。
 
-为什么显式登记而不是留空：``test_ids_are_contiguous`` 用「已实现 + 待实现」拼出
-完整编号，缺号会立刻失败——它守的是「别漏实现」，不是「别缺号」。把缺口写成
-常量，缺口就从「看不见的空白」变成「看得见的清单」。
+PENDING_RULES: frozenset[str] = frozenset()
+"""V3.6.2 规格里**尚未实现**的判定层规则 —— **当前为空**（65 条全部实现）。
 
-实现一条：从本集合删一条、往 ``RULES`` 加一条，总数不变。
+为什么保留这个空常量而不是删掉：``test_ids_are_contiguous`` 用「已实现 + 待实现」
+拼出完整编号，缺号会立刻失败。留一个显式空集，等于把「缺口已清零」写进代码，
+而不是靠「忘了写」来证明。下一次规格升级新增规则时，往这里加一条即可，
+总数断言会立刻提醒还差几条。
+
+历史：V3.6.2 相对 V3.1(2) 新增的 11 条（``G04.R19/R20``、``G08.R12–R15``、
+``G09.R05–R09``）已全部实现，本集合因此清空。
+
 G00–G02 的 9 条不在此列——它们归 LLM 抽取层，不进本模块。
-
-当前总数 55 + 11 = 66 = 规格判定层 65 + 工程补充 1（``G04.R21``）。
+当前总数 66 = 规格判定层 65 + 工程补充 1（``G04.R21``）。
 """
 
 assert len(RULES) + len(PENDING_RULES) == 66, (
@@ -1338,7 +1752,7 @@ assert len(RULES) + len(PENDING_RULES) == 66, (
 )
 
 # ===========================================================================
-# 规则来源性质登记（V3.6 起）—— 全 55 条，一条不少
+# 规则来源性质登记（V3.6 起）—— 全 66 条，一条不少
 # ===========================================================================
 RULE_SOURCE = {
     # ---- G03 急诊分诊（21）：ESVS 6 / 工程 13 / 其他 2 ----
@@ -1383,7 +1797,9 @@ RULE_SOURCE = {
     "G04.R17": ("ESVS原文", "Rec154"),
     "G04.R18": ("ESVS原文", "§10.1–10.2"),
     "G04.R21": ("工程安全规则", None),
-    # ---- G08 病种分类（11）：ESVS 9 / 工程 1 / 其他 1 ----
+    "G04.R19": ("ESVS原文", "§7"),  # K 列：ESVS 2024 章节来源已定位
+    "G04.R20": ("工程安全规则", None),  # K 列：工程安全规则（非指南原文）
+    # ---- G08 病种分类（15）：ESVS 10 / 工程 4 / 其他 1 ----
     "G08.R01": ("ESVS原文", "§2"),
     "G08.R02": ("其他指南", None),  # ACC/AHA 2022
     "G08.R03": ("ESVS原文", "§6"),
@@ -1395,18 +1811,34 @@ RULE_SOURCE = {
     "G08.R09": ("工程安全规则", None),  # VascGuide 临床标签设计规则
     "G08.R10": ("ESVS原文", "§10.2 Rec145–146"),
     "G08.R11": ("ESVS原文", "§10.5 Rec154–155"),
-    # ---- G09 分类收尾（4）：工程 4 ----
+    "G08.R12": ("其他指南", "Rec139–144"),  # K 列：专题指南/共识；L 列另有 ESVS 2026 VGEI
+    "G08.R13": ("ESVS原文", "§7"),  # K 列：ESVS 2024 章节来源已定位
+    "G08.R14": ("工程安全规则", None),  # K 列：工程安全规则（非指南原文）
+    "G08.R15": ("工程安全规则", None),
+    # ---- G09 分类收尾（9）：工程 7 / 其他指南 2 ----
     "G09.R01": ("工程安全规则", None),
     "G09.R02": ("工程安全规则", None),
     "G09.R03": ("工程安全规则", None),  # 临床标签一致性规则
     "G09.R04": ("工程安全规则", None),  # V1.1 既有分类体系
+    "G09.R05": ("其他指南", "§10"),  # ESVS 2024 §10；ESVS 2026 VGEI
+    "G09.R06": ("其他指南", "§7"),  # ESVS 2024 §7；ESVS 2026 VGEI
+    "G09.R07": ("工程安全规则", None),
+    "G09.R08": ("工程安全规则", None),
+    "G09.R09": ("工程安全规则", None),
 }
-"""55 条规则的来源性质与 ESVS 章节（V3.6 表「备注／依据」列的口径）。
+"""66 条规则的来源性质与 ESVS 章节（V3.6.2「备注／依据」列的口径）。
 
-当前分布：ESVS 原文 29 / 工程安全规则 22 / 其他指南 3。
+当前分布：ESVS 原文 31 / 工程安全规则 29 / 其他指南 6。
+
 值得知道的是：**G03 急诊 21 条里只有 6 条是 ESVS 原文**，其余 13 条是
 工程为安全自行拟定的分流规则 —— 写论文或做临床采纳时不能笼统声称
 「全部基于 ESVS 2024」。
+
+V3.6.2 新增的 11 条按各自 K 列登记：``G04.R19``/``G08.R13`` 标「ESVS 2024
+章节来源已定位」；``G04.R20``、``G08.R14/R15``、``G09.R07/R08/R09`` 标
+「工程安全规则（非指南原文）」；``G08.R12``、``G09.R05/R06`` 标
+「专题指南/共识来源」→ 归 ``其他指南``，章节取 L 列（ESVS 2024 §7/§10、
+ESVS 2026 VGEI）。
 """
 
 _unregistered = set(RULES) - set(RULE_SOURCE)
@@ -1424,6 +1856,10 @@ if _empty_section:
     )
 
 # G03 优先级桶（P01–P04 是分组，不是规则，不进 RULES）
+#
+# 分组口径以 **V3.6.2 每条规则行自己的 P 标记 + M 列出口**为准，不以分组行 F 列
+# 的清单为准 —— 两者在 ``G03.R12`` 上已经不同步：分组行仍写 ``R11;R17–R19;R21``，
+# 但 R12 单行已标 P1、出口 REVIEW。分组行的清单是旧版残留，单条声明才是判据。
 G03_P01 = (
     "G03.R01",
     "G03.R02",
@@ -1435,23 +1871,88 @@ G03_P01 = (
     "G03.R08",
     "G03.R09",
     "G03.R10",
-    "G03.R12",
     "G03.R16",
     "G03.R20",
 )
-G03_P02 = ("G03.R11", "G03.R17", "G03.R18", "G03.R19", "G03.R21")
+G03_P02 = ("G03.R11", "G03.R12", "G03.R17", "G03.R18", "G03.R19", "G03.R21")
 G03_P03 = ("G03.R13", "G03.R14")
 G03_P04 = ("G03.R15",)
 
-D3_EMERGENCY_RULES: frozenset[str] = frozenset(
-    {"G03.R01", "G03.R02", "G03.R03", "G03.R04", "G03.R05", "G03.R06", "G03.R07", "G03.R12"}
-)
-"""命中即预置 ``D3`` 病种标签的急诊规则 —— 这些描述的都是破裂／疑似破裂路径。
+EMERGENCY_LABELS: dict[str, str] = {
+    # ---- 破裂／疑似破裂 → D3 ----
+    "G03.R01": "D3",
+    "G03.R02": "D3",
+    "G03.R03": "D3",
+    "G03.R04": "D3",
+    "G03.R05": "D3",
+    "G03.R06": "D3",
+    "G03.R07": "D3",
+    "G03.R16": "D3",
+    # ---- 主动脉移植物 + 消化道出血 → D6（主动脉肠瘘是术后并发症） ----
+    "G03.R08": "D6",
+}
+"""命中即**预置病种标签**的急诊规则 → 该规则的病种入口。
 
 为什么在 G03 就预置标签：急诊模式**不跑 G08**（分类需要完整资料），若不预置，
-``class_output`` 为空，下游工具A 拿不到病种入口 —— D3 病种流程永远启动不了。
-预置只回答「该走哪条病种路径」，**不改变路由出口本身**（出口仍是 G05）。
+``class_output`` 为空，下游工具A 拿不到病种入口 —— 病种流程永远启动不了，
+输出退化成「病种未分类：病种流程未给出结论」。预置只回答「该走哪条病种路径」，
+**不改变路由出口本身**（出口仍是 G05）。
+
+为什么是 ``dict`` 而不是一个集合：**标签不都是 D3**。早先只登记了八条破裂规则、
+默认所有预置都是 ``D3``，于是 G03.P01 里另外几条命中的病例全部空转。其中两条是
+实打实的遗漏，不是「无病种可归」：
+
+``G03.R16`` 医生明确怀疑破裂
+    规格 ``D3`` sheet 的对象本就是「破裂／**疑似破裂** AAA」，判据
+    （``d.dx_context == "疑似"`` 或 ``c.rupture_report == "疑似破裂"``）描述的
+    正是该 sheet 的病人。归 ``D3``。
+
+``G03.R08`` 主动脉移植物史合并消化道出血
+    这是**主动脉肠瘘**，属术后并发症。``D6.3.R01`` 的判据里本来就有
+    ``active_gi_bleed``，入口 ``D6.1`` 也把「感染/瘘」路由到 ``D6.3``。
+    归 ``D6`` 恰是规格已经写好的那条路。
+
+**``G03.R12`` 反过来是「不该有标签」**：它曾在此表里归 ``D3``，因为早先把它
+放在 ``G03.P01``（命中即进 G05）。V3.6.2 把它的出口改成 ``REVIEW``（``G03!20``：
+「紧急复核，不能降为常规」）——影像不可靠时**不得**据此给出术式方向。它已移入
+``G03.P02``，故从本表移除。
+
+剩下三条**确实无病种可归**，登记在 :data:`EMERGENCY_NO_LABEL` —— 不预置是
+正确边界而非遗漏，它们靠五段式的「危险提示」交代，不硬塞进病种流程。
 """
+
+#: 命中急诊但**确实无病种可归**的规则 —— 与 :data:`EMERGENCY_LABELS` 互补。
+#:
+#: 为什么要把「无病种」也显式登记，而不是留空：留空无法与「忘了登记」区分。
+#: 下面这条导入期自检要求 ``G03_P01`` 的每一条都落在本集合或
+#: :data:`EMERGENCY_LABELS` 里——新增一条急诊规则却忘了决定标签时，import 就
+#: 会炸，而不是等到某个病例输出「病种未分类」才发现。
+EMERGENCY_NO_LABEL: frozenset[str] = frozenset(
+    {
+        # 急性肢体缺血：D1–D7 里没有这个病种，工具A 无 sheet 可查。
+        "G03.R09",
+        # NEWS2 严重恶化：全身性危险征象，与主动脉病种无关。
+        "G03.R10",
+        # 严重低血压（不依赖已知 AAA）：同上，未确认是主动脉源。
+        "G03.R20",
+    }
+)
+
+#: 命中即预置 ``D3`` 标签的规则 —— 从 :data:`EMERGENCY_LABELS` 派生，不另抄一份。
+#: 病种层（``nodes/d3_ruptured.py``）用它判「确认型 vs 临床怀疑型」，故保留这个名字。
+D3_EMERGENCY_RULES: frozenset[str] = frozenset(
+    rid for rid, label in EMERGENCY_LABELS.items() if label == "D3"
+)
+
+# 导入期自检：G03.P01 每条规则必须「有病种标签」或「明确登记为无病种」。
+# 二者皆无 = 命中后工具A 静默空转（输出退化成「病种未分类」），正是本表要防的。
+_undecided_emergency = set(G03_P01) - EMERGENCY_LABELS.keys() - EMERGENCY_NO_LABEL
+if _undecided_emergency:
+    raise RuntimeError(
+        "以下 G03 急诊规则既没有病种标签、也没有登记为「无病种可归」，"
+        "命中后工具A 会静默空转："
+        f"{sorted(_undecided_emergency)}"
+    )
 G04_BLOCKING = (
     "G04.R01",
     "G04.R02",
@@ -1465,10 +1966,20 @@ G04_BLOCKING = (
     "G04.R10",
     "G04.R11",
     "G04.R12",
+    "G04.R18",
 )
-"""阻断型：命中即判复杂；其 UNKNOWN 也不是放行理由（交给 R13 兜）。"""
-G04_EXTRA = ("G04.R15", "G04.R16", "G04.R17", "G04.R18", "G04.R21")
+"""阻断型：命中即判复杂；其 UNKNOWN 也不是放行理由（由 R14 的 ``all_clear`` 兜）。
+
+为什么 ``G04.R18``（炎症与感染的鉴别）在这组而不是「加分型」：V3.6.2 给它的
+类别是 **P0-A**，缺失列写「关键输入缺失/未知/冲突时转 VERIFY/REVIEW，不按阴性
+处理」。放进加分型会让「炎症与感染分不清」的病例在 UNKNOWN 时照常放行到 G07，
+于是一个未排除感染的病人被当成低复杂择期处理。这正是 ``all_clear`` 要挡的事。
+"""
+G04_EXTRA = ("G04.R15", "G04.R16", "G04.R17", "G04.R21")
 """加分型：遗传/炎症/灌注线索。命中→复杂；其 UNKNOWN **不阻断** G07 放行。
+
+规格对这三类（遗传、炎症、灌注）明写「UNKNOWN 不算命中、也不阻断」——它们
+描述的是**病因修饰**，不是「必须排除的危险」。``G04.R18`` 不在其中，见上。
 
 ``G04.R21`` 是本条唯一一条**代码侧补齐**的规则（V3.6.2 只有 ``G04!C39`` 字段行、
 没有规则行），来源性质登记为「工程安全规则」，不得计入 ESVS 原文。
@@ -1623,7 +2134,7 @@ def route(case: VascCase, measurement: VascMeasurement | None = None) -> RouteRe
             next_node="G05",
             level=RULES[hit].level,
             mode=RouteMode.EMERGENCY,
-            class_output=["D3"] if hit in D3_EMERGENCY_RULES else None,
+            class_output=[EMERGENCY_LABELS[hit]] if hit in EMERGENCY_LABELS else None,
             gaps=_collect_gaps(x, G03_P01, trace),
             trace=trace,
         )
@@ -1705,6 +2216,12 @@ def route(case: VascCase, measurement: VascMeasurement | None = None) -> RouteRe
     v14 = RULES["G04.R14"].func(x)
     trace.append(RuleTrace("G04.R14", v14, "G07"))
     if v14 is True:
+        # G04.R19 与 R14 同出口（G07），但依据更具体：R14 只回答「所有阻断项
+        # 都清了」，R19 回答「清了，而且这人是术后随访」。审计时后者能一眼
+        # 看出病人做过手术 —— 同样的出口，证据粒度不同。
+        if RULES["G04.R19"].func(x) is True:
+            trace.append(RuleTrace("G04.R19", True, "G07"))
+            return _finish_mode(x, "G07", RouteMode.GUIDELINE, "G04.R19", trace)
         return _finish_mode(x, "G07", RouteMode.GUIDELINE, "G04.R14", trace)
 
     return _make(
@@ -1726,7 +2243,24 @@ def route(case: VascCase, measurement: VascMeasurement | None = None) -> RouteRe
 def _finish_mode(
     x: _Ctx, next_node: NextNode, mode: RouteMode, rule_id: str, trace: list[RuleTrace]
 ) -> RouteResult:
-    """进入模式后继续跑 G08/G09：产出病种标签、处理冲突与回流。"""
+    """进入模式后继续跑 G08/G09：产出病种标签、处理冲突与回流。
+
+    V3.6.2 的完整顺序（顺序本身是判据，不要重排）::
+
+        G08.R01–R08   打主标签（D1–D7 + Ⅳ型TAAA 扩展）
+        G08.R10/R11   病因修饰标签（炎症 → D5、遗传 → 保留为病因）
+        G04.R20       病因与主病种并存的确认（不改出口，只留痕）
+        G08.R12/R13   感染来源与术后分诊的**证据定档**（不决定入口节点）
+        G08.R14/R15   无目标病变 / 未分类的**候选**（暂定，交 G09 终审）
+        G08.R09+R09   多标签冲突（R09 把允许共存的组合排除在冲突之外）
+        G09.R05/R06   分类中新发现的感染/瘘、术后异常（补标签，可回流）
+        G09.R01       抽取层标记的新急症 → 回流 G05（最优先）
+        G09.R02       身份/来源冲突 → 隔离核实
+        G09.R04       正常出口
+        G09.R03       冲突 → 人工复核
+        G09.R07/R08   无标签时的终审：无目标病变 / 未分类
+    """
+    # ---- G08 主标签 ----
     for rid in G08_RULES:
         v = RULES[rid].func(x)
         trace.append(RuleTrace(rid, v, "G06"))
@@ -1737,17 +2271,55 @@ def _finish_mode(
         if v is True and LABEL_BY_RULE[rid] not in x.labels:
             x.labels.append(LABEL_BY_RULE[rid])
 
+    # ---- G08.R10/R11 病因修饰标签 ----
     if RULES["G08.R10"].func(x) is True and "D5" not in x.labels:
         x.labels.append("D5")
         trace.append(RuleTrace("G08.R10", True, "G06"))
     if RULES["G08.R11"].func(x) is True:
         trace.append(RuleTrace("G08.R11", True, "G06"))
 
-    conflict = RULES["G08.R09"].func(x)
-    x.diag_conflict = bool(conflict)
-    trace.append(RuleTrace("G08.R09", conflict, "人工复核"))
+    # ---- G04.R20 病因与主病种并存 ----
+    # 出口写的是 G08，说明它属于分类阶段。此处复记一次：G04 阶段判它时
+    # 主标签还没出来，只能判「有病因、有 AAA」；到这里才谈得上「并存」。
+    trace.append(RuleTrace("G04.R20", RULES["G04.R20"].func(x), "G08"))
 
-    # G09.R01 回流优先于模式（优先级 G03 回流 > G06）
+    # ---- G08.R12/R13 证据定档，不决定入口 ----
+    # 入口细化（D4.2/D4.3、D6.1/D6.2/D6.3）由 D4.1 / D6.1 分诊时判 —— 在这里
+    # 再判一次就是第二处判据。这两条只留痕，供审计与下游核对。
+    for rid in ("G08.R12", "G08.R13"):
+        trace.append(RuleTrace(rid, RULES[rid].func(x), "G06"))
+
+    # ---- G08.R14/R15 候选（暂定）----
+    x.no_target_candidate = RULES["G08.R14"].func(x)
+    trace.append(RuleTrace("G08.R14", x.no_target_candidate, "G09"))
+    x.unclassifiable_candidate = RULES["G08.R15"].func(x)
+    trace.append(RuleTrace("G08.R15", x.unclassifiable_candidate, "G09"))
+
+    # ---- G08.R09 × G09.R09 冲突判定 ----
+    raw_conflict = RULES["G08.R09"].func(x)
+    coexist = RULES["G09.R09"].func(x)
+    trace.append(RuleTrace("G08.R09", raw_conflict, "人工复核"))
+    trace.append(RuleTrace("G09.R09", coexist, "人工复核"))
+    # R09 的白名单意义在这里落地：被判为「允许共存」的多标签不升级成冲突。
+    x.diag_conflict = False if coexist is True else bool(raw_conflict)
+
+    # ---- G09.R05 分类中新发现的感染/主动脉瘘 ----
+    # 规格：「新增感染/瘘证据时保留疑似/确诊状态并路由 D4；如活动性出血、休克
+    # 或破裂危险，**同时**回 G03/G05」。
+    #
+    # 这里**只留痕、不补 D4 标签**：D4 标签由 ``G08.R04`` 负责（两者同源读
+    # ``CL.INFECTION`` / ``CL.FISTULA``）。补一次会让病种引擎从 ``D4.1`` 再走
+    # 一遍 —— 而 ``D6.3`` 已经转到 ``D4.3``，多出来的 ``D4.1`` 是重复路径。
+    # 急症回流由 ``G09.R01`` 承担，本规则不重复判急症等级（那是 G03 的职责）。
+    trace.append(RuleTrace("G09.R05", RULES["G09.R05"].func(x), "G06"))
+
+    # ---- G09.R06 术后异常 ----
+    if RULES["G09.R06"].func(x) is True:
+        trace.append(RuleTrace("G09.R06", True, "G06"))
+        if "D6" not in x.labels:
+            x.labels.append("D6")
+
+    # ---- G09.R01 回流优先于模式（优先级 G03 回流 > G06）----
     if RULES["G09.R01"].func(x) is True:
         trace.append(RuleTrace("G09.R01", True, "G05"))
         return _make(
@@ -1762,7 +2334,7 @@ def _finish_mode(
             trace=trace,
         )
 
-    # G09.R02：身份/来源冲突 → 隔离不可信记录，转资料核实（排在 R03 之前）
+    # ---- G09.R02 身份/来源冲突 → 隔离不可信记录 ----
     if RULES["G09.R02"].func(x) is True:
         trace.append(RuleTrace("G09.R02", True, "资料核实"))
         return _make(
@@ -1777,9 +2349,10 @@ def _finish_mode(
             trace=trace,
         )
 
-    # G09.R04 是正常出口：无新急症 + 无冲突 + 至少一个可信标签
+    # ---- G09.R04 正常出口 ----
     trace.append(RuleTrace("G09.R04", RULES["G09.R04"].func(x), "G06"))
 
+    # ---- G09.R03 冲突 → 人工复核 ----
     if x.diag_conflict:
         trace.append(RuleTrace("G09.R03", True, "人工复核"))
         return _make(
@@ -1792,6 +2365,41 @@ def _finish_mode(
             gaps=_collect_gaps(x, ("G08.R09", "G09.R03"), trace),
             trace=trace,
         )
+
+    # ---- G09.R07 / R08：没有标签时的终审 ----
+    # 这一段只在「一个标签都没打出来」时生效。有标签就走正常出口 ——
+    # 「无目标病变」和「已分到 D1」是互斥的，不能同时成立。
+    if not x.labels:
+        if RULES["G09.R07"].func(x) is True:
+            trace.append(RuleTrace("G09.R07", True, "无目标病变"))
+            return _make(
+                x,
+                kind=RouteKind.NO_TARGET,
+                rule_id="G09.R07",
+                reason=(
+                    "G09.R07 目标区域已充分评价且未见任何目标病变：停止 D1–D7 分流，"
+                    "由临床团队继续其他病因诊断。"
+                ),
+                next_node="无目标病变",
+                level="未触发",
+                gaps=_collect_gaps(x, ("G08.R14", "G09.R07"), trace),
+                trace=trace,
+            )
+        if RULES["G09.R08"].func(x) is True:
+            trace.append(RuleTrace("G09.R08", True, "资料核实"))
+            return _make(
+                x,
+                kind=RouteKind.VERIFY,
+                rule_id="G09.R08",
+                reason=(
+                    "G09.R08 未能形成可信病种标签：输出未分类并列出待核字段，不强行选择 D1–D7。"
+                ),
+                next_node="资料核实",
+                level="未触发",
+                gaps=_collect_gaps(x, ("G08.R15", "G09.R08"), trace),
+                unknown_decisive=True,
+                trace=trace,
+            )
 
     return _make(
         x,
@@ -1828,6 +2436,9 @@ is_uncertain_token = _is_uncertain_token
 
 
 __all__ = [
+    "D3_EMERGENCY_RULES",
+    "EMERGENCY_LABELS",
+    "EMERGENCY_NO_LABEL",
     "FALLBACK_VERIFY",
     "G03_P01",
     "G03_P02",

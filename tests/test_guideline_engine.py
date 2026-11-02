@@ -130,7 +130,7 @@ class TestRegistry:
             assert row.startswith(f"{sheet}!"), f"{rule_id} 的源行 {row} 与 sheet 不符"
 
     def test_implemented_rule_count_matches_declaration(self) -> None:
-        assert IMPLEMENTED_RULE_COUNT == len(RULE_ROWS) == 169
+        assert IMPLEMENTED_RULE_COUNT == len(RULE_ROWS) == 172
 
     def test_implemented_rules_per_sheet_do_not_exceed_spec(self) -> None:
         for sheet, total in SPEC_RULE_COUNTS.items():
@@ -147,6 +147,13 @@ class TestD31:
         assert report.path[0] == "D3.1"
         assert report.escalation == "G05"
         assert ("D3.1.R01", True) in [(e.rule_id, e.verdict) for e in report.entries]
+
+    def test_r05_stays_unknown_when_no_grade_was_recorded(self) -> None:
+        """破裂分级未记录 → ``R05`` 保持 UNKNOWN，不得当成「排除破裂」。"""
+        case = make_case(cl={"aaa_rupture": None})
+        outcome = d3_1(GuidelineState(case=case, route=route(case)))
+        assert outcome.verdicts["D3.1.R05"] is None
+        assert outcome.verdicts["D3.1.R01"] is False
 
     def test_r01_reuses_the_router_verdict(self) -> None:
         """R01 必须直接看 ``route_result.rule_id``，不得在工具里重判。"""
@@ -235,8 +242,12 @@ class TestD32AndD33:
         assert report.terminal is not None and "候选" in report.terminal
         assert any("IFU 未核验" in gap for gap in report.gaps)
 
-    def test_d33_is_unreachable_until_d32_is_confirmed(self) -> None:
-        """D3.2 的出口是「术者确认」，故本轮不会自动进 D3.3。"""
+    def test_d33_is_not_entered_before_the_doctor_decides(self) -> None:
+        """医生还没写治疗目标时，D3.2 停在「术者确认」，不进 D3.3。
+
+        反向用例见 ``TestD33.test_a_recorded_goal_hands_the_case_to_the_recorder``：
+        一旦 ``D3.GOALS`` 写下来，同一个 D3.2 就会把病例交给 D3.3 留痕。
+        """
         report = _report(_rupture_case())
         assert "D3.3" not in report.path
 
@@ -324,22 +335,161 @@ class TestEvaluateNodeFallback:
 # ===========================================================================
 # D3.3：非修复决策的记录器
 # ===========================================================================
+#: 一份「医生已决定不修复」的完整记录 —— 五项 + 原因 + 裁决人。
+_D33_NONREPAIR: dict[str, object] = {
+    "D3.REPAIR_FEASIBILITY": "无可行方案",
+    "D3.PATIENT_WISH": "拒绝特定治疗",
+    "D3.CAPACITY": "长期无能力",
+    "D3.PROGNOSIS": "医生综合评估：长期卧床、痴呆，修复获益极低",
+    "D3.GOALS": "舒适照护",
+    "D3.NONREPAIR_REASON": ["患者极高风险", "患者拒绝"],
+}
+
+
+def _d33_state(d3: dict[str, object] | None = None) -> GuidelineState:
+    case = _rupture_case()
+    return GuidelineState(
+        case=case, route=route(case), node_inputs={"D3": {**_D33_NONREPAIR, **(d3 or {})}}
+    )
+
+
 class TestD33:
-    def test_reports_gaps_when_nothing_recorded(self) -> None:
+    """D3.3 是「裁决记录面」，**当前没有自动入边**。
+
+    规格 D3.3 全表 12 行的 M 列（输出／下一节点）都是「人工决策 / 医生确认 /
+    记录理由 / 终点动作」，没有一条 ``next_node``。所以本类全部直接调用节点测
+    判据——端到端走不到这里，那是设计结果，不是缺口（见节点模块注释）。
+    """
+
+    # ---- 结构：不进主流程 ----
+
+    def test_a_recorded_goal_does_not_reroute_d32(self) -> None:
+        """医生写下治疗目标也不改道 —— D3.2 的出口恒为「术式方向 + 术者确认」。
+
+        曾加过一条 `D3.GOALS 已记录 → next_node="D3.3"` 的改写，那是给 D3.3
+        造了一条规格没有的入边，还让「已确认不修复」与候选栏的「EVAR：可行候选」
+        并列出现在同一份报告里。这条测试守的就是「不要再加回去」。
+        """
+        outcome = d3_2(_d33_state())
+        assert outcome.next_node is None
+        assert outcome.terminal is not None
+
+    def test_end_to_end_never_enters_d33(self) -> None:
+        """完整跑一遍：即使 ``D3.*`` 填满，路径也停在 ``D3.2``。"""
+        case = _rupture_case()
+        report = run(
+            ToolRequest(case=case, route_result=route(case), node_inputs={"D3": _D33_NONREPAIR})
+        )
+        assert report.path == ("D3.1", "D3.2")
+        assert "D3.3" not in report.path
+
+    def test_without_a_goal_d32_still_stops_at_the_doctor(self) -> None:
+        case = _rupture_case()
+        outcome = d3_2(GuidelineState(case=case, route=route(case)))
+        assert outcome.next_node is None
+        assert outcome.terminal is not None
+
+    def test_a_blocked_anatomy_keeps_the_manual_review(self) -> None:
+        case = make_case(n={"neck_len": None, "neck_d": None, "neck_angle": None})
+        outcome = d3_2(
+            GuidelineState(case=case, route=route(case), node_inputs={"D3": _D33_NONREPAIR})
+        )
+        assert outcome.verdicts["D3.2.R90"] is True
+        assert outcome.next_node is None
+
+    # ---- R90：五项不全就阻断 ----
+
+    def test_all_fields_missing_blocks_with_a_field_list(self) -> None:
         case = _rupture_case()
         outcome = d3_3(GuidelineState(case=case, route=route(case)))
         assert outcome.verdicts["D3.3.R90"] is True
         assert len(outcome.gaps) == len(_D33_FIELDS)
-        assert outcome.terminal is not None and "确认" in outcome.terminal
+        assert outcome.terminal is not None and "术者确认" in outcome.terminal
 
-    def test_reaches_doctor_confirmation_when_all_recorded(self) -> None:
-        """五项都记录后仍需医生确认——不是系统给出「不修复」结论。"""
+    def test_a_repair_goal_reaches_the_confirmation_exit(self) -> None:
+        """五项齐、目标是「积极修复」→ R91，不刷非修复原因的缺口。"""
         case = _rupture_case()
         filled = {spec_id: "已记录" for spec_id, _ in _D33_FIELDS}
+        filled["D3.GOALS"] = "积极修复"
         outcome = d3_3(GuidelineState(case=case, route=route(case), node_inputs={"D3": filled}))
         assert outcome.verdicts["D3.3.R91"] is True
-        assert outcome.gaps == ()
-        assert outcome.terminal is not None and "确认" in outcome.terminal
+        assert not any("NONREPAIR_REASON" in gap for gap in outcome.gaps)
+        assert not any("裁决医师" in gap for gap in outcome.gaps)
+
+    # ---- R01：有理由，但还没决定 ----
+
+    def test_no_option_without_a_decision_lists_the_paths(self) -> None:
+        """R01：做不了但目标还没填 → 摊开转诊/替代/舒适照护，不替医生选。"""
+        outcome = d3_3(_d33_state({"D3.GOALS": "待决定"}))
+        assert outcome.verdicts["D3.3.R01"] is True
+        assert outcome.terminal is not None and "授权医生确认" in outcome.terminal
+
+    def test_patient_refusal_alone_also_triggers_r01(self) -> None:
+        outcome = d3_3(_d33_state({"D3.GOALS": "待决定", "D3.REPAIR_FEASIBILITY": "存在EVAR方案"}))
+        assert outcome.verdicts["D3.3.R01"] is True
+
+    # ---- R02 / R03：已决定，看原因写得全不全 ----
+
+    def test_a_decision_without_a_reason_is_recorded_but_flagged(self) -> None:
+        """目标写「舒适照护」但原因是「未确定」→ R02，出口说须补原因。"""
+        outcome = d3_3(_d33_state({"D3.NONREPAIR_REASON": ["未确定"]}))
+        assert outcome.verdicts["D3.3.R03"] is False
+        assert outcome.verdicts["D3.3.R02"] is True
+        assert outcome.terminal is not None and "须补非修复原因" in outcome.terminal
+        assert any("D3.NONREPAIR_REASON" in gap for gap in outcome.gaps)
+
+    def test_a_complete_record_reaches_r03(self) -> None:
+        outcome = d3_3(_d33_state())
+        assert outcome.verdicts["D3.3.R03"] is True
+        assert outcome.terminal is not None and "待授权医生确认" in outcome.terminal
+
+    def test_a_missing_reason_field_is_unknown_for_r03(self) -> None:
+        """原因栏整块没填 → R03 判不了（``None``），R02 仍成立。"""
+        outcome = d3_3(_d33_state({"D3.NONREPAIR_REASON": None}))
+        assert outcome.verdicts["D3.3.R03"] is None
+        assert outcome.verdicts["D3.3.R02"] is True
+
+    def test_an_empty_reason_list_is_unknown_for_r03(self) -> None:
+        outcome = d3_3(_d33_state({"D3.NONREPAIR_REASON": []}))
+        assert outcome.verdicts["D3.3.R03"] is None
+
+    def test_r02_is_unknown_without_a_recorded_goal(self) -> None:
+        """目标栏没值时 R02 只能给 UNKNOWN —— 它连「是不是不修复」都判不了。"""
+        from src.tools.guideline_engine.nodes.d3_ruptured import _d33_r02
+
+        assert _d33_r02(_d33_state({"D3.GOALS": None})) is None
+
+    def test_a_limited_treatment_goal_also_counts_as_non_repair(self) -> None:
+        """「有限治疗」与「舒适照护」同为不修复档（规格 F 列）。"""
+        outcome = d3_3(_d33_state({"D3.GOALS": "有限治疗"}))
+        assert outcome.verdicts["D3.3.R03"] is True
+
+    # ---- 签名只是提示，不是字段 ----
+
+    def test_the_signature_is_only_a_gap_hint(self) -> None:
+        """「裁决医师与时间」只出现在缺口提示里，不构成任何判据。
+
+        规格 R02 的正文要求「必须记录…裁决医师与时间」，但 M 列给系统的动作
+        只有「记录并停止自动术式推荐」。签名是医院流程的事，本系统不采集——
+        曾经把它读成两个输入字段（``D3.ATTEST_ACTOR`` / ``D3.ATTEST_AT``）
+        并驱动规则分档，那是越界，已删除。
+        """
+        outcome = d3_3(_d33_state())
+        assert any("须在病历中补记裁决医师与时间" in gap for gap in outcome.gaps)
+        assert not any("ATTEST" in key for key in outcome.verdicts)
+
+    # ---- 终点语言 ----
+
+    def test_the_terminal_keeps_the_upstream_direction(self) -> None:
+        """终点要同时说「定下来的处置」和「此前算出的方向」。"""
+        from src.tools.guideline_engine.state import NodeOutcome
+
+        state = _d33_state()
+        state.visited.append(
+            NodeOutcome(node_id="D3.2", verdicts={}, entries=(), terminal="EVAR 一线")
+        )
+        outcome = d3_3(state)
+        assert outcome.terminal is not None and "上游术式方向：EVAR 一线" in outcome.terminal
 
 
 # ===========================================================================
@@ -591,6 +741,239 @@ class TestD32Candidates:
             text = cand.render()
             for banned in ("SKU", "品牌", "型号", "mm 支架", "Endurant", "Excluder"):
                 assert banned not in text
+
+
+class TestD31CtaPath:
+    """``D3.1.R03/R04`` —— 判据已实现，但端到端被 ``R01``/``R02`` 遮蔽。
+
+    这两条的输入空间被 P0-A 层吃干净了：``class_output`` 含 ``D3`` 只在
+    ``D3_EMERGENCY_RULES``（G03 九条）命中时发生，而那九条全部落在
+    ``_D3_CONFIRMED`` / ``_D3_SUSPECTED`` 里（见
+    ``test_the_two_rule_sets_cover_every_d3_label``）。所以它们
+    只在手动调用、或将来 R01/R02 覆盖范围收缩时执行。
+
+    仍然要写真判据：占位 ``return None`` 与「实现了但被遮蔽」在工程上是两件事
+    ——后者不是待办，前者是。
+    """
+
+    def _state(self, cl: dict[str, object] | None = None, **inputs: object) -> GuidelineState:
+        case = make_case(cl={"aaa_rupture": "疑似", **(cl or {})})
+        return GuidelineState(
+            case=case, route=route(case), node_inputs={"D3": dict(inputs)} if inputs else {}
+        )
+
+    # ---- R03：能不能等 CTA ----
+
+    def test_a_stable_patient_can_wait_for_cta(self) -> None:
+        from src.tools.guideline_engine.nodes.d3_ruptured import _d31_r03
+
+        assert _d31_r03(self._state(**{"D3.CTA_FEASIBLE": "可以"})) is True
+
+    def test_an_unstable_patient_cannot_wait(self) -> None:
+        """``不可以`` 是确定的「不能等」，不是「判不了」——返 False 才让它落到 R04。"""
+        from src.tools.guideline_engine.nodes.d3_ruptured import _d31_r03
+
+        assert _d31_r03(self._state(**{"D3.CTA_FEASIBLE": "不可以"})) is False
+
+    def test_an_uncertain_verdict_is_unknown(self) -> None:
+        """规格 J 列：「不确定→紧急团队判断」——系统不替它判。"""
+        from src.tools.guideline_engine.nodes.d3_ruptured import _d31_r03
+
+        assert _d31_r03(self._state(**{"D3.CTA_FEASIBLE": "不确定"})) is None
+
+    def test_an_unrecorded_field_is_unknown(self) -> None:
+        from src.tools.guideline_engine.nodes.d3_ruptured import _d31_r03
+
+        assert _d31_r03(self._state()) is None
+
+    # ---- R04：影像不够，临床还在怀疑 ----
+
+    def test_missing_cta_with_clinical_suspicion_keeps_the_emergency_state(self) -> None:
+        from src.tools.guideline_engine.nodes.d3_ruptured import _d31_r04
+
+        assert _d31_r04(self._state(**{"D3.CTA_COVERAGE": "未做"})) is True
+
+    def test_unevaluable_cta_with_an_unresolved_grade_also_counts(self) -> None:
+        from src.tools.guideline_engine.nodes.d3_ruptured import _d31_r04
+
+        state = self._state(cl={"aaa_rupture": "无法评价"}, **{"D3.CTA_COVERAGE": "不可评价"})
+        assert _d31_r04(state) is True
+
+    def test_adequate_coverage_does_not_enter_this_rule(self) -> None:
+        from src.tools.guideline_engine.nodes.d3_ruptured import _d31_r04
+
+        state = self._state(**{"D3.CTA_COVERAGE": "腹主动脉至髂股入路"})
+        assert _d31_r04(state) is False
+
+    def test_missing_cta_without_suspicion_is_false(self) -> None:
+        """影像没做，但破裂状态与报告都不支持怀疑 —— 不是「影像不足以判」。"""
+        from src.tools.guideline_engine.nodes.d3_ruptured import _d31_r04
+
+        case = make_case(cl={"aaa_rupture": "明确"}, c={"rupture_report": "明确未见"})
+        state = GuidelineState(
+            case=case, route=route(case), node_inputs={"D3": {"D3.CTA_COVERAGE": "未做"}}
+        )
+        assert _d31_r04(state) is False
+
+    # ---- 结构：为什么端到端到不了这两条 ----
+
+    def test_the_end_to_end_case_is_resolved_at_the_p0_layer(self) -> None:
+        """P0-A 命中即 return，``verdicts`` 里根本没有 P3 两条。"""
+        case = _rupture_case()
+        outcome = d3_1(GuidelineState(case=case, route=route(case)))
+        assert outcome.verdicts["D3.1.R01"] is True
+        assert "D3.1.R03" not in outcome.verdicts
+        assert "D3.1.R04" not in outcome.verdicts
+
+    def test_the_two_rule_sets_cover_every_d3_label(self) -> None:
+        """``D3`` 标签只来自 G03 九条，而 R01/R02 的判据集合**恰好**覆盖那九条。
+
+        这条断言是 ``D3.1.R03/R04``「求值不可达」的**结构依据**：只要
+        ``_D3_CONFIRMED | _D3_SUSPECTED`` 与预置标签集合相等，P0-A 两条就必有一条
+        先命中，P3 两条永远轮不到。将来往 ``EMERGENCY_LABELS`` 里加 ``D3`` 规则却
+        没落进这两个集合，这里会先炸——否则那两条 P3 会突然变得可达，
+        而「不可达」的注释还留在原地。
+        """
+        from src.rules.router import D3_EMERGENCY_RULES
+        from src.tools.guideline_engine.nodes.d3_ruptured import _D3_CONFIRMED, _D3_SUSPECTED
+
+        assert _D3_CONFIRMED | _D3_SUSPECTED == set(D3_EMERGENCY_RULES)
+        assert _D3_CONFIRMED & _D3_SUSPECTED == frozenset()
+
+
+class TestD3ResourceCoverage:
+    """D3.2 的资源三条 —— 修前 ``R03``/``R06``/``R07`` 一条都没生效过。"""
+
+    def _d32(self, resource: str | None = None):
+        case = make_case(cl={"aaa_rupture": "明确"})
+        inputs = {} if resource is None else {"D3": {"D3.TEAM_RESOURCE": resource}}
+        return d3_2(GuidelineState(case=case, route=route(case), node_inputs=inputs))
+
+    def test_clinical_suspicion_hits_the_suspected_rule(self) -> None:
+        """``D3.1.R02``：临床怀疑型（报告写疑似破裂、影像未见外溢）。
+
+        修前这条规则从未被判 True——不是判据错，是没有用例造出这种组合：
+        路由器走 ``G03.R07``（临床怀疑）而不是 ``G03.R01``（影像明确）。
+        """
+        case = make_case(cl={"aaa_rupture": "疑似"}, c={"rupture_report": "疑似破裂"})
+        result = route(case)
+        assert result.rule_id == "G03.R07"
+
+        outcome = d3_1(GuidelineState(case=case, route=result))
+        assert outcome.verdicts["D3.1.R02"] is True
+        assert outcome.escalation == "G05"
+        assert outcome.next_node == "D3.2"
+
+    def test_center_without_capacity_transfers_instead_of_operating(self) -> None:
+        """院方明确做不了 → 转诊/现场救援，不能说「EVAR 一线」。
+
+        修前 ``R03`` 拿「本中心无法实施」去比 ``D3.TEAM_RESOURCE``——那个字符串
+        不在字段值域里（正确值是「均不可立即用」），所以恒为 False；同时 ``R01``
+        完全不看资源，于是报告会写「EVAR 一线」，让团队去做本院做不到的手术。
+        """
+        outcome = self._d32("均不可立即用")
+        assert outcome.verdicts["D3.2.R01"] is False
+        assert outcome.verdicts["D3.2.R03"] is True
+        assert outcome.terminal == "急诊交接／转诊／现场救援"
+
+    def test_an_unrecorded_resource_list_does_not_block_first_line(self) -> None:
+        """未记录 ≠ 不可用（规格 R90 原话「未确认不等于不可用」）。"""
+        outcome = self._d32()
+        assert outcome.verdicts["D3.2.R01"] is True
+        assert outcome.terminal is not None and "一线" in outcome.terminal
+
+    @pytest.mark.parametrize("resource", [None, "未知", "证据冲突", "均不可立即用"])
+    def test_resource_gap_is_shown_to_the_reader(self, resource: str | None) -> None:
+        """``R06``：资源未确认或有缺项 → 把缺失清单摆出来（展示性规则）。"""
+        assert self._d32(resource).verdicts["D3.2.R06"] is True
+
+    def test_confirmed_capacity_needs_no_resource_checklist(self) -> None:
+        assert self._d32("两者可用").verdicts["D3.2.R06"] is False
+
+    def test_unavailable_capacity_downgrades_both_candidates(self) -> None:
+        """终点说「转诊」，候选栏就不能说「EVAR 可行」。
+
+        修前只改了 ``R03`` 的出口，候选仍由 ``_evar_candidate`` 按解剖判，
+        同一份报告里出现「急诊交接／转诊」与「EVAR：可行候选」两句相反的话。
+        档位取 ``MDT`` 而不是 ``EXCLUDED``：否定的不是术式，是「本院此刻能不能做」。
+        """
+        statuses = {c.procedure: c.status for c in self._d32("均不可立即用").candidates}
+        assert statuses["EVAR"] is CandidateStatus.MDT
+        assert statuses["OSR"] is CandidateStatus.MDT
+
+    def test_confirmed_capacity_keeps_evar_feasible(self) -> None:
+        statuses = {c.procedure: c.status for c in self._d32("两者可用").candidates}
+        assert statuses["EVAR"] is CandidateStatus.FEASIBLE
+
+    def test_parallel_preparation_always_applies_inside_this_node(self) -> None:
+        """``R07``：进了 D3.2 就是破裂病例，并行复苏/备血/手术室恒适用。"""
+        for resource in (None, "两者可用", "均不可立即用"):
+            assert self._d32(resource).verdicts["D3.2.R07"] is True
+
+    def test_display_rules_are_recorded_but_hold_no_slot(self) -> None:
+        """``R06``/``R07`` 只留痕、不占出口 —— 结构性断言，防有人把它们挪回槽位。
+
+        它们原来在 ``_D32_SLOTS`` 里，判据恒 ``None`` 才不抢出口。那种写法的问题
+        不是「保守」而是「永不生效」：``R07`` 恒真的话它会抢在 ``R91`` 前面，
+        恒 ``None`` 的话它连记录都留不下。
+        """
+        from src.tools.guideline_engine.nodes.d3_ruptured import (
+            _D32_DISPLAY_RULES,
+            _D32_SLOTS,
+        )
+
+        slot_ids = {slot.rule_id for slot in _D32_SLOTS}
+        display_ids = {rule.rule_id for rule in _D32_DISPLAY_RULES}
+        assert display_ids == {"D3.2.R06", "D3.2.R07"}
+        assert not (display_ids & slot_ids)
+
+        outcome = self._d32("两者可用")
+        assert "D3.2.R06" in outcome.verdicts
+        assert "D3.2.R07" in outcome.verdicts
+        assert outcome.terminal == "EVAR 一线（术者即时确认）"
+
+
+class TestShadowedFallbacks:
+    """三条「恒真但被遮蔽」的兜底 —— 执行不到，至少要把函数体跑一遍。
+
+    它们不是死代码：``R91`` 的职责是「以后新增征象字段时不会漏掉兜底」。
+    但现在输入空间被 R01/R02/R90 分完了，任何用例都到不了这里，所以只能直调判据。
+    """
+
+    def test_d13_r08_only_fires_when_both_directions_are_blocked(self) -> None:
+        """腔内走不通 + 当前不能开刀 → MDT/转诊，而不是「不可手术」。"""
+        case = make_case(
+            cl={"aaa_diam": 56.0, "aaa_rupture": "未见相关证据", "diag_multi": None},
+            n={"seal_ifu": "不符"},
+        )
+        state = GuidelineState(
+            case=case, route=route(case), node_inputs={"D1": {"D1.OP_FITNESS": "当前不适合"}}
+        )
+        outcome = d1_3(state)
+        assert outcome.verdicts["D1.3.R08"] is True
+        assert outcome.terminal is not None and "MDT" in outcome.terminal
+
+    def test_d13_r08_stays_false_when_surgery_is_still_possible(self) -> None:
+        case = make_case(
+            cl={"aaa_diam": 56.0, "aaa_rupture": "未见相关证据", "diag_multi": None},
+            n={"seal_ifu": "不符"},
+        )
+        state = GuidelineState(
+            case=case, route=route(case), node_inputs={"D1": {"D1.OP_FITNESS": "可接受"}}
+        )
+        assert d1_3(state).verdicts["D1.3.R08"] is False
+
+    def test_d22_r91_is_a_constant_exit(self) -> None:
+        from src.tools.guideline_engine.nodes.d2_symptomatic import _d22_r91
+
+        state = GuidelineState(case=make_case(), route=route(make_case()))
+        assert _d22_r91(state) is True
+
+    def test_d52_r91_is_a_constant_exit(self) -> None:
+        from src.tools.guideline_engine.nodes.d5_special import _d52_r91
+
+        state = GuidelineState(case=make_case(), route=route(make_case()))
+        assert _d52_r91(state) is True
 
 
 class TestCandidateAggregation:
@@ -2819,10 +3202,16 @@ class TestD61FollowUpTriage:
         assert "D6.1.R02" not in outcome.verdicts
 
     def test_infection_goes_to_d63_then_d43(self) -> None:
-        """感染的完整链路：D6.1 → D6.3 → D4.3（单值是 next_node 的限制）。"""
+        """感染的完整链路：D6.1 → D6.3 → D4.3（单值是 next_node 的限制）。
+
+        修前路径里还有 ``D1.1``：术后病人同时拿到 ``D1`` 与 ``D6`` 两个标签，
+        病种引擎从两个入口各走一遍，报告里出现两套互相矛盾的随访建议
+        （按直径复查 vs 内漏监测）。``G08.R01/R02`` 加上「未做过修复」前置后，
+        术后只走 ``D6``，这条断言也随之收紧。
+        """
         case = _d6_state(n={"endoleak_type": "无", "infection_ctx": "高度怀疑"}).case
         report = run(ToolRequest(case=case, route_result=route(case), node_inputs={"D6": _D6_PLAN}))
-        assert report.path == ("D1.1", "D6.1", "D6.3", "D4.3")
+        assert report.path == ("D6.1", "D6.3", "D4.3")
 
     def test_new_rupture_escalates(self) -> None:
         outcome = d6_1(_d6_state(cl={"aaa_rupture": "明确"}))

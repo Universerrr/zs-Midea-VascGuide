@@ -48,13 +48,17 @@ from ....rules.router import (
     or_,
     token,
 )
-from ..state import Candidate, CandidateStatus, GuidelineEntry, GuidelineState, NodeFn, NodeOutcome
+from ..state import Candidate, CandidateStatus, GuidelineState, NodeFn, NodeOutcome
 from .common import (
+    DisplayRule,
     RuleSlot,
     access_blocked,
     anatomy_available,
+    display_entries,
     evaluate_node,
     missing_fields,
+    multi_field,
+    spec_token,
 )
 
 __all__ = ["NODES", "d3_1", "d3_2", "d3_3"]
@@ -82,14 +86,6 @@ _D32_RESOURCE_FIELDS: tuple[tuple[str, str], ...] = (
     ("D3.BLOOD_PREP", "血液准备：血型/交叉配血/大量输血流程"),
     ("D3.ANAESTHESIA_PLAN", "麻醉与生理策略评估"),
     ("D3.RESUSCITATION_STRATEGY", "复苏策略与目标"),
-)
-
-_D33_FIELDS: tuple[tuple[str, str], ...] = (
-    ("D3.REPAIR_FEASIBILITY", "修复可行性：存在 EVAR/OSR 方案 / 需转诊 / 无可行方案"),
-    ("D3.PATIENT_WISH", "患者意愿：有决策能力时的明确表达 / 预先医疗决定"),
-    ("D3.CAPACITY", "决策能力评估与合法代理人"),
-    ("D3.PROGNOSIS", "获益与预后综合评估"),
-    ("D3.GOALS", "治疗目标：积极修复 / 转诊 / 有限治疗 / 舒适照护"),
 )
 
 
@@ -132,29 +128,64 @@ def _d31_r02(state: GuidelineState) -> Verdict:
 
 
 def _d31_r03(state: GuidelineState) -> Verdict:
-    """CTA 是否可等待 —— **恒 UNKNOWN，不是「没有通道」**。
+    """P3：患者是否**足够稳定**等到 CTA（``D3.1!12``）。
 
-    通道是通的（``state.node_field("D3.CTA_FEASIBLE")`` 能取到「可以/不可以/
-    不确定」），缺的是**抽取来源**：目前没有任何环节把这张表填进 ``node_inputs``。
-    在抽取通道建好之前返回 ``None`` 而不是 ``False``，语义上才对：字段没提供
-    不等于「不可以做 CTA」。
+    规格 G 列是两档：稳定 → 尽快 CTA 胸腹主动脉与入路；过度不稳定 → 直接
+    手术室/术中影像。两档的出口相同（都进 ``D3.2``），所以本规则只回答
+    「能不能等」这一个问题；分档的措辞由 ``exit_value`` 承担。
 
-    补实现时注意：本条两档（尽快 CTA / 直接手术室）的 ``exit_value`` 是同一个
-    ``D3.2``，差别只在说明文字。``RuleSlot.statement`` 是静态串，装不下这个
-    分叉——要么接受「一条规则两种说法」的措辞，要么把分档写进 ``terminal``。
+    判据主体是 ``D3.CTA_FEASIBLE``（规格 H 列：医生/麻醉评估）：
+    ``可以`` → 能等；``不可以`` → 不能等；``不确定``/未记录 → 判不了
+    （规格 J 列：「不确定→紧急团队判断」）。
+
+    ⚠️ 读**原始值** ``token`` 而不是 ``spec_token``：``spec_token`` 会把
+    ``不确定`` 折成 ``None``（它在 ``UNCERTAIN_TOKENS`` 里）。这里的
+    「不确定」是**字段的合法结论**，不是「值缺失」——同 ``D3.CTA_COVERAGE``
+    的「不可评价」。两层「不确定」必须分开：``Q.VALUE_STATUS`` 的
+    「不可评价」是「这个值的状态不明」，``D3.*`` 的「不可评价」是「影像
+    确实无法评价」这个确定结论。
+
+    ⚠️ **端到端不可达，但不是「判据没写」**：``class_output`` 含 ``D3`` 只在
+    ``D3_EMERGENCY_RULES``（G03 九条）命中时发生，而那九条全部落在
+    ``_D3_CONFIRMED`` 或 ``_D3_SUSPECTED`` 里 —— ``R01``/``R02`` 必有一条先命中
+    （同为 P0-A 且声明在前）。所以本规则只在手动调用、或将来 R01/R02
+    的覆盖范围收缩时才会执行。保留真判据的理由：占位 ``return None`` 与
+    「实现了但被遮蔽」在工程上是两件事——后者不是待办，前者是。
     """
-    return None  # type: ignore[return-value]
+    return eq(token(state.node_field("D3.CTA_FEASIBLE")), "可以")
+
+
+#: ``D3.CTA_COVERAGE`` 里表示「影像不足以判」的三档（规格 F 列值域）。
+#: ``腹主动脉至髂股入路`` / ``胸腹扩展`` 两档属覆盖充分，不在其中。
+_CTA_INCOMPLETE: tuple[str, ...] = ("未做", "不可评价", "部分")
 
 
 def _d31_r04(state: GuidelineState) -> Verdict:
-    """临床高度怀疑但影像缺失/不确定 —— 同上，通道存在、抽取缺位。
+    """P3：临床仍在怀疑、但影像不足以判 → 维持急诊疑似，不降级（``D3.1!16``）。
 
-    要判它得同时读 ``D3.RUPTURE_CONTEXT`` / ``D3.CTA_COVERAGE`` /
-    ``D3.HEMORRHAGE_EVIDENCE`` 三个**自由文本枚举**（「未做 / 不可评价 / 结果
-    冲突」），而模型层没有对应的 ``Literal``。在抽取层定下这三档的规范值之前
-    就读，只会得到「关键词匹配」，那正是本仓库禁止的做法。
+    规格 G 列的两个前提：临床医生明确疑似（或危险证据持续）**且** CTA 未做／
+    不可评价／结果冲突。所以判据分两段，缺一段就判不了：
+
+    1. 影像是否不足以判 —— 读 ``D3.CTA_COVERAGE``（值域稳定，四档明确）；
+    2. 临床是否仍在怀疑 —— 读 ``CL.AAA_RUPTURE`` 或 ``C.RUPTURE_REPORT``。
+
+    为什么第二段不读 ``D3.RUPTURE_CONTEXT``：它是「已知AAA+急性腹痛+晕厥…」
+    这种**组合串**（规格 D 列写的「结构化组合」），按子串匹配等于关键词匹配，
+    本仓库明令禁止。``CL.AAA_RUPTURE`` 是同一事实的结构化版本，判它更可靠。
+
+    ⚠️ ``D3.CTA_COVERAGE`` 同样读原始值：它的 ``不可评价`` 是确定结论
+    （「这次影像确实没法评价」），而 ``spec_token`` 会把它折成 ``None``——
+    折掉之后「影像不可评价」与「没填这个字段」就分不开了，而 R04 要的正是前者。
+
+    与 ``R03`` 同一条限制：端到端被 ``R01``/``R02`` 遮蔽，见 R03 的说明。
     """
-    return None  # type: ignore[return-value]
+    coverage = eq(token(state.node_field("D3.CTA_COVERAGE")), *_CTA_INCOMPLETE)
+    if coverage is not True:
+        return coverage
+    return or_(
+        eq(_rupture(state), "疑似", "无法评价"),
+        eq(_report(state), "疑似破裂"),
+    )
 
 
 def _d31_r05(state: GuidelineState) -> Verdict:
@@ -221,7 +252,8 @@ _D31_SLOTS: tuple[RuleSlot, ...] = (
         rule_id="D3.1.R03",
         priority="P3",
         source_row="D3.1!12",
-        statement="决定 CTA 是否可等待：稳定则尽快 CTA，过度不稳定则直接手术室",
+        statement="决定 CTA 是否可等待：足够稳定则尽快 CTA 胸腹主动脉与入路；"
+        "过度不稳定则直接手术室/术中影像（两档出口相同，均进 D3.2）",
         judge=_d31_r03,
         exit_kind="next",
         exit_value="D3.2",
@@ -230,7 +262,8 @@ _D31_SLOTS: tuple[RuleSlot, ...] = (
         rule_id="D3.1.R04",
         priority="P3",
         source_row="D3.1!16",
-        statement="临床高度怀疑但影像缺失/不可评价 → 维持急诊疑似，不因未见影像证据降级",
+        statement="临床高度怀疑但影像未做/不可评价/结果冲突 → 维持急诊疑似，"
+        "不因未见影像证据或 SBP≥80 自动降级",
         judge=_d31_r04,
         exit_kind="next",
         exit_value="D3.2",
@@ -303,10 +336,19 @@ def _d32_r01(state: GuidelineState) -> Verdict:
     髂动脉闭塞时 EVAR 根本无法建立入路，把它算作「解剖适合」是错的——入路
     本就属于「解剖是否适合 EVAR」的一部分。
 
-    「团队/设备可用」不参与判据：它没有数据来源，且规格 R90 明确要求
-    「不延误控制」，不能因为没有资源清单就否定一线方案。该条件以缺口形式
-    单独列出，由术者当场确认。
+    「团队/设备可用」怎么处理：只**否定明确不可用**这一种情况。
+
+    · ``D3.TEAM_RESOURCE = 均不可立即用`` → 本规则不成立。本院此刻做不了这台
+      手术，再说「EVAR 一线」就是让团队去做做不到的事（``R03`` 接住去转诊）。
+    · 未记录 / 未知 / 证据冲突 → 不进判据，仍按原样成立。规格 R90 明写
+      「未确认不等于不可用」「不延误控制」，拿「没填资源清单」否定一线方案，
+      等于让资料缺失替医生做决定。
+
+    两种情形分开处理的理由：**明确不可用是事实，未记录是资料缺口**——后者该进
+    ``gaps``，前者必须改变结论。
     """
+    if eq(token(state.node_field("D3.TEAM_RESOURCE")), "均不可立即用") is True:
+        return False
     return and_(
         anatomy_available(state),
         not_(access_blocked(state)),
@@ -327,9 +369,26 @@ def _d32_r02(state: GuidelineState) -> Verdict:
     )
 
 
+#: ``D3.TEAM_RESOURCE`` 里表示「本中心能做」的三个取值。
+#: 其余三档（``均不可立即用`` / ``未知`` / ``证据冲突``）都不构成「能实施」。
+_RESOURCE_AVAILABLE: tuple[str, ...] = ("EVAR团队可用", "OSR团队可用", "两者可用")
+
+
+def _resource_unavailable(state: GuidelineState) -> bool:
+    """院方是否**明确**此刻做不了这台手术（不是「没填」，是「填了做不了」）。"""
+    return eq(token(state.node_field("D3.TEAM_RESOURCE")), "均不可立即用") is True
+
+
 def _d32_r03(state: GuidelineState) -> Verdict:
-    """P3：本中心无法安全实施 → 现场救援/转诊。依赖团队资源，当前无来源。"""
-    return eq(token(state.node_field("D3.TEAM_RESOURCE")), "本中心无法实施")
+    """P3：本中心不能及时提供必要修复 → 现场救援/转诊。
+
+    比较对象是 ``D3.TEAM_RESOURCE`` 的规范值 **``均不可立即用``**。
+    修前这里写的是「本中心无法实施」——**那个字符串不在该字段的值域里**
+    （值域：EVAR团队可用 / OSR团队可用 / 两者可用 / 均不可立即用 / 未知 /
+    证据冲突），所以本条恒为 ``False``，从来没命中过。这不是缺测试，是词表写错：
+    照规格的**标题**（「本中心不能及时提供必要修复」）抄，而不是照字段的**值域**写。
+    """
+    return eq(token(state.node_field("D3.TEAM_RESOURCE")), "均不可立即用")
 
 
 def _d32_r04(state: GuidelineState) -> Verdict:
@@ -342,21 +401,30 @@ def _d32_r04(state: GuidelineState) -> Verdict:
 
 
 def _d32_r06(state: GuidelineState) -> Verdict:
-    """P3：资源缺项清单（提示类，不参与判定）。
+    """P3（展示性）：资源未确认或有缺项 → 把缺失清单摆出来。
 
-    规格要求「立即显示缺失的术者、手术室、影像、器械、血库/ICU 能力」——
-    这是**展示义务**而非判定条件，故恒 UNKNOWN，缺项由节点的 ``gaps`` 承担。
+    为什么从出口槽位改成展示性规则：「立即显示缺失的术者、手术室、影像、
+    器械、血库/ICU 能力」是**展示义务**，不是「去哪」的判断。留在槽位里它只能
+    恒返 ``None`` 才不抢 ``R91`` 的出口——那等于登记了一条永不生效的规则
+    （实测：全量测试跑完，它一次都没判过 ``True``）。
+
+    判据取「是否已确认可用」而不是「有哪些缺项」：缺项清单在 ``gaps`` 里，
+    这里只回答「要不要把清单摆到读者面前」。
     """
-    return None
+    resource = token(state.node_field("D3.TEAM_RESOURCE"))
+    # 未记录（None）/ 均不可立即用 / 未知 / 证据冲突 —— 四种都该把清单摆出来。
+    return resource not in _RESOURCE_AVAILABLE
 
 
 def _d32_r07(state: GuidelineState) -> Verdict:
-    """P3：复苏/血液/手术室并行准备（提示类）。
+    """P3（展示性）：复苏/血液/手术室并行准备 —— 进了本节点就恒适用。
 
-    规格原文「Agent 提示缺项并记录状态，不生成具体复苏医嘱或固定目标」——
-    所以这里没有判定，只有留痕。
+    规格原文「疑似/明确 rAAA 需同时组织复苏、血液准备、手术室和修复策略；
+    Agent 提示缺项并记录状态，不生成具体复苏医嘱或固定目标」。只要病例走到
+    ``D3.2``，它就是疑似/明确的破裂病例，这条义务必然成立；具体缺项在
+    ``gaps`` 里，本规则只留痕「提醒过」。
     """
-    return None
+    return True
 
 
 def _d32_r90(state: GuidelineState) -> Verdict:
@@ -416,24 +484,6 @@ _D32_SLOTS: tuple[RuleSlot, ...] = (
         exit_value="EVAR 候选（IFU 待核验，术者确认）",
     ),
     RuleSlot(
-        rule_id="D3.2.R06",
-        priority="P3",
-        source_row="D3.2!18",
-        statement="显示缺失的术者、手术室、影像、器械、血库/ICU 能力（提示类，不产生判定）",
-        judge=_d32_r06,
-        exit_kind="terminal",
-        exit_value="急诊交接／救援／转诊",
-    ),
-    RuleSlot(
-        rule_id="D3.2.R07",
-        priority="P3",
-        source_row="D3.2!19",
-        statement="疑似/明确 rAAA 并行组织复苏、血液准备、手术室与修复策略（提示类，不生成医嘱）",
-        judge=_d32_r07,
-        exit_kind="terminal",
-        exit_value="急诊团队即时执行",
-    ),
-    RuleSlot(
         rule_id="D3.2.R91",
         priority="P3",
         source_row="D3.2!5",
@@ -441,6 +491,22 @@ _D32_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d32_r91,
         exit_kind="terminal",
         exit_value="术者确认（急诊血管团队）",
+    ),
+)
+
+
+_D32_DISPLAY_RULES: tuple[DisplayRule, ...] = (
+    DisplayRule(
+        rule_id="D3.2.R06",
+        source_row="D3.2!18",
+        statement="显示缺失的术者、手术室、影像、器械、血库/ICU 能力；现场救援或转诊由临床团队决定",
+        judge=_d32_r06,
+    ),
+    DisplayRule(
+        rule_id="D3.2.R07",
+        source_row="D3.2!19",
+        statement="疑似/明确 rAAA 并行组织复苏、血液准备、手术室与修复策略；不生成具体复苏医嘱或固定目标",
+        judge=_d32_r07,
     ),
 )
 
@@ -494,6 +560,17 @@ def _evar_candidate(state: GuidelineState) -> Candidate:
         )
     if ifu_ok is False:
         return Candidate("EVAR", CandidateStatus.EXCLUDED, "器械 IFU 明确不符", ("D3.2.R02",))
+    if _resource_unavailable(state):
+        # 术式本身没被否定——否定的是「本院此刻能不能做」。所以不给 EXCLUDED，
+        # 给 MDT：决定转诊还是现场救援是团队的事，不是解剖的事。
+        # 不加这一档的后果：终点写「转诊」、候选栏写「EVAR：可行候选」，两句相反。
+        return Candidate(
+            "EVAR",
+            CandidateStatus.MDT,
+            "术式本身未被否定，但本院此刻无法实施（团队/手术室/血库均不可立即用）："
+            "转诊或现场救援由临床团队决定",
+            ("D3.2.R03",),
+        )
     if anatomy is False:
         return Candidate(
             "EVAR",
@@ -539,6 +616,14 @@ def _osr_candidate(state: GuidelineState) -> Candidate:
     为什么仍要列出这一行：规格要求「分别列出」两列。只给 EVAR 会让读者以为
     OSR 已被排除，而实际上它只是待专家评估——两者临床含义完全不同。
     """
+    if _resource_unavailable(state):
+        return Candidate(
+            "OSR",
+            CandidateStatus.MDT,
+            "本院此刻无法实施（团队/手术室/血库均不可立即用）：开放解剖与麻醉评估无输入，"
+            "转诊或现场救援由临床团队决定",
+            ("D3.2.R03",),
+        )
     evar_excluded = (
         access_blocked(state) is True or eq(token(state.case.n.seal_ifu), "符合") is False
     )
@@ -560,53 +645,258 @@ def d3_2(state: GuidelineState) -> NodeOutcome:
     声明：缺口是全局输入缺口，候选是跨规则的术式归并。
     """
     outcome = evaluate_node("D3.2", state, _D32_SLOTS)
-    return replace(
+    extra_entries, extra_verdicts = display_entries("D3.2", state, _D32_DISPLAY_RULES)
+    outcome = replace(
         outcome,
+        verdicts={**outcome.verdicts, **extra_verdicts},
+        entries=(*outcome.entries, *extra_entries),
         gaps=_d32_gaps(state),
         candidates=(_evar_candidate(state), _osr_candidate(state)),
     )
 
+    # 本节点的出口恒为终端态（术式方向 + 术者确认），**不向 D3.3 改道**。
+    #
+    # 规格 D3.3 全表 12 行的 M 列（输出／下一节点）都是「人工决策 / 医生确认 /
+    # 终点动作」——没有一条 ``next_node``。它是急诊流程的**终止面**，不是中间站。
+    #
+    # 曾经在这里加过一条「``D3.GOALS`` 已记录 → ``next_node="D3.3"``」的改写，
+    # 那是错的：治疗目标是医生在系统之外做出的决定，不在术前评估数据里
+    # （``D3.GOALS`` 的优先来源是「血管团队/上级医师」），系统只能等它进来，
+    # 不能主动去取。加那条改写的实际后果是给 D3.3 造了一条规格没有的入边，
+    # 并让「已确认不修复」与候选栏的「EVAR：可行候选」并列出现在一份报告里。
+    return outcome
+
 
 # ---------------------------------------------------------------------------
-# D3.3 EVAR/OSR/救援及不修复（缺项提示器）
+# D3.3 EVAR/OSR/救援及不修复（裁决记录面 · 当前无自动入边）
 # ---------------------------------------------------------------------------
-def d3_3(state: GuidelineState) -> NodeOutcome:
-    """D3.3：整理非修复/转诊决策的依据与缺项，出口恒为医生确认。
+#
+# ⚠️ **本节点在当前输入范围内不可达**，这是忠实于规格的结果，不是缺陷。
+#
+# 规格 D3.3 全表 12 行的 M 列（输出／下一节点）都是「人工决策 / 医生确认 /
+# 记录理由 / 终点动作/人工处理」，**没有一条 ``next_node``**。它不是流程中的
+# 一跳，而是急诊流程的**终止面**：万一哪天判据指向「不可修复」，这里必须由人
+# 接手，而不是模型自己下结论。
+#
+# 五条规则的 G 列在重复同一句话——「不得由模型仅凭年龄或合并症自动判定无修复
+# 价值」「未评价不得自动输出不修复」「Agent 不得自动作出不可手术结论」「系统
+# 不得自行下达不修复结论」「不得自动判定不修复」。所以本节点是**刹车**，不是
+# **方向盘**：它不产生方向，只拦停。
+#
+# 为什么它拿不到输入：``D3.REPAIR_FEASIBILITY`` 的优先来源是「急诊血管团队」、
+# ``D3.GOALS`` 是「血管团队/上级医师」、``D3.NONREPAIR_REASON`` 是
+# 「血管团队/MDT/医患沟通」。三者都是**决策产物**，不在术前评估数据里——对比
+# G00 的真正病例字段（``D.VITAL`` 监护、``D.LAB`` LIS、``D.CTA`` PACS、
+# ``D.SURG`` 手术记录），全是检查与记录，没有一条是「医生的决定」。
+#
+# 所以本节点：判据写全、单测覆盖，但不接自动入边。等「医生在系统内登记处置
+# 决定」的入口建好，再决定用哪种方式接上。在那之前它不进主流程——也正因如此，
+# 报告里不会出现「终点说已确认不修复、候选栏说 EVAR 可行」这种自相矛盾。
+#
+# ⚠️ 一处曾经犯过的错，留在这里防重犯：曾把 R02 正文「必须记录…裁决医师与
+# 时间」读成两个输入字段（``D3.ATTEST_ACTOR`` / ``D3.ATTEST_AT``），并让它们
+# 驱动 R03/R02 分档。那是越界——R02 的 M 列给系统的动作只有「记录并停止自动
+# 术式推荐」，签名是医院流程的事，规格字段表里没有这两个 id。已删除。
+_D33_FIELDS: tuple[tuple[str, str], ...] = (
+    ("D3.REPAIR_FEASIBILITY", "修复可行性：存在 EVAR/OSR 方案 / 需转诊 / 无可行方案"),
+    ("D3.PATIENT_WISH", "患者意愿：有决策能力时的明确表达 / 预先医疗决定"),
+    ("D3.CAPACITY", "决策能力评估与合法代理人"),
+    ("D3.PROGNOSIS", "获益与预后综合评估"),
+    ("D3.GOALS", "治疗目标：积极修复 / 转诊 / 有限治疗 / 舒适照护"),
+)
 
-    规格三条规则都写了同一句话：「系统不得自行下达不修复结论」。故本节点
-    **不产出任何"建议不修复"的结论**，只把缺项和依据摊开给授权医生。
+#: ``D3.GOALS`` 里属于「不修复／限定治疗」的两档 —— 只有这两档才需要非修复原因。
+_D33_NONREPAIR_GOALS: tuple[str, ...] = ("有限治疗", "舒适照护")
+
+#: ``D3.PATIENT_WISH`` 里表示「患者/代理已明确拒绝」的两档。
+_D33_REFUSAL: tuple[str, ...] = ("拒绝特定治疗", "预先医疗决定")
+
+#: ``D3.REPAIR_FEASIBILITY`` 里表示「本中心没有可实施方案」的取值。
+_D33_NO_OPTION: str = "无可行方案"
+
+#: ``D3.NONREPAIR_REASON`` 里表示「还没定」的一项 —— 有它就等于没记录原因。
+_D33_REASON_UNSET: str = "未确定"
+
+
+def _d33_value(state: GuidelineState, spec_id: str) -> object:
+    """读一个 ``D3.*`` 字段；「未知」这类不确定写法折成 ``None``。"""
+    return spec_token(state.node_field(spec_id))
+
+
+def _d33_reason_recorded(state: GuidelineState) -> Verdict:
+    """非修复原因是否写清（多选，且不含「未确定」）。"""
+    reasons = multi_field(state, "D3.NONREPAIR_REASON")
+    if reasons is None:
+        return None
+    tokens = [token(value) for value in reasons]
+    if not tokens:
+        return None
+    return _D33_REASON_UNSET not in tokens
+
+
+def _d33_r03(state: GuidelineState) -> Verdict:
+    """P3：非修复/舒适照护计划经完整评估后才输出（``D3.3!12``）。
+
+    判据 = 「这是一个不修复决定」（``R02``）+ 「非修复原因已写清」。
+
+    「五项字段齐全」不在这里重复判：``R90``（P2）先执行，任一缺失就已阻断。
+    两处都判会让「缺哪一项」的说明分散在两个地方，而且 R03 的 F 列与 R90 的
+    F 列本来就不同（R03 少 ``D3.PROGNOSIS``、多 ``D3.NONREPAIR_REASON``）——
+    把「齐不齐」交给 R90、「原因写没写」留给本节点，两个清单各管各的。
+
+    与 ``R02`` 的分界正是**原因是否写清**：写清走 R03（计划完整），没写清走
+    R02（决定已记录、原因待补）。声明顺序 R03 在前，构成两档。
     """
-    gaps = missing_fields(state, _D33_FIELDS)
-    if gaps:
-        return NodeOutcome(
-            node_id="D3.3",
-            verdicts={"D3.3.R90": True},
-            entries=(
-                GuidelineEntry(
-                    node_id="D3.3",
-                    rule_id="D3.3.R90",
-                    source_row="D3.3!6",
-                    statement="患者意愿、决策能力、修复可行性或获益评估未完成 → 不得自动判定不修复",
-                    verdict=True,
-                ),
-            ),
-            terminal="术者确认（须记录可行性/意愿/裁决医师与时间）",
-            gaps=gaps,
-        )
-    return NodeOutcome(
-        node_id="D3.3",
-        verdicts={"D3.3.R91": True},
-        entries=(
-            GuidelineEntry(
-                node_id="D3.3",
-                rule_id="D3.3.R91",
-                source_row="D3.3!5",
-                statement="授权医生记录可行性、获益风险、患者/代理意愿与转诊可能性后确认处置",
-                verdict=True,
-            ),
-        ),
-        terminal="术者确认（修复/转诊/非修复/舒适照护）",
+    decided = _d33_r02(state)
+    if decided is not True:
+        return decided
+    return _d33_reason_recorded(state)
+
+
+def _d33_r02(state: GuidelineState) -> Verdict:
+    """P3：决定不修复/不转诊 → 记录，并**停止自动术式推荐**（``D3.3!9``）。
+
+    ``D3.GOALS`` 落在「有限治疗／舒适照护」即视为已决定不修复。规格 M 列给
+    系统的动作原文就是「记录并**停止自动术式推荐**」——这是本节点存在的实际
+    作用，也是它必须与候选栏对齐的原因。
+
+    不把「原因是否写清」放进来：那是 R03 与 R02 的分界，本条只回答「这是不是
+    一个不修复决定」。放进来会让两条规则判据重合，R02 永远抢不到。
+    """
+    goals = _d33_value(state, "D3.GOALS")
+    if goals is None:
+        return None
+    return goals in _D33_NONREPAIR_GOALS
+
+
+def _d33_r01(state: GuidelineState) -> Verdict:
+    """P3：无可行方案或患者/代理拒绝 → 评估转诊、替代处置或舒适照护（``D3.3!8``）。
+
+    它接的是**还没有决定**的那一档：有理由（做不了 / 不愿做），但目标栏还没填。
+    此时系统的职责是把可选路径摊开（转诊 / 替代 / 舒适照护），
+    而不是替医生选一个——所以出口仍是「授权医生确认」。
+    """
+    return or_(
+        eq(_d33_value(state, "D3.REPAIR_FEASIBILITY"), _D33_NO_OPTION),
+        eq(_d33_value(state, "D3.PATIENT_WISH"), *_D33_REFUSAL),
     )
+
+
+def _d33_r90(state: GuidelineState) -> Verdict:
+    """P2：五项规定字段任一未完成 → 不得自动判定不修复（``D3.3!6``）。
+
+    清单取规格 R90 的 F 列（可行性／意愿／能力／预后／目标）。它与 R03 的
+    F 列不是同一组：R03 少 ``D3.PROGNOSIS``、多 ``D3.NONREPAIR_REASON``。
+    阻断口径用本清单（更严），因为「获益评估没做就不许下不修复结论」是
+    ``D3.PROGNOSIS`` J 列的原话。
+    """
+    return bool(missing_fields(state, _D33_FIELDS))
+
+
+def _d33_r91(state: GuidelineState) -> Verdict:
+    """P3 出口：五项齐备但目标不属不修复类（多为「积极修复」）→ 交术者确认。"""
+    return True
+
+
+def _d33_gaps(state: GuidelineState) -> tuple[str, ...]:
+    """``D3.3`` 缺什么 —— 五项规定字段 + **决定不修复时**才追加的留痕提示。
+
+    「裁决医师与时间」在这里只作**提示**，不是字段、不是判据。规格 R02 的
+    正文要求「必须记录…裁决医师与时间」，但 M 列给系统的动作只有「记录并停止
+    自动术式推荐」——签名是医院流程的事，本系统不采集，只提示补记。
+    """
+    gaps: list[str] = list(missing_fields(state, _D33_FIELDS))
+    if _d33_value(state, "D3.GOALS") in _D33_NONREPAIR_GOALS:
+        if _d33_reason_recorded(state) is not True:
+            gaps.append(
+                "D3.NONREPAIR_REASON（非修复原因：无可行解剖／患者极高风险／"
+                "无资源且转诊不可行／患者拒绝／治疗目标／其他）：未记录或仍为「未确定」"
+            )
+        gaps.append(
+            "须在病历中补记裁决医师与时间（规格 D3.3.R02 正文要求；本系统不采集签名，只提示）"
+        )
+    return tuple(dict.fromkeys(gaps))
+
+
+def _d32_direction(state: GuidelineState) -> str | None:
+    """上一节点（``D3.2``）给出的术式方向 —— 拼进本节点终点，免得丢了。"""
+    return next(
+        (o.terminal for o in reversed(state.visited) if o.node_id == "D3.2" and o.terminal),
+        None,
+    )
+
+
+_D33_SLOTS: tuple[RuleSlot, ...] = (
+    RuleSlot(
+        rule_id="D3.3.R03",
+        priority="P3",
+        source_row="D3.3!12",
+        statement="非修复/舒适照护须经授权医生确认：可行性、获益风险、能力/意愿、转诊可能性"
+        "均已评估且不可行原因已记录 → 输出非修复计划",
+        judge=_d33_r03,
+        exit_kind="terminal",
+        exit_value="非修复／舒适照护计划（五项已评估、原因已记录，待授权医生确认）",
+    ),
+    RuleSlot(
+        rule_id="D3.3.R02",
+        priority="P3",
+        source_row="D3.3!9",
+        statement="决定不修复/不转诊：医生已记录治疗目标 → 记录该决定并停止自动术式推荐，"
+        "保留急症危险提示；不可行原因仍待补",
+        judge=_d33_r02,
+        exit_kind="terminal",
+        exit_value="不修复决定已记录：停止自动术式推荐，须补非修复原因，并由授权医生确认",
+    ),
+    RuleSlot(
+        rule_id="D3.3.R01",
+        priority="P3",
+        source_row="D3.3!8",
+        statement="本中心无可行方案或患者/代理拒绝 → 评估转诊/救援、替代处置或舒适照护，"
+        "由授权医生确认；系统不自行下达不修复结论",
+        judge=_d33_r01,
+        exit_kind="terminal",
+        exit_value="授权医生确认的转诊／替代处置／舒适照护",
+    ),
+    RuleSlot(
+        rule_id="D3.3.R90",
+        priority="P2",
+        source_row="D3.3!6",
+        statement="患者意愿、决策能力、修复可行性或获益评估未完成 → 不得自动判定不修复",
+        judge=_d33_r90,
+        exit_kind="terminal",
+        exit_value="术者确认（须补修复可行性／患者意愿／决策能力／获益评估／治疗目标）",
+    ),
+    RuleSlot(
+        rule_id="D3.3.R91",
+        priority="P3",
+        source_row="D3.3!5",
+        statement="授权医生记录可行性、获益风险、患者/代理意愿与转诊可能性后确认处置",
+        judge=_d33_r91,
+        exit_kind="terminal",
+        exit_value="术者确认（修复/转诊/非修复/舒适照护）",
+    ),
+)
+
+
+def d3_3(state: GuidelineState) -> NodeOutcome:
+    """D3.3：记录医生已做出的处置决定，并据此停止术式推荐。
+
+    本节点**不产出任何「建议不修复」的结论**——它读的全是医生已经写下的记录，
+    唯一加工是把上游（``D3.2``）的术式方向拼进终点，让报告最后一句同时包含
+    「定下来的处置」和「此前算出的方向」。
+
+    ⚠️ 当前**没有自动入边**（见模块注释：规格 M 列对 D3.3 每行都是「人工」）。
+    这里的实现完整、可测，但只有手动调用或将来接上「登记处置决定」的入口才会
+    执行。``_d32_direction`` 也只在那种场景下才有内容可拼。
+    """
+    outcome = evaluate_node("D3.3", state, _D33_SLOTS)
+
+    terminal = outcome.terminal
+    direction = _d32_direction(state)
+    if terminal is not None and direction is not None:
+        terminal = f"{terminal}；上游术式方向：{direction}"
+
+    return replace(outcome, terminal=terminal, gaps=_d33_gaps(state))
 
 
 #: 本模块提供的节点（键与规格 sheet 名一致）。
@@ -616,12 +906,18 @@ NODES: dict[str, NodeFn] = {
     "D3.3": d3_3,
 }
 
-#: 已实现的规则 → 规格源行。``D3.1`` 7 条 + ``D3.2`` 8 条全实现；
-#: ``D3.3`` 只实现 R90/R91 两条结构性规则——它的 R01–R03 判据全部是
-#: 「授权医生记录可行性/意愿/预后后确认」，属裁决留痕而非判定，等录入通道
-#: 建好再补（否则三条规则恒 UNKNOWN，只是多三行噪声）。
+#: 已登记的规则 → 规格源行。``D3.1`` 7 条 + ``D3.2`` 8 条 + ``D3.3`` 5 条（共 20）。
+#:
+#: 可达性分三层，不要笼统说「已实现」：
+#:   * ``D3.1.R03/R04`` —— 图可达、**求值不可达**：``class_output`` 含 ``D3``
+#:     只在 ``D3_EMERGENCY_RULES``（G03 九条）命中时发生，而那九条**全部**
+#:     落在 ``_D3_CONFIRMED`` 或 ``_D3_SUSPECTED`` 里 —— 即 ``R01``/``R02``
+#:     必有一条先命中（同为 P0-A、声明在前）。判据是真判据，不是占位；
+#:     只在手动调用或 R01/R02 覆盖范围收缩时执行。
+#:   * ``D3.3.R01–R03`` —— 判据完整、**图不可达**：规格 M 列对 D3.3 每行都是
+#:     「人工」，没有入边。见该节模块注释。
+#:   * 其余 14 条 —— 三层全通，由端到端用例覆盖。
 RULE_ROWS: dict[str, str] = {
-    **{slot.rule_id: slot.source_row for slot in (*_D31_SLOTS, *_D32_SLOTS)},
-    "D3.3.R90": "D3.3!6",
-    "D3.3.R91": "D3.3!5",
+    **{slot.rule_id: slot.source_row for slot in (*_D31_SLOTS, *_D32_SLOTS, *_D33_SLOTS)},
+    **{rule.rule_id: rule.source_row for rule in _D32_DISPLAY_RULES},
 }
