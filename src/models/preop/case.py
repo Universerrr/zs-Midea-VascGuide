@@ -209,12 +209,13 @@ class SymptomDomain(_StrictDomain):
         None  # 医师判断疼痛与 AAA 的相关性（未判断 ≠ 无关）
     )
     syncope: Literal["肯定", "否定", "可疑", "未知"] | None = None  # 晕厥或短暂意识丧失
-    gi_bleed: list[Literal["呕血", "黑便", "便血", "无", "未知"]] | None = (
+    gi_bleed: list[Literal["呕血", "黑便", "便血", "其他出血表现", "无", "未知"]] | None = (
         None  # 当前消化道出血表现（可多选，「无」为已知阴性）
     )
-    limb: list[Literal["痛", "苍白", "发凉", "麻木", "无力", "运动障碍", "无", "未知"]] | None = (
-        None  # 急性肢体缺血症状（可多选，「无」为已知阴性）
-    )
+    limb: (
+        list[Literal["疼痛", "苍白", "发凉", "麻木", "无力", "运动障碍", "其他", "无", "未知"]]
+        | None
+    ) = None  # 急性肢体缺血症状（可多选，「无」为已知阴性）
     pulse_deficit: Literal["有", "减弱", "缺失", "无法评价", "未查"] | None = (
         None  # 外周搏动检查结果
     )
@@ -442,9 +443,12 @@ class ClassifyDomain(_StrictDomain):
         ]
         | None
     ) = None  # 原生主动脉或移植物感染状态
-    fistula: Literal["主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似", "否", "未知"] | None = (
-        None  # 主动脉相关瘘征象（主动脉肠瘘/腔静脉瘘）
-    )
+    # 类型取规格原文五态；「明确/疑似」的状态在 N.FISTULA_CTX（``n.fistula_ctx``），
+    # 这里保留「疑似」只为兼容旧输入（拆分见台账 B 项）。
+    fistula: (
+        Literal["主动脉肠瘘", "主动脉腔静脉瘘", "其他腔脏器瘘", "未确定", "疑似", "否", "未知"]
+        | None
+    ) = None  # 主动脉相关瘘的解剖类型
     pau: LesionGrade | None = None  # 穿透性主动脉溃疡
     imh: LesionGrade | None = None  # 主动脉壁内血肿
     iaad: LesionGrade | None = None  # 孤立性腹主动脉夹层

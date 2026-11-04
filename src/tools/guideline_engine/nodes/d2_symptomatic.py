@@ -31,7 +31,7 @@
 
 ``S.LIMB``
     规格是单值枚举（是/否/疑似/未评估/证据冲突），模型是**多选列表**
-    （痛/苍白/发凉/麻木/无力/运动障碍/无/未知）。故用 ``has()`` 看列表里有没有
+    （疼痛/苍白/发凉/麻木/无力/运动障碍/其他/无/未知）。故用 ``has()`` 看列表里有没有
     症状项，不能用 ``eq``。
 
 ## 为什么 D2 的破裂证据回 G03 而不是直接进 G05
@@ -56,6 +56,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from ....rules.router import (
+    LIMB_ISCHEMIA_SIGNS,
     Verdict,
     and_,
     eq,
@@ -98,8 +99,8 @@ _ATTRIB_OTHER: str = "明确其他原因"
 #: 模型 ``s.pain_attrib`` 里「还没判」的取值（**不是** None，也算缺失）。
 _ATTRIB_UNJUDGED: str = "未判断"
 
-#: ``s.limb`` 里属于「有缺血表现」的取值（``无`` / ``未知`` 不在其中）。
-_LIMB_SIGNS: tuple[str, ...] = ("痛", "苍白", "发凉", "麻木", "无力", "运动障碍")
+#: ``s.limb`` 里属于「有缺血表现」的取值 —— 复用路由层那一份。
+_LIMB_SIGNS: tuple[str, ...] = LIMB_ISCHEMIA_SIGNS
 
 #: ``D2.COMPRESSION`` 里属于「有压迫表现」的取值（``无`` / ``未知`` 不在其中）。
 _COMPRESSION_SIGNS: tuple[str, ...] = (

@@ -84,7 +84,7 @@ VascGuide 面向主动脉瘤（AAA / TAA）全周期管理，覆盖 **术前决�
 | **审计留痕结构** | `FieldProvenance`（字段原文出处 / 写入者 / 是否被人工覆写）、`UrgencyFlagAudit` |
 | **确定性规则层** | `router.py`（V3.6.2 的 66 条判定规则 + 三值求值）+ `RULESET.md`（规则↔源行对照）+ `version.py`（规则版本），详见「四」 |
 | **编排层（LangGraph）** | 四层节点 `input → router → execution → output` 串成 `StateGraph` 并接 SQLite Checkpoint；每节点自动留痕（节点名 / 起止时间 / 输入输出哈希），审计链可**逐环校验**，详见「五」 |
-| **测试与工具链** | **1185 项测试**（87 路由基线 + 84 数据契约 + 131 编排层 + 247 规则分支 + 121 结论自证契约 + 12 CLI + 503 工具A；其中 4 项参数化跳过——`MANUAL.URGENCY` / `FALLBACK.VERIFY` 不是规格规则，本就没有源行可对）、`ruff` 无告警、覆盖率 **99%**（`router.py` 98% —— 未覆盖项全是导入期自检的 `raise` 分支；`audit.py` 与 `recommendation.py` 100%；病种节点 ≥99%） |
+| **测试与工具链** | **1191 项测试**（87 路由基线 + 84 数据契约 + 131 编排层 + 253 规则分支 + 121 结论自证契约 + 12 CLI + 503 工具A；其中 4 项参数化跳过——`MANUAL.URGENCY` / `FALLBACK.VERIFY` 不是规格规则，本就没有源行可对）、`ruff` 无告警、覆盖率 **99%**（`router.py` 98% —— 未覆盖项全是导入期自检的 `raise` 分支；`audit.py` 与 `recommendation.py` 100%；病种节点 ≥99%） |
 
 ### ⏳ 尚未开始
 
@@ -154,7 +154,7 @@ zs-Midea VascGuide/
 │   │   └── postop.py            # PostOpCase / FollowUpPlan / FollowUpStatus（预留，空占位）
 │   ├── rules/                   # ✅ 确定性规则层（详见「四」；无 __init__.py）
 │   │   ├── router.py            # ✅ 路由判定流水线（V3.6.2：66 条判定规则 + 三值求值）
-│   │   ├── version.py           # ✅ 规则版本号（RULESET_VERSION = v362.6@v3.6.2，进哈希）
+│   │   ├── version.py           # ✅ 规则版本号（RULESET_VERSION = v362.7@v3.6.2，进哈希）
 │   │   └── RULESET.md           # ✅ 66 条规则 ↔ 函数名 ↔ V3.6.2 源行 对照表（防规格漂移）
 │   ├── tools/                   # ✅ 5 个确定性工具（一工具一模块；A 已实现，B–E 未实现）
 │   │   ├── base.py              # ✅ ToolSpec / ToolRequest / MissingUpstreamError
@@ -202,7 +202,7 @@ zs-Midea VascGuide/
 │   ├── test_preop.py            # ✅ 86 项路由端到端基线（五出口 / 同桶优先级 / 标签）
 │   ├── test_model_contract.py   # ✅ 84 项数据契约（162 字段 / 不确定值白名单 / 严格模式）
 │   ├── test_preop_graph.py      # ✅ 131 项编排层 + 调度表 + 依赖排序 + Checkpoint 往返 + 架构守卫
-│   ├── test_router_branches.py  # ✅ 247 项规则分支（66 条逐条命中 + 三值语义 + 派生量 + 源行对账 + 出口自洽）
+│   ├── test_router_branches.py  # ✅ 253 项规则分支（66 条逐条命中 + 三值语义 + 派生量 + 源行对账 + 出口自洽）
 │   ├── test_router_note_contract.py # ✅ 121 项结论自证契约（rule_id / reason / gaps / trace）
 │   ├── test_guideline_engine.py # ✅ 503 项工具A 契约（D1–D7 七条路径 + 粒度红线 / 不越权 / 缺口可见 + 源行对账）
 │   └── test_main.py             # ✅ 12 项 CLI 契约（错误提示可读性 / JSON 与文本同源 / 副作用边界）
@@ -248,7 +248,7 @@ zs-Midea VascGuide/
 | 文件 | 职责 | 状态 |
 |---|---|---|
 | `router.py` | 路由判定流水线（纯函数，无副作用、无 IO、无全局状态） | ✅ V3.6.2 的 66 条判定规则（G03 21 / G04 21 / G08 15 / G09 9） |
-| `version.py` | 规则版本号注册表（审计必需，进哈希） | ✅ `RULESET_VERSION = v362.6@v3.6.2` |
+| `version.py` | 规则版本号注册表（审计必需，进哈希） | ✅ `RULESET_VERSION = v362.7@v3.6.2` |
 | `RULESET.md` | 66 条规则 ↔ 函数名 ↔ V3.6.2 源行 的对照表 | ✅ 与代码逐条对应（测试守着） |
 
 ### 2. 路由做什么（以及不做什么）

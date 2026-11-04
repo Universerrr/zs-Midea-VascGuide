@@ -28,6 +28,7 @@ from typing import Literal
 from ....models.preop.case import UNCERTAIN_TOKENS
 from ....rules.router import (
     FISTULA_LABELS,
+    GI_BLEED_SIGNS,
     INFECTION_LABELS,
     SAC_GROWTH_MM,
     SBP_SHOCK,
@@ -496,10 +497,11 @@ def at_repair_threshold(state: GuidelineState) -> Verdict:
     return diam >= sex[1]
 
 
-#: ``S.GI_BLEED`` 里属于「活动性出血」的表现（``无`` / ``未知`` 不在其中）。
-_GI_BLEED_SIGNS: tuple[str, ...] = ("呕血", "黑便", "便血")
+#: ``S.GI_BLEED`` 里属于「活动性出血」的表现 —— 直接用路由层那一份，
+#: 两处各写一张表迟早会漏掉「其他出血表现」。
+_GI_BLEED_SIGNS: tuple[str, ...] = GI_BLEED_SIGNS
 
-#: ``S.LIMB`` 里属于「急性肢体缺血」的两档（``痛``/``苍白``/``发凉``是早期表现，
+#: ``S.LIMB`` 里属于「急性肢体缺血」的两档（``疼痛``/``苍白``/``发凉``是早期表现，
 #: 单独出现不构成「肢体濒危」；运动障碍与无力才是必须立刻处理的信号）。
 _LIMB_THREATENED: tuple[str, ...] = ("运动障碍", "无力")
 

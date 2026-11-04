@@ -642,7 +642,7 @@ def g03_r07_rupture_not_excluded(x: _Ctx) -> Verdict:
 
 def g03_r08_graft_with_gi_bleed(x: _Ctx) -> Verdict:
     graft = _or(_has(x.d.surg, "EVAR", "OSR"), _eq(x.c.graft, "有"))
-    return _and(graft, _has(x.s.gi_bleed, "呕血", "黑便", "便血"))
+    return _and(graft, _has(x.s.gi_bleed, *GI_BLEED_SIGNS))
 
 
 def g03_r09_acute_limb_ischemia(x: _Ctx) -> Verdict:
@@ -651,7 +651,7 @@ def g03_r09_acute_limb_ischemia(x: _Ctx) -> Verdict:
         _eq(x.s.pulse_deficit, "有", "缺失"),
         _branch_occluded(x),
     )
-    return _and(_has(x.s.limb, "痛", "苍白", "发凉"), severe)
+    return _and(_has(x.s.limb, "疼痛", "苍白", "发凉"), severe)
 
 
 def g03_r10_news2_critical(x: _Ctx) -> Verdict:
@@ -692,8 +692,8 @@ def g03_r15_no_emergency_release(x: _Ctx) -> Verdict:
         _eq(x.q.current_assess, "本次已评估"),
         _eq(x.s.pain_present, "否"),
         _eq(x.s.syncope, "否定"),
-        _absent(x.s.gi_bleed, ("呕血", "黑便", "便血")),
-        _absent(x.s.limb, ("痛", "苍白", "发凉", "麻木", "无力", "运动障碍")),
+        _absent(x.s.gi_bleed, GI_BLEED_SIGNS),
+        _absent(x.s.limb, LIMB_ISCHEMIA_SIGNS),
         _present(x.v.sbp, x.v.hr, x.v.acvpu),
     )
 
@@ -917,7 +917,7 @@ def g04_r19_prior_repair_unremarkable(x: _Ctx) -> Verdict:
         _not(_eq(x.n.graft_major, "无")),
         _ge(x.n.sac_growth, SAC_GROWTH_MM),
         _eq(x.cl.infection, "原生感染明确", "原生感染疑似", "移植物感染明确", "移植物感染疑似"),
-        _eq(x.cl.fistula, "主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似"),
+        _eq(x.cl.fistula, *FISTULA_LABELS),
     )
     return _not(abnormal)
 
@@ -996,8 +996,31 @@ INFECTION_LABELS: tuple[str, ...] = (
     "移植物感染疑似",
 )
 
-#: ``CL.FISTULA`` 里表示「有主动脉相关瘘」的四个取值。
-FISTULA_LABELS: tuple[str, ...] = ("主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似")
+#: ``CL.FISTULA`` 里表示「有主动脉相关瘘」的取值。
+#: ``未确定`` 是规格 ``CL.FISTULA_TYPE`` 的一态——类型待定，但瘘已成立。
+FISTULA_LABELS: tuple[str, ...] = (
+    "主动脉肠瘘",
+    "主动脉腔静脉瘘",
+    "其他腔脏器瘘",
+    "未确定",
+    "疑似",
+)
+
+#: ``S.GI_BLEED`` 里表示「有活动性出血」的取值（``无`` / ``未知`` 不在其中）。
+#: 路由层与病种层共用这一份，避免两处各写一张表。
+GI_BLEED_SIGNS: tuple[str, ...] = ("呕血", "黑便", "便血", "其他出血表现")
+
+#: ``S.LIMB`` 里表示「有缺血表现」的取值（``无`` / ``未知`` 不在其中）。
+#: ``脉搏减弱或消失`` 归 ``S.PULSE_DEFICIT``，不重复放在这里。
+LIMB_ISCHEMIA_SIGNS: tuple[str, ...] = (
+    "疼痛",
+    "苍白",
+    "发凉",
+    "麻木",
+    "无力",
+    "运动障碍",
+    "其他",
+)
 
 
 def _infection_or_fistula_label(x: _Ctx) -> Verdict:
@@ -1007,6 +1030,43 @@ def _infection_or_fistula_label(x: _Ctx) -> Verdict:
     两处若各抄一份取值域，「什么算感染」就会有两个版本。
     """
     return _or(_eq(x.cl.infection, *INFECTION_LABELS), _eq(x.cl.fistula, *FISTULA_LABELS))
+
+
+def _cross_domain_gaps(x: _Ctx) -> list[str]:
+    """同一事实在 CL 域与 N 域结论相反时，记一条**证据缺口**。
+
+    规格有意把两域分开：``G04.R07`` 的「允许值」列只有 ``N.INFECTION_CTX`` /
+    ``N.FISTULA_CTX``，``G08.R04`` 只有 ``CL.INFECTION`` / ``CL.FISTULA`` ——
+    各自只看自己那一域。所以这里**不改任何判定**（改了就越出规格声明的输入），
+    只把「抽取层把同一件事填成了两种结论」报出来，让置信度从「高」降「中」。
+
+    典型来源：医生在病程里写「高度怀疑移植物感染」（N 域有），而分类结论那一栏
+    留空或写了「无证据」（CL 域无）——判据各按自己的域走，报告里就会出现
+    「复杂模式、但病种标签只有 D1」。缺口写出来，复核者才知道该补哪一栏。
+    """
+    gaps: list[str] = []
+    pairs = (
+        (
+            _eq(x.cl.infection, *INFECTION_LABELS),
+            _eq(x.n.infection_ctx, "医师明确", "高度怀疑"),
+            "CL.INFECTION",
+            "N.INFECTION_CTX",
+            "感染",
+        ),
+        (
+            _eq(x.cl.fistula, *FISTULA_LABELS),
+            _eq(x.n.fistula_ctx, "明确", "疑似"),
+            "CL.FISTULA",
+            "N.FISTULA_CTX",
+            "主动脉相关瘘",
+        ),
+    )
+    for cl_v, n_v, cl_name, n_name, what in pairs:
+        if cl_v is True and n_v is False:
+            gaps.append(f"{cl_name} 有{what}证据，但 {n_name} 记为无：同一事实两域结论相反，需核对")
+        elif cl_v is False and n_v is True:
+            gaps.append(f"{n_name} 提示{what}，但 {cl_name} 未给证据：同一事实两域结论相反，需核对")
+    return gaps
 
 
 def g08_r04_d4_infected(x: _Ctx) -> Verdict:
@@ -1142,7 +1202,7 @@ def g08_r13_postop_label_not_complication(x: _Ctx) -> Verdict:
         _ge(x.n.sac_growth, SAC_GROWTH_MM),
         _eq(x.n.graft_major, "组件分离", "移位", "明显闭塞"),
         _eq(x.cl.infection, "原生感染明确", "移植物感染明确"),
-        _eq(x.cl.fistula, "主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘"),
+        _eq(x.cl.fistula, "主动脉肠瘘", "主动脉腔静脉瘘", "其他腔脏器瘘"),
     )
     return _not(confirmed)
 
@@ -2171,7 +2231,7 @@ def _make(
     class_output: list[str] | None = None,
 ) -> RouteResult:
     labels_out = list(class_output) if class_output is not None else list(x.labels)
-    gap_list = list(gaps or [])
+    gap_list = [*(gaps or []), *_cross_domain_gaps(x)]
 
     # 急诊模式 + 零标签 = 病种流程无法启动。补一条能被输出层直接展示的缺口，
     # 并降置信度（见 ``_confidence``）。三条无病种规则（R09/R10/R20）走的就是这里：
@@ -2594,9 +2654,11 @@ __all__ = [
     "G04_BLOCKING",
     "G04_EXTRA",
     "G08_RULES",
+    "GI_BLEED_SIGNS",
     "GUARD_D3_LABEL",
     "INFECTION_LABELS",
     "LABEL_BY_RULE",
+    "LIMB_ISCHEMIA_SIGNS",
     "MANUAL_URGENCY",
     "OUTCOME_PRIORITY",
     "PENDING_RULES",

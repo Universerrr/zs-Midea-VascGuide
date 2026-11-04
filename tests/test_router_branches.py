@@ -353,7 +353,7 @@ HITS: list[tuple[str, dict[str, object]]] = [
     ),
     ("G03.R07", {"c": {"rupture_report": "疑似破裂"}}),
     ("G03.R08", {"d": {"surg": ["EVAR"]}, "s": {"gi_bleed": ["黑便"]}}),
-    ("G03.R09", {"s": {"limb": ["痛", "苍白"], "pulse_deficit": "缺失"}}),
+    ("G03.R09", {"s": {"limb": ["疼痛", "苍白"], "pulse_deficit": "缺失"}}),
     ("G03.R10", {"v": {"spo2": 91.0, "rr": 22.0, "sbp": 105.0, "hr": 95.0}}),
     ("G03.R11", {"v": {"spo2": 92.0, "rr": 22.0, "hr": 95.0}}),
     ("G03.R12", {"s": {"syncope": "肯定"}, "q": {"cta_enhance": "不足"}}),
@@ -930,6 +930,52 @@ BLANK_RUPTURE_IMAGING = {
     "rupture_report": None,
     "contain": None,
 }
+
+
+class TestCrossDomainConsistency:
+    """同一事实的两个域结论相反时，**只报缺口、不改出口**。
+
+    规格有意把两域分开：``G04.R07`` 的允许值只有 ``N.INFECTION_CTX`` /
+    ``N.FISTULA_CTX``，``G08.R04`` 只有 ``CL.INFECTION`` / ``CL.FISTULA``。
+    所以「统一判据读两处」是越界的（会把 G04 变成第二处分类判据）；能做的是
+    把矛盾**报出来**，让置信度从「高」降「中」，复核者才知道该补哪一栏。
+    """
+
+    def test_cl_evidence_without_the_n_field_is_reported(self) -> None:
+        result = route(make_case(cl={"infection": "原生感染明确", "diag_multi": None}))
+        assert any(
+            "CL.INFECTION" in gap and "N.INFECTION_CTX" in gap for gap in result.evidence_gaps
+        )
+        assert result.confidence_level == "中"
+
+    def test_n_suspicion_without_the_cl_field_is_reported(self) -> None:
+        result = route(make_case(cl={"diag_multi": None}, n={"infection_ctx": "高度怀疑"}))
+        assert any("N.INFECTION_CTX" in gap for gap in result.evidence_gaps)
+
+    def test_fistula_uses_the_same_check(self) -> None:
+        result = route(
+            make_case(cl={"fistula": "主动脉肠瘘", "diag_multi": None}, n={"fistula_ctx": "未见"})
+        )
+        assert any("CL.FISTULA" in gap and "N.FISTULA_CTX" in gap for gap in result.evidence_gaps)
+
+    def test_a_consistent_case_reports_no_gap(self) -> None:
+        result = route(make_case())
+        assert not [gap for gap in result.evidence_gaps if "结论相反" in gap]
+        assert result.confidence_level == "高"
+
+    def test_the_gap_does_not_add_a_label_the_spec_does_not_give(self) -> None:
+        """``N`` 域怀疑感染时**不加 D4 标签** —— 那是 ``G08.R04`` 的职责，它只读 ``CL``。
+
+        这条守的是「不许把一致性检查偷做成判定」：缺口可以写，标签不能补。
+        """
+        result = route(make_case(cl={"diag_multi": None}, n={"infection_ctx": "医师明确"}))
+        assert result.rule_id == "G04.R07", "仍然按 N 域进复杂模式"
+        assert "D4" not in result.class_output
+
+    def test_the_two_rules_keep_their_declared_inputs(self) -> None:
+        """``G04.R07`` 只读 N 域、``G08.R04`` 只读 CL 域 —— 字段声明就是规格的允许值。"""
+        assert RULES["G04.R07"].fields == ("n.infection_ctx", "n.fistula_ctx")
+        assert set(RULES["G08.R04"].fields) == {"cl.infection", "cl.fistula"}
 
 
 class TestExitConsistency:
