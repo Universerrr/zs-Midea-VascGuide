@@ -1,15 +1,21 @@
-"""V3.6.2 术前字段模型 —— **162 字段 / 14 个按域子模型**。
+"""V3.6.2 术前字段模型 —— **164 字段 / 14 个按域子模型**。
 
 口径（对着 V3.6.2 工作簿逐条数出来，不是估算）::
 
     172（V3.6.2 字段 ID 去重）
       − 3  判定产物：N.COMPLEX_STATUS、CL.TAAA_IV、R.CLINICAL_AORTIC_SUSPECT
       − 3  物化派生：L.HB_DELTA、V.NEWS2_SCORE、V.NEWS2_SINGLE3
-      − 3  并入同名上位字段：CL.FISTULA_TYPE→CL.FISTULA、S.GI_BLEED_TYPE→S.GI_BLEED、
-           S.LIMB_SIGNS→S.LIMB
+      − 1  并入同名上位字段：CL.FISTULA_TYPE→CL.FISTULA（状态另有 N.FISTULA_CTX）
       − 2  归病种通道：INF.IGG4、INF.PET_MRI（D5.3 专用，走 ``node_inputs``）
       + 1  补入：N.ACCESS_TORTUOSITY（规格未单列，入路评估要用）
-      = 162
+      = 164
+
+**``S.GI_BLEED`` / ``S.LIMB`` 为什么必须是独立字段（2026-11-04 改）**：
+规格把「状态」与「明细」分成两列（``S.GI_BLEED`` 五态 + ``S.GI_BLEED_TYPE`` 多选），
+而在所有判据规则的「允许值」列里出现的是**状态**：``G03.R08`` 只写 ``S.GI_BLEED``，
+``G03.R15`` 只写 ``S.GI_BLEED;S.LIMB``，``S.GI_BLEED_TYPE`` 仅由抽取层 ``G02.R04`` 读。
+合并成一格时判据只能读明细，等于读错了列；更直接的后果是「疑似消化道出血」
+无处安放（明细里没有这个取值），只能退化成「未记录」。
 
 **``N.EVAR_IFU_STATUS`` 为什么不再并入 ``N.SEAL_IFU``（2026-11-04 改）**：
 两者覆盖面不同——前者是整体适配（近远端密封 + 瘤颈 + 分支 + 髂股入路 + 组件兼容），
@@ -36,7 +42,7 @@
 3. **有阈值的判断存原值**（颈长、Hb、SBP、eGFR…），阈值留在规则层；
    只有「本身无阈值」的事实才用布尔 / 三态枚举。反例 ``S.PAIN_SEVERE_SCREEN`` 保留但**仅展示**。
 
-非域字段（不计入 162）
+非域字段（不计入 164）
 ----------------------
 ``case_id``（系统身份）、``urgency_flag``（人工覆盖通道）、``urgency_flag_audit``（留痕）、
 ``field_evidence``（字段级证据链）挂在 :class:`VascCase` 上，属于模型级的横切属性。
@@ -188,10 +194,10 @@ class EvidenceDomain(_StrictDomain):
 
 
 # ===========================================================================
-# S. 症状与查体（18）
+# S. 症状与查体（20）
 # ===========================================================================
 class SymptomDomain(_StrictDomain):
-    """S. 症状与查体（18 字段）。"""
+    """S. 症状与查体（20 字段）。"""
 
     pain_present: Literal["是", "否", "可疑", "未知"] | None = None  # 当前疼痛存在
     pain_site: (
@@ -209,13 +215,19 @@ class SymptomDomain(_StrictDomain):
         None  # 医师判断疼痛与 AAA 的相关性（未判断 ≠ 无关）
     )
     syncope: Literal["肯定", "否定", "可疑", "未知"] | None = None  # 晕厥或短暂意识丧失
-    gi_bleed: list[Literal["呕血", "黑便", "便血", "其他出血表现", "无", "未知"]] | None = (
-        None  # 当前消化道出血表现（可多选，「无」为已知阴性）
+    gi_bleed: Literal["是", "否", "疑似", "未知", "证据冲突"] | None = (
+        None  # 本次是否存在消化道出血（S.GI_BLEED，规格原文五态）
     )
-    limb: (
+    gi_bleed_type: list[Literal["呕血", "黑便", "便血", "其他出血表现", "无", "未知"]] | None = (
+        None  # 出血表现类型（S.GI_BLEED_TYPE，可多选；「无」为已知阴性）
+    )
+    limb: Literal["是", "否", "疑似", "未评估", "证据冲突"] | None = (
+        None  # 本次是否存在急性肢体缺血/外周栓塞表现（S.LIMB，规格原文五态）
+    )
+    limb_signs: (
         list[Literal["疼痛", "苍白", "发凉", "麻木", "无力", "运动障碍", "其他", "无", "未知"]]
         | None
-    ) = None  # 急性肢体缺血症状（可多选，「无」为已知阴性）
+    ) = None  # 急性肢体缺血具体体征（S.LIMB_SIGNS，可多选；「无」为已知阴性）
     pulse_deficit: Literal["有", "减弱", "缺失", "无法评价", "未查"] | None = (
         None  # 外周搏动检查结果
     )
@@ -513,7 +525,7 @@ class ResultDomain(_StrictDomain):
 # 组装
 # ===========================================================================
 class VascCase(BaseModel):
-    """V3.6.2 术前病例 —— 162 个路由字段（14 个域子模型）+ 4 个非域字段。
+    """V3.6.2 术前病例 —— 164 个路由字段（14 个域子模型）+ 4 个非域字段。
 
     访问形式：``case.n.neck_len`` / ``case.cl.aaa_diam`` / ``case.p.age``。
 
@@ -541,7 +553,7 @@ class VascCase(BaseModel):
     k: CheckDomain = Field(default_factory=CheckDomain)
     r: ResultDomain = Field(default_factory=ResultDomain)
 
-    # ---- 非域字段（不计入 162）----
+    # ---- 非域字段（不计入 164）----
     urgency_flag: bool = Field(
         default=False,
         description="人工置位：医生主动标记「本次必须按急症处理」（可越级进 G05）。",
@@ -580,7 +592,7 @@ DOMAIN_FIELD_COUNTS: dict[str, int] = {
     "t": 1,
     "d": 11,
     "q": 16,
-    "s": 18,
+    "s": 20,
     "v": 17,
     "lab": 11,
     "c": 20,
@@ -591,7 +603,7 @@ DOMAIN_FIELD_COUNTS: dict[str, int] = {
     "k": 5,
     "r": 2,
 }
-TOTAL_FIELD_COUNT = sum(DOMAIN_FIELD_COUNTS.values())  # = 162
+TOTAL_FIELD_COUNT = sum(DOMAIN_FIELD_COUNTS.values())  # = 164
 
 
 def _check_field_counts() -> None:

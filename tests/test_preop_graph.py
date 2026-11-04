@@ -1153,7 +1153,7 @@ class TestEmergencyDiseaseEntry:
             make_case(
                 case_id="GRAPH-R08",
                 d={"surg": ["EVAR"]},
-                s={"gi_bleed": ["黑便"]},
+                s={"gi_bleed_type": ["黑便"]},
                 c={"graft": "有"},
             )
         )

@@ -352,8 +352,8 @@ HITS: list[tuple[str, dict[str, object]]] = [
         },
     ),
     ("G03.R07", {"c": {"rupture_report": "疑似破裂"}}),
-    ("G03.R08", {"d": {"surg": ["EVAR"]}, "s": {"gi_bleed": ["黑便"]}}),
-    ("G03.R09", {"s": {"limb": ["疼痛", "苍白"], "pulse_deficit": "缺失"}}),
+    ("G03.R08", {"d": {"surg": ["EVAR"]}, "s": {"gi_bleed_type": ["黑便"]}}),
+    ("G03.R09", {"s": {"limb_signs": ["疼痛", "苍白"], "pulse_deficit": "缺失"}}),
     ("G03.R10", {"v": {"spo2": 91.0, "rr": 22.0, "sbp": 105.0, "hr": 95.0}}),
     ("G03.R11", {"v": {"spo2": 92.0, "rr": 22.0, "hr": 95.0}}),
     ("G03.R12", {"s": {"syncope": "肯定"}, "q": {"cta_enhance": "不足"}}),
@@ -668,7 +668,9 @@ class TestLabelsAndConfidence:
         ``D6.1`` 也把「感染/瘘」路由到 ``D6.3``。修前预置标签写死成 ``D3``，
         这条根本拿不到标签。
         """
-        result = route(make_case(d={"surg": ["EVAR"]}, s={"gi_bleed": ["黑便"]}, c={"graft": "有"}))
+        result = route(
+            make_case(d={"surg": ["EVAR"]}, s={"gi_bleed_type": ["黑便"]}, c={"graft": "有"})
+        )
         assert result.rule_id == "G03.R08"
         assert result.mode is RouteMode.EMERGENCY
         assert result.class_output == ["D6"]
@@ -869,7 +871,7 @@ class TestDerivedStates:
         ctx = _Ctx(
             make_case(
                 c={"malperfusion": None, "branch": {"SMA": "通畅", "CA": "通畅"}},
-                s={"limb": ["无"]},
+                s={"limb_signs": ["无"]},
             )
         )
         assert ctx.malperfusion is False
@@ -883,7 +885,7 @@ class TestDerivedStates:
         ctx = _Ctx(
             make_case(
                 c={"malperfusion": None, "branch": {"SMA": "不可评价", "CA": "通畅"}},
-                s={"limb": ["无"]},
+                s={"limb_signs": ["无"]},
             )
         )
         assert ctx.malperfusion is None
@@ -893,7 +895,7 @@ class TestDerivedStates:
         ctx = _Ctx(
             make_case(
                 c={"malperfusion": None, "branch": {"CIA": "通畅"}},
-                s={"limb": ["苍白"]},
+                s={"limb_signs": ["苍白"]},
             )
         )
         assert ctx.malperfusion is None
@@ -930,6 +932,54 @@ BLANK_RUPTURE_IMAGING = {
     "rupture_report": None,
     "contain": None,
 }
+
+
+class TestBleedAndLimbStatus:
+    """``S.GI_BLEED`` / ``S.LIMB`` 是**状态**字段，``*_TYPE`` / ``*_SIGNS`` 是明细。
+
+    规格的「允许值」列写得很清楚：``G03.R08`` 是 ``D.SURG;S.GI_BLEED``，
+    ``G03.R15`` 是 ``…;S.GI_BLEED;S.LIMB;…``；``S.GI_BLEED_TYPE`` 只有抽取层
+    ``G02.R04`` 读。此前模型把两个字段并成一格，判据只能读明细，等于**读错了列**。
+
+    现在的口径：状态优先、明细兜底、矛盾即 UNKNOWN。
+    """
+
+    def test_state_alone_drives_the_emergency_rule(self) -> None:
+        """状态写「是」、明细空白 → 仍然命中（不再依赖明细）。"""
+        result = route(make_case(d={"surg": ["EVAR"]}, s={"gi_bleed": "是", "gi_bleed_type": None}))
+        assert result.rule_id == "G03.R08"
+
+    def test_detail_is_the_fallback_when_state_is_missing(self) -> None:
+        result = route(make_case(d={"surg": ["EVAR"]}, s={"gi_bleed_type": ["黑便"]}))
+        assert result.rule_id == "G03.R08"
+
+    def test_uncertain_state_is_not_treated_as_negative(self) -> None:
+        """「疑似消化道出血」既不加急症、也不放行 —— 走资料核实。"""
+        result = route(
+            make_case(d={"surg": ["EVAR"]}, s={"gi_bleed": "疑似", "gi_bleed_type": None})
+        )
+        assert result.rule_id == "FALLBACK.VERIFY"
+        assert result.next_node == "资料核实"
+
+    def test_conflicting_state_and_detail_are_not_arbitrated(self) -> None:
+        """状态=否、明细却有黑便 → UNKNOWN。两份记录打架，不替任何一方作主。"""
+        result = route(
+            make_case(d={"surg": ["EVAR"]}, s={"gi_bleed": "否", "gi_bleed_type": ["黑便"]})
+        )
+        assert result.rule_id == "FALLBACK.VERIFY"
+
+    def test_a_clean_negative_releases_to_guideline(self) -> None:
+        result = route(make_case(s={"gi_bleed": "否", "gi_bleed_type": ["无"]}))
+        assert result.rule_id == "G04.R14"
+
+    def test_unassessed_limb_is_not_a_negative(self) -> None:
+        """``S.LIMB`` 把「未评估」单列一态，就是为了防「没查 = 没有」。"""
+        result = route(make_case(s={"limb": "未评估", "limb_signs": None, "pulse_deficit": "缺失"}))
+        assert result.rule_id == "FALLBACK.VERIFY"
+
+    def test_limb_state_with_severe_pulse_deficit_fires(self) -> None:
+        result = route(make_case(s={"limb": "是", "limb_signs": None, "pulse_deficit": "缺失"}))
+        assert result.rule_id == "G03.R09"
 
 
 class TestCrossDomainConsistency:

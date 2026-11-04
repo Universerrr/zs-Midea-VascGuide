@@ -70,8 +70,12 @@ def baseline_kwargs() -> dict[str, Any]:
             "pain_present": "否",
             "pain_current": "明确无",
             "syncope": "否定",
-            "gi_bleed": ["无"],
-            "limb": ["无"],
+            # 状态留空、明细写「无」：模拟「抽取层只抓到护理记录」的常见情形。
+            # 两边都写也能跑，但那样每个用例都得同时改两个字段才不打架。
+            "gi_bleed": None,
+            "gi_bleed_type": ["无"],
+            "limb": None,
+            "limb_signs": ["无"],
             "pulse_deficit": "未查",
             "infection": ["无"],
             "abd_tender": "阴性",

@@ -251,6 +251,43 @@ def _absent(values: list[object] | None, dangerous: tuple[str, ...]) -> Verdict:
     return True
 
 
+def _gi_bleed_status(x: _Ctx) -> Verdict:
+    """本次是否有消化道出血（三值）—— ``S.GI_BLEED`` 是主判据，明细兜底。
+
+    规格的「允许值」列写的就是状态字段：``G03.R08`` 是 ``D.SURG;S.GI_BLEED``，
+    ``G03.R15`` 是 ``…;S.GI_BLEED;S.LIMB;…``；``S.GI_BLEED_TYPE`` 只有抽取层
+    ``G02.R04`` 读。所以状态有值时以它为准，未填时才看明细。
+
+    **两者矛盾时不替任何一方作主**：状态写「否」而明细记了呕血，返回 UNKNOWN
+    ——「一份记录说没有、另一份记着呕血」不是能自动裁的事。
+    """
+    state = _token(x.s.gi_bleed)
+    detail = _has(x.s.gi_bleed_type, *GI_BLEED_SIGNS)
+    if state == "是":
+        return True
+    if state == "否":
+        return None if detail is True else False
+    if state is not None and _is_uncertain_token(state):
+        return None
+    return detail
+
+
+def _limb_status(x: _Ctx) -> Verdict:
+    """本次是否有急性肢体缺血表现（三值）—— 同 :func:`_gi_bleed_status` 的口径。
+
+    ``S.LIMB`` 的五态里把 ``未评估`` 单列出来，正是为了防「没查 = 没有」。
+    """
+    state = _token(x.s.limb)
+    detail = _has(x.s.limb_signs, *LIMB_ISCHEMIA_SIGNS)
+    if state == "是":
+        return True
+    if state == "否":
+        return None if detail is True else False
+    if state is not None and _is_uncertain_token(state):
+        return None
+    return detail
+
+
 def _num(value: object) -> float | None:
     if value is None or isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -510,8 +547,7 @@ def _materialize_malperfusion(x: _Ctx) -> tuple[Verdict, frozenset[str]]:
     vals = {_token(v) for v in branches.values()}
     if vals & {"可疑", "不可评价"}:
         return None, frozenset()
-    limb = x.s.limb
-    limb_clear = not limb or all(_token(t) == "无" for t in limb)
+    limb_clear = _limb_status(x) is False
     if all(v == "通畅" for v in vals) and limb_clear:
         return False, frozenset()
     return None, frozenset()
@@ -642,16 +678,16 @@ def g03_r07_rupture_not_excluded(x: _Ctx) -> Verdict:
 
 def g03_r08_graft_with_gi_bleed(x: _Ctx) -> Verdict:
     graft = _or(_has(x.d.surg, "EVAR", "OSR"), _eq(x.c.graft, "有"))
-    return _and(graft, _has(x.s.gi_bleed, *GI_BLEED_SIGNS))
+    return _and(graft, _gi_bleed_status(x))
 
 
 def g03_r09_acute_limb_ischemia(x: _Ctx) -> Verdict:
     severe = _or(
-        _has(x.s.limb, "运动障碍", "麻木"),
+        _has(x.s.limb_signs, "运动障碍", "麻木"),
         _eq(x.s.pulse_deficit, "有", "缺失"),
         _branch_occluded(x),
     )
-    return _and(_has(x.s.limb, "疼痛", "苍白", "发凉"), severe)
+    return _and(_limb_status(x), severe)
 
 
 def g03_r10_news2_critical(x: _Ctx) -> Verdict:
@@ -692,8 +728,8 @@ def g03_r15_no_emergency_release(x: _Ctx) -> Verdict:
         _eq(x.q.current_assess, "本次已评估"),
         _eq(x.s.pain_present, "否"),
         _eq(x.s.syncope, "否定"),
-        _absent(x.s.gi_bleed, GI_BLEED_SIGNS),
-        _absent(x.s.limb, LIMB_ISCHEMIA_SIGNS),
+        _not(_gi_bleed_status(x)),
+        _not(_limb_status(x)),
         _present(x.v.sbp, x.v.hr, x.v.acvpu),
     )
 
@@ -1478,7 +1514,7 @@ RULES: dict[str, RuleSpec] = {
         "G03!16",
         "G05",
         "主动脉移植物史合并消化道出血",
-        ("d.surg", "s.gi_bleed"),
+        ("d.surg", "s.gi_bleed", "s.gi_bleed_type"),
         "明确危险",
     ),
     "G03.R09": RuleSpec(
@@ -1486,7 +1522,7 @@ RULES: dict[str, RuleSpec] = {
         "G03!17",
         "G05",
         "急性肢体缺血危险征象",
-        ("s.limb", "s.pulse_deficit", "c.branch"),
+        ("s.limb", "s.limb_signs", "s.pulse_deficit", "c.branch"),
         "明确危险",
     ),
     "G03.R10": RuleSpec(
@@ -1693,7 +1729,7 @@ RULES: dict[str, RuleSpec] = {
         "G04!40",
         "G06",
         "器官或肢体灌注障碍",
-        ("c.malperfusion", "c.branch", "s.limb"),
+        ("c.malperfusion", "c.branch", "s.limb", "s.limb_signs"),
     ),
     "G04.R19": RuleSpec(
         g04_r19_prior_repair_unremarkable,

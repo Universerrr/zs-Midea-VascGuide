@@ -157,7 +157,7 @@ def _fields_without_comment() -> list[tuple[str, str]]:
 # ===========================================================================
 class TestFieldInventory:
     def test_total_is_162(self) -> None:
-        assert TOTAL_FIELD_COUNT == 162
+        assert TOTAL_FIELD_COUNT == 164
 
     def test_domain_counts_match_declaration(self) -> None:
         """独立数一遍：自检表说多少，实际就得是多少。"""
@@ -439,7 +439,7 @@ class TestVersionContract:
         这不是重复劳动 —— 它的作用是让「版本变了」成为一个需要人确认的动作，
         而不是顺手改一个常量就悄悄过关。
         """
-        assert RULESET_VERSION == "v362.7@v3.6.2"
+        assert RULESET_VERSION == "v362.8@v3.6.2"
 
     def test_spec_version_appears_in_ruleset_version(self) -> None:
         assert SPEC_VERSION in RULESET_VERSION

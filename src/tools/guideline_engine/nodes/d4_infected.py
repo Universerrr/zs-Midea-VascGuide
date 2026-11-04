@@ -92,7 +92,7 @@ _NATIVE_INFECTION: tuple[str, ...] = ("原生感染明确", "原生感染疑似"
 #: 模型 ``cl.infection`` 里「既往移植物感染」的两个取值。
 _GRAFT_INFECTION: tuple[str, ...] = ("移植物感染明确", "移植物感染疑似")
 
-#: ``s.gi_bleed`` 里属于「活动性出血」的表现（``无`` / ``未知`` 不在其中）。
+#: ``s.gi_bleed_type`` 里属于「活动性出血」的表现（``无`` / ``未知`` 不在其中）。
 _GI_BLEED_SIGNS: tuple[str, ...] = ("呕血", "黑便", "便血")
 
 #: ``D4.AEF_WARNING`` 里属于「已发生出血」的取值。

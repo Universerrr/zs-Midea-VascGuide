@@ -56,7 +56,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 from ....rules.router import (
-    LIMB_ISCHEMIA_SIGNS,
     Verdict,
     and_,
     eq,
@@ -83,6 +82,7 @@ from .common import (
     cta_evaluable,
     display_entries,
     evaluate_node,
+    limb_ischemia_present,
     missing_fields,
     multi_field,
     spec_token,
@@ -98,9 +98,6 @@ _ATTRIB_OTHER: str = "明确其他原因"
 
 #: 模型 ``s.pain_attrib`` 里「还没判」的取值（**不是** None，也算缺失）。
 _ATTRIB_UNJUDGED: str = "未判断"
-
-#: ``s.limb`` 里属于「有缺血表现」的取值 —— 复用路由层那一份。
-_LIMB_SIGNS: tuple[str, ...] = LIMB_ISCHEMIA_SIGNS
 
 #: ``D2.COMPRESSION`` 里属于「有压迫表现」的取值（``无`` / ``未知`` 不在其中）。
 _COMPRESSION_SIGNS: tuple[str, ...] = (
@@ -138,10 +135,10 @@ def _tender(state: GuidelineState) -> object:
 def _limb_ischemia(state: GuidelineState) -> Verdict:
     """急性肢体缺血/外周栓塞表现（规格 ``S.LIMB``）。
 
-    模型侧是多选列表，故走 ``has()``：列表里出现任一症状项即算有表现；
-    只有「无」时才是明确阴性；含「未知」时是 UNKNOWN——**未评估不等于否**。
+    状态优先、体征明细兜底，判据本体在 ``common.limb_ischemia_present``；
+    ``S.LIMB`` 五态里把「未评估」单列出来，正是为了防「没查 = 没有」。
     """
-    return has(state.case.s.limb, *_LIMB_SIGNS)
+    return limb_ischemia_present(state)
 
 
 def _wall_breach(state: GuidelineState) -> Verdict:

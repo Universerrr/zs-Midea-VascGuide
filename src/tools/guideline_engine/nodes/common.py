@@ -30,6 +30,7 @@ from ....rules.router import (
     FISTULA_LABELS,
     GI_BLEED_SIGNS,
     INFECTION_LABELS,
+    LIMB_ISCHEMIA_SIGNS,
     SAC_GROWTH_MM,
     SBP_SHOCK,
     Verdict,
@@ -65,6 +66,7 @@ __all__ = [
     "gap_if_missing",
     "infection_typed",
     "is_spec_uncertain",
+    "limb_ischemia_present",
     "malperfusion",
     "missing_fields",
     "multi_field",
@@ -507,13 +509,43 @@ _LIMB_THREATENED: tuple[str, ...] = ("运动障碍", "无力")
 
 
 def active_gi_bleed(state: GuidelineState) -> Verdict:
-    """活动性消化道出血（``S.GI_BLEED`` 的三个阳性表现）。"""
-    return has(state.case.s.gi_bleed, *_GI_BLEED_SIGNS)
+    """活动性消化道出血 —— 状态优先、明细兜底，与判定层同一口径。
+
+    这几个病种规则的「允许值」列写的是 ``S.GI_BLEED``（状态五态）；
+    ``S.GI_BLEED_TYPE`` 是抽取层的补充记录，只在状态未填时兜底。
+    两者矛盾（状态=否、明细却有呕血）时不替任何一方作主，返回 UNKNOWN。
+    """
+    st = token(state.case.s.gi_bleed)
+    detail = has(state.case.s.gi_bleed_type, *_GI_BLEED_SIGNS)
+    if st == "是":
+        return True
+    if st == "否":
+        return None if detail is True else False
+    if st is not None and is_spec_uncertain(st):
+        return None
+    return detail
+
+
+def limb_ischemia_present(state: GuidelineState) -> Verdict:
+    """本次是否有急性肢体缺血表现（``S.LIMB`` 状态优先、体征明细兜底）。"""
+    st = token(state.case.s.limb)
+    detail = has(state.case.s.limb_signs, *LIMB_ISCHEMIA_SIGNS)
+    if st == "是":
+        return True
+    if st == "否":
+        return None if detail is True else False
+    if st is not None and is_spec_uncertain(st):
+        return None
+    return detail
 
 
 def acute_limb_ischemia(state: GuidelineState) -> Verdict:
-    """急性肢体缺血（运动障碍 / 无力）—— 术后病例的 P0 触发项之一。"""
-    return has(state.case.s.limb, *_LIMB_THREATENED)
+    """肢体**濒危**（运动障碍 / 无力）—— 术后病例的 P0 触发项之一。
+
+    比 :func:`limb_ischemia_present` 窄：只有「已威胁肢体存活」的体征才升级到 P0，
+    早期表现（疼痛/苍白/发凉）走 ``S.LIMB`` 状态那条路。
+    """
+    return has(state.case.s.limb_signs, *_LIMB_THREATENED)
 
 
 def sbp_below_shock(state: GuidelineState) -> Verdict:

@@ -2081,13 +2081,13 @@ class TestD2DegradedInputs:
     def test_limb_sign_counts_as_a_symptom(self) -> None:
         """``s.limb`` 是多选列表：有症状项即算有表现，不能用 ``eq`` 判。"""
         outcome = d2_1(
-            _d2_state(s={"aaa_tender": "阴性", "pain_attrib": "明确相关", "limb": ["发凉"]})
+            _d2_state(s={"aaa_tender": "阴性", "pain_attrib": "明确相关", "limb_signs": ["发凉"]})
         )
         assert outcome.verdicts["D2.1.R01"] is True
 
     def test_limb_unknown_is_not_a_negative(self) -> None:
         outcome = d2_1(
-            _d2_state(s={"aaa_tender": "阴性", "pain_attrib": "明确相关", "limb": ["未知"]})
+            _d2_state(s={"aaa_tender": "阴性", "pain_attrib": "明确相关", "limb_signs": ["未知"]})
         )
         assert outcome.verdicts["D2.1.R01"] is None
 
@@ -2243,7 +2243,7 @@ class TestD41Triage:
 
     def test_fistula_with_active_bleeding_also_notifies_g03(self) -> None:
         """规格「如伴活动性出血、休克或新破裂证据，**先**回 G03/G05」。"""
-        outcome = d4_1(_d4_state(cl={"fistula": "主动脉肠瘘"}, s={"gi_bleed": ["黑便"]}))
+        outcome = d4_1(_d4_state(cl={"fistula": "主动脉肠瘘"}, s={"gi_bleed_type": ["黑便"]}))
         assert outcome.verdicts["D4.1.R03"] is True
         assert outcome.next_node == "D4.3"
         assert outcome.escalation == "G03"
@@ -2569,7 +2569,7 @@ class TestD43Magic:
         state = _d4_state(
             cl={"infection": "移植物感染疑似", "prev_evor": "EVAR"},
             c={"graft": "有"},
-            s={"gi_bleed": ["呕血"]},
+            s={"gi_bleed_type": ["呕血"]},
         )
         outcome = d4_3(state)
         assert outcome.verdicts["D4.3.R01"] is True
@@ -3427,7 +3427,7 @@ class TestD61FollowUpTriage:
         assert outcome.escalation == "G05"
 
     def test_active_gi_bleed_escalates(self) -> None:
-        outcome = d6_1(_d6_state(s={"gi_bleed": ["黑便"]}))
+        outcome = d6_1(_d6_state(s={"gi_bleed_type": ["黑便"]}))
         assert outcome.verdicts["D6.1.R01"] is True
         assert outcome.escalation == "G05"
 
@@ -3597,7 +3597,7 @@ class TestD63StructureAndTargetVessel:
     def test_postop_aef_with_bleeding_escalates_and_goes_to_d43(self) -> None:
         outcome = d6_3(
             _d6_state(
-                s={"gi_bleed": ["黑便"]},
+                s={"gi_bleed_type": ["黑便"]},
                 n={"infection_ctx": "医师明确"},
                 d6={"D6.AEF_POSTOP": ["GI出血", "腔外气体"]},
             )
@@ -3607,7 +3607,7 @@ class TestD63StructureAndTargetVessel:
         assert outcome.next_node == "D4.3"
 
     def test_acute_limb_ischemia_escalates(self) -> None:
-        outcome = d6_3(_d6_state(s={"limb": ["苍白", "运动障碍"]}))
+        outcome = d6_3(_d6_state(s={"limb_signs": ["苍白", "运动障碍"]}))
         assert outcome.verdicts["D6.3.R06"] is True
         assert outcome.escalation == "G03"
 
@@ -3757,7 +3757,7 @@ class TestD6EdgeBranches:
     def test_structure_node_skips_p0_without_a_repair_history(self) -> None:
         from src.tools.guideline_engine.nodes.d6_postop import _d63_r08
 
-        assert _d63_r08(_d6_state(cl={"prev_evor": "无"}, s={"gi_bleed": ["黑便"]})) is False
+        assert _d63_r08(_d6_state(cl={"prev_evor": "无"}, s={"gi_bleed_type": ["黑便"]})) is False
 
     def test_structure_gaps_cover_infection_fistula_and_perfusion(self) -> None:
         outcome = d6_3(

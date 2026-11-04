@@ -33,6 +33,7 @@ SPEC = ToolSpec(
         "case.s.pain_attrib",
         "case.s.aaa_tender",
         "case.s.limb",
+        "case.s.limb_signs",
         # D3 破裂的影像证据；D2.1 的壁外出血判据（WALL / CONTAIN）
         "case.c.extrav",
         "case.c.hematoma",
@@ -68,6 +69,7 @@ SPEC = ToolSpec(
         "case.c.graft",
         "case.c.aef_sign",
         "case.s.gi_bleed",
+        "case.s.gi_bleed_type",
         # D5 特殊病变：壁结构病变（PAU/IMH/IAAD）、形态（囊状/假性）、器官灌注
         "case.cl.pau",
         "case.cl.imh",

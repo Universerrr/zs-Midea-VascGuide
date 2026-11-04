@@ -50,19 +50,21 @@
   "s": {
     "pain_present": "是",
     "syncope": "否定",
-    "gi_bleed": [
-      "无"
-    ],
-    "limb": [
-      "无"
-    ],
+    "gi_bleed": "否",
+    "limb": "否",
     "pulse_deficit": "未查",
     "infection": [
       "无"
     ],
     "abd_tender": "阳性",
     "pain_current": "当前新发",
-    "aaa_tender": "明确阳性"
+    "aaa_tender": "明确阳性",
+    "gi_bleed_type": [
+      "无"
+    ],
+    "limb_signs": [
+      "无"
+    ]
   },
   "v": {
     "sbp": 82.0,

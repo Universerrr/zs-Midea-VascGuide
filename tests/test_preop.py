@@ -76,11 +76,11 @@ class TestEmergency:
         assert (result.mode, result.rule_id) == (RouteMode.EMERGENCY, "G03.R07")
 
     def test_graft_with_gi_bleed(self) -> None:
-        result = _route(d={"surg": ["EVAR"]}, s={"gi_bleed": ["黑便"]})
+        result = _route(d={"surg": ["EVAR"]}, s={"gi_bleed_type": ["黑便"]})
         assert (result.mode, result.rule_id) == (RouteMode.EMERGENCY, "G03.R08")
 
     def test_acute_limb_ischemia(self) -> None:
-        result = _route(s={"limb": ["疼痛", "苍白"], "pulse_deficit": "缺失"})
+        result = _route(s={"limb_signs": ["疼痛", "苍白"], "pulse_deficit": "缺失"})
         assert (result.mode, result.rule_id) == (RouteMode.EMERGENCY, "G03.R09")
 
     def test_news2_critical(self) -> None:
