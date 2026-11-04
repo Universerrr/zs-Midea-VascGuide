@@ -1,15 +1,16 @@
-"""路由分支测试 —— V3.1(2) **54 条判定规则**的逐条覆盖 + 三值语义守卫。
+"""路由分支测试 —— V3.6.2 **66 条判定规则**的逐条覆盖 + 三值语义守卫。
 
 分三层（刻意分开：失败时含义不同）：
 
-1. **注册表守卫**：``RULES`` 与 V3.1(2) 是否对得上（条数 / 编号 / 源行 / 出口）。
+1. **注册表守卫**：``RULES`` 与 V3.6.2 是否对得上（条数 / 编号 / 源行 / 出口）。
    这层失败 = 规格漂移，不是逻辑 bug。
 2. **逐条命中**（``HITS``）：每条规则至少一个「明确命中」用例。逐条直接调规则函数、
    不经 ``route()`` 编排 —— 否则前面规则先命中就再也走不到后面，覆盖是假的。
 3. **三值语义**：``UNKNOWN`` 不短路、不确定值只产生 UNKNOWN、未提及 ≠ 阴性。
 
-依赖运行时状态的 4 条（``G04.R14``、``G08.R09``、``G09.R03``、``G09.R04``）单独测：
-它们读的是编排层写进 ``_Ctx`` 的中间结果，不是病例字段，无法用「一条用例一个 dict」表达。
+依赖运行时状态的 6 条（``G04.R14``、``G08.R09``、``G09.R03``、``G09.R04``、
+``G09.R07``、``G09.R09``）单独测：它们读的是编排层写进 ``_Ctx`` 的中间结果，
+不是病例字段，无法用「一条用例一个 dict」表达。
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from conftest import make_case
+from conftest import SPEC_XLSX, make_case
 
 from src.models.preop.case import VascCase
 from src.models.preop.recommendation import RouteMode
@@ -83,13 +84,47 @@ class TestRuleRegistry:
             assert got == list(range(1, len(got) + 1)), f"{domain} 编号不连续：{got}"
 
     def test_every_rule_declares_a_source_cell(self) -> None:
-        """``source`` 是第二真源的凭据：必须形如 ``G03!9``，能回指 V3.1(2) 单元格。"""
+        """``source`` 是第二真源的凭据：必须形如 ``G03!9``，能回指 V3.6.2 单元格。"""
         bad = [rid for rid, spec in RULES.items() if not spec.source or "!" not in spec.source]
         assert not bad, bad
 
     def test_source_cell_domain_matches_rule_domain(self) -> None:
         bad = [rid for rid, spec in RULES.items() if not spec.source.startswith(rid.split(".")[0])]
         assert not bad, bad
+
+    def test_source_rows_match_the_workbook(self) -> None:
+        """``source`` 里的行号必须等于该 rule_id 在 V3.6.2 工作簿里的**实际行**。
+
+        为什么需要这条：``source`` 平时只是一个字符串，规格插行/删行后 66 个行号
+        会集体静默漂移，而所有判据测试照样全绿。V3.6.2 升级时就漂了 29 条，
+        直到逐条对账才发现——那本该是机器的事。
+
+        ``G04.R21`` 是工程补齐规则（规格里没有同 ID 的行），它的 ``source``
+        指向所消费的字段定义行，因此改为校验「那一格确实是 ``C.MALPERFUSION``」。
+        """
+        spec_path = SPEC_XLSX
+        if spec_path is None:
+            pytest.skip("规格 Excel 既不在仓库 docs/ 也不在桌面，跳过逐条对账")
+        from openpyxl import load_workbook
+
+        wb = load_workbook(spec_path, read_only=True, data_only=True)
+        actual: dict[str, str] = {}
+        for sheet in ("G03", "G04", "G08", "G09"):
+            for i, row in enumerate(wb[sheet].iter_rows(min_row=1, values_only=True), start=1):
+                rid = str(row[0] or "").strip()
+                if rid in RULES:
+                    actual[rid] = f"{sheet}!{i}"
+
+        wrong = [
+            f"{rid}: 代码 {spec.source}，规格 {actual.get(rid) or '规格里没有这一行'}"
+            for rid, spec in RULES.items()
+            if rid != "G04.R21" and actual.get(rid) != spec.source
+        ]
+        assert not wrong, "\n".join(wrong)
+
+        sheet, _, row = RULES["G04.R21"].source.partition("!")
+        cell = wb[sheet].cell(row=int(row), column=1).value
+        assert str(cell).strip() == "C.MALPERFUSION", cell
 
     def test_every_rule_has_a_valid_exit(self) -> None:
         assert {spec.exit for spec in RULES.values()} <= VALID_EXITS
@@ -355,7 +390,7 @@ HITS: list[tuple[str, dict[str, object]]] = [
     ),
     ("G04.R06", {"n": {"thoracic": "是"}}),
     ("G04.R07", {"n": {"infection_ctx": "医师明确"}}),
-    ("G04.R08", {"n": {"seal_ifu": "不符"}}),
+    ("G04.R08", {"n": {"seal_ifu": "不符合"}}),
     ("G04.R09", {"n": {"iliac_bilat": "双侧", "iia_left": "闭塞"}}),
     ("G04.R10", {"n": {"access_occlusion": "双侧闭塞"}}),
     ("G04.R11", {"n": {"prev_repair": "EVAR", "endoleak_type": "I"}}),
@@ -822,7 +857,7 @@ class TestDerivedStates:
         assert ctx.malperfusion_organs == frozenset({"肾", "下肢"})
 
     def test_malperfusion_branch_occlusion_alone_is_never_true(self) -> None:
-        """规格 G04!C39 明文：不能仅凭解剖狭窄自动推断器官缺血。
+        """规格 G04!J40 明文：不能仅凭解剖狭窄自动推断器官缺血。
 
         这条断言是方案乙的护栏——日后谁把派生改成「闭塞即阳性」，它会先红。
         """

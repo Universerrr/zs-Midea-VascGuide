@@ -1,4 +1,4 @@
-"""数据模型契约测试 —— V3.1(2) 的 **161 个字段**是否被如实建模。
+"""数据模型契约测试 —— V3.6.2 的 **161 个字段**是否被如实建模。
 
 与 v1.x（51 个平铺字段）的关键差别：
 
@@ -156,8 +156,8 @@ def _fields_without_comment() -> list[tuple[str, str]]:
 # 一、字段清单
 # ===========================================================================
 class TestFieldInventory:
-    def test_total_is_161(self) -> None:
-        assert TOTAL_FIELD_COUNT == 161
+    def test_total_is_162(self) -> None:
+        assert TOTAL_FIELD_COUNT == 162
 
     def test_domain_counts_match_declaration(self) -> None:
         """独立数一遍：自检表说多少，实际就得是多少。"""
@@ -292,7 +292,7 @@ class TestLiteralEnums:
         )
 
     def test_extra_detail_domains_are_present(self) -> None:
-        """GEN. / INF. 是 V3.1(2) 新增的证据明细层：规则不直接读，供 N.*_CTX 派生。"""
+        """GEN. / INF. 是证据明细层：规则不直接读，供 N.*_CTX 派生。"""
         assert {"gen", "inf"} <= set(DOMAIN_FIELD_COUNTS)
 
     def test_uncertain_values_can_be_entered(self) -> None:
@@ -439,7 +439,7 @@ class TestVersionContract:
         这不是重复劳动 —— 它的作用是让「版本变了」成为一个需要人确认的动作，
         而不是顺手改一个常量就悄悄过关。
         """
-        assert RULESET_VERSION == "v362.2@v3.6.2"
+        assert RULESET_VERSION == "v362.5@v3.6.2"
 
     def test_spec_version_appears_in_ruleset_version(self) -> None:
         assert SPEC_VERSION in RULESET_VERSION

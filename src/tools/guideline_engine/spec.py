@@ -48,6 +48,7 @@ SPEC = ToolSpec(
         "case.n.neck_d",
         "case.n.neck_angle",
         "case.n.seal_ifu",
+        "case.n.evar_ifu_status",
         "case.n.access_occlusion",
         "case.n.access_tortuosity",
         "case.n.renal_r",

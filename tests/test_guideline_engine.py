@@ -13,8 +13,10 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
-from conftest import make_case
+from conftest import SPEC_XLSX, make_case
 from pydantic import ValidationError
 
 from src.models.preop.case import VascCase
@@ -22,11 +24,21 @@ from src.preop_agent.output_layer.node import build_tool_findings
 from src.rules.router import D3_EMERGENCY_RULES, route
 from src.tools.base import ToolRequest
 from src.tools.guideline_engine import run
+from src.tools.guideline_engine.nodes import (
+    d1_asymptomatic,
+    d2_symptomatic,
+    d3_ruptured,
+    d4_infected,
+    d5_special,
+    d6_postop,
+    d7_iliac,
+)
 from src.tools.guideline_engine.nodes.common import RuleSlot, evaluate_node
 from src.tools.guideline_engine.nodes.d1_asymptomatic import d1_1, d1_2, d1_3
 from src.tools.guideline_engine.nodes.d2_symptomatic import d2_1, d2_2, d2_3
 from src.tools.guideline_engine.nodes.d3_ruptured import (
     _D33_FIELDS,
+    _d31_r91,
     d3_1,
     d3_2,
     d3_3,
@@ -47,6 +59,7 @@ from src.tools.guideline_engine.state import (
     Candidate,
     CandidateStatus,
     GuidelineState,
+    Link,
     NodeOutcome,
 )
 
@@ -137,6 +150,37 @@ class TestRegistry:
             done = sum(1 for rid in RULE_ROWS if rid.startswith(f"{sheet}."))
             assert done <= total, f"{sheet} 实现了 {done} 条，规格只有 {total} 条"
 
+    def test_every_registered_rule_has_a_judge(self) -> None:
+        """登记了 172 条，就必须有 172 条**真的会被求值**。
+
+        ``RULE_ROWS`` 是「已登记」清单，``RuleSlot`` / ``DisplayRule`` 才是真正
+        执行判据的载体。两者不一致时，报告里那条结论永远不出现，而条数统计照样
+        是 172 —— 光看数字发现不了。
+
+        唯一豁免 ``D1.1.R06``：它是展示性规则，由 ``d1_1`` 在节点层手写产出
+        （进槽位会以 P1 抢先命中，挤掉 P3 的监测出口）。豁免必须写在这里，
+        新增规则时忘了接判据才会被发现。
+        """
+        hand_written = {"D1.1.R06"}
+        declared: set[str] = set()
+        for mod in (
+            d1_asymptomatic,
+            d2_symptomatic,
+            d3_ruptured,
+            d4_infected,
+            d5_special,
+            d6_postop,
+            d7_iliac,
+        ):
+            for attr, value in vars(mod).items():
+                if attr.endswith(("_SLOTS", "_DISPLAY_RULES")) and isinstance(value, tuple):
+                    declared |= {item.rule_id for item in value}
+        missing = sorted(set(RULE_ROWS) - declared - hand_written)
+        assert not missing, f"已登记但没有任何判据载体：{missing}"
+        assert not declared - set(RULE_ROWS), (
+            f"判据载体指向未登记的规则：{declared - set(RULE_ROWS)}"
+        )
+
 
 # ===========================================================================
 # D3.1：破裂确定性与证据
@@ -174,16 +218,21 @@ class TestD31:
         outcome = d3_1(GuidelineState(case=case, route=result))
         assert outcome.verdicts["D3.1.R01"] is False
 
-    def test_unknown_rupture_status_stays_in_emergency(self) -> None:
-        """破裂状态不可评价 → 不得降级为「排除破裂」，保持急诊疑似。
+    def test_unknown_rupture_status_continues_to_d32(self) -> None:
+        """破裂状态不可评价 → 不得降级为「排除破裂」，继续进 D3.2 评估。
 
         由 ``R05``（P0-A）兜住，而不是 ``R90``（P2）——优先级顺序即规格
         ``NODE.ORDER`` 的「P0 先输出且不得被低优先级覆盖」。
+
+        出口按规格 M 列「下一节点/终点：D3.2 / 动作：D3.2 或持续急诊评估」：
+        **值域只有 D3.2**，没有 G05。修前写成 ``escalate G05``，把「持续急诊评估」
+        当成了独立出口 —— 那描述的是 D3.2 内部的持续观察，不是另一条路。
         """
         case = make_case(cl={"aaa_rupture": "无法评价"})
         outcome = d3_1(GuidelineState(case=case, route=route(case)))
         assert outcome.verdicts.get("D3.1.R05") is True
-        assert outcome.escalation == "G05"
+        assert outcome.next_node == "D3.2"
+        assert outcome.escalation is None
 
     def test_unevaluable_imaging_with_clear_rupture_status_falls_to_r90(self) -> None:
         """破裂状态明确为「未见」，但 CTA 不可评价 → P2 数据阻断，人工复核。"""
@@ -204,6 +253,35 @@ class TestD31:
         outcome = d3_1(GuidelineState(case=case, route=route(case)))
         assert outcome.verdicts.get("D3.1.R91") is True
         assert outcome.terminal is not None and "D1.1" in outcome.terminal
+
+    def test_r91_requires_the_doctor_to_confirm(self) -> None:
+        """影像全阴但医生仍写「疑似」→ **不得**走排除破裂（规格 G 列两段合取）。
+
+        这是 R91 修严的核心：只看影像会把一份「CTA 报阴性」的病例送回择期，
+        等于系统替医生撤销了他自己写的怀疑。未记录同样不算确认。
+        """
+        for dx_context in ("疑似", None):
+            case = make_case(
+                d={"dx_context": dx_context},
+                cl={"aaa_rupture": "未见相关证据"},
+                c={"extrav": "未见", "hematoma": "未见", "rupture_report": "明确未见"},
+            )
+            state = GuidelineState(case=case, route=route(case))
+            assert _d31_r91(state) is False, dx_context
+            # 链路不能断在分诊层：稳定患者由 R03 接手进 D3.2
+            outcome = d3_1(state)
+            assert outcome.verdicts.get("D3.1.R91") is not True
+            assert outcome.next_node == "D3.2"
+
+    def test_doctor_confirmed_negative_still_takes_the_exclusion_path(self) -> None:
+        """医生确认 + 影像全阴 → 仍然走 R91（修严不能把正常出口也堵死）。"""
+        case = make_case(
+            d={"dx_context": "确认"},
+            cl={"aaa_rupture": "未见相关证据"},
+            c={"extrav": "未见", "hematoma": "未见", "rupture_report": "明确未见"},
+        )
+        state = GuidelineState(case=case, route=route(case))
+        assert _d31_r91(state) is True
 
     def test_hit_rule_is_recorded_with_its_source_row(self) -> None:
         """命中项必须带源行——结论要能回到规格的具体单元格。"""
@@ -234,7 +312,7 @@ class TestD32AndD33:
             make_case(
                 c={"extrav": "明确", "extrav_contig": "明确连续"},
                 q={"cta_enhance": "适当", "cta_phase": "动脉期"},
-                n={"seal_ifu": "未核验"},
+                n={"evar_ifu_status": "未核验"},
             )
         )
         verdicts = {e.rule_id: e.verdict for e in report.entries}
@@ -519,7 +597,7 @@ class TestD32RepairDirection:
 
     def test_unverified_ifu_downgrades_to_candidate(self) -> None:
         """IFU 未核验 → 不给一线，降为候选（R04），且缺口里点名 IFU。"""
-        outcome = self._d32(n={"seal_ifu": "未核验"})
+        outcome = self._d32(n={"evar_ifu_status": "未核验"})
         assert outcome.verdicts["D3.2.R01"] is None
         assert outcome.verdicts["D3.2.R04"] is True
         assert outcome.terminal is not None and "候选" in outcome.terminal
@@ -527,7 +605,7 @@ class TestD32RepairDirection:
 
     def test_ifu_mismatch_switches_to_osr(self) -> None:
         """IFU 明确不符 → 评估 OSR（规格 R02，P1）。"""
-        outcome = self._d32(n={"seal_ifu": "不符"})
+        outcome = self._d32(n={"evar_ifu_status": "不符合"})
         assert outcome.verdicts["D3.2.R02"] is True
         assert outcome.terminal is not None and "OSR" in outcome.terminal
 
@@ -538,7 +616,7 @@ class TestD32RepairDirection:
 
     def test_unilateral_access_occlusion_keeps_evar(self) -> None:
         """单侧闭塞不阻断：对侧仍可建立入路，不得把病人推去开放手术。"""
-        outcome = self._d32(n={"access_occlusion": "单侧闭塞", "seal_ifu": "未核验"})
+        outcome = self._d32(n={"access_occlusion": "单侧闭塞", "evar_ifu_status": "未核验"})
         assert outcome.verdicts["D3.2.R02"] is not True
         assert outcome.verdicts["D3.2.R04"] is True
 
@@ -559,13 +637,13 @@ class TestD32RepairDirection:
 
     def test_missing_team_resource_never_blocks_direction(self) -> None:
         """团队资源无来源是常态，不能因此否掉术式方向——规格要求「不延误控制」。"""
-        outcome = self._d32(n={"seal_ifu": "未核验"})
+        outcome = self._d32(n={"evar_ifu_status": "未核验"})
         assert outcome.verdicts["D3.2.R04"] is True
         assert any("TEAM_RESOURCE" in gap for gap in outcome.gaps)
 
     def test_borderline_sbp_withholds_first_line(self) -> None:
         """SBP 82 属临界：不判「可评估」，故不给一线，但仍可给候选。"""
-        outcome = self._d32(v={"sbp": 82.0}, n={"seal_ifu": "未核验"})
+        outcome = self._d32(v={"sbp": 82.0}, n={"evar_ifu_status": "未核验"})
         assert outcome.verdicts["D3.2.R01"] is None
         assert outcome.verdicts["D3.2.R04"] is True
 
@@ -656,18 +734,42 @@ class TestD32Candidates:
         assert set(got) == {"EVAR", "OSR"}
 
     def test_full_workup_gives_feasible_evar(self) -> None:
-        got = self._candidates(n={"seal_ifu": "符合"}, v={"sbp": 120.0})
+        got = self._candidates(n={"evar_ifu_status": "符合"}, v={"sbp": 120.0})
         assert got["EVAR"].status is CandidateStatus.FEASIBLE
         assert "D3.2.R01" in got["EVAR"].rule_ids
 
     def test_unverified_ifu_downgrades_to_conditional(self) -> None:
-        got = self._candidates(n={"seal_ifu": "未核验"})
+        got = self._candidates(n={"evar_ifu_status": "未核验"})
         assert got["EVAR"].status is CandidateStatus.CONDITIONAL
         assert "IFU 未核验" in got["EVAR"].reason
 
     def test_ifu_mismatch_is_exclusion_not_unknown(self) -> None:
         """IFU 明确不符是**排除**，不是「未评估」——两者临床含义相反。"""
-        got = self._candidates(n={"seal_ifu": "不符"})
+        got = self._candidates(n={"evar_ifu_status": "不符合"})
+        assert got["EVAR"].status is CandidateStatus.EXCLUDED
+
+    def test_proximal_seal_alone_never_counts_as_whole_device_ifu(self) -> None:
+        """近端密封区符合 ≠ 整体 IFU 符合（规格 ``N.SEAL_IFU`` 判据列明写）。
+
+        两个字段合并时，这里会给「可行候选（IFU 符合）」；拆开后必须降为条件性
+        候选，并在理由里说清「只核了近端」。整例也不再宣称「EVAR 一线」。
+        """
+        case = make_case(
+            c={"extrav": "明确", "extrav_contig": "明确连续"},
+            q={"cta_enhance": "适当", "cta_phase": "动脉期"},
+            n={"seal_ifu": "符合", "evar_ifu_status": None},
+        )
+        outcome = d3_2(GuidelineState(case=case, route=route(case)))
+        evar = _candidate(outcome, "EVAR")
+        assert evar.status is CandidateStatus.CONDITIONAL
+        assert "仅近端密封区已确认" in evar.reason
+        assert "IFU 符合" not in evar.reason
+        assert outcome.verdicts["D3.2.R01"] is not True
+        assert outcome.terminal is not None and "候选" in outcome.terminal
+
+    def test_overall_ifu_mismatch_wins_over_a_conforming_proximal_seal(self) -> None:
+        """近端符合、整体不符合 → 排除 EVAR。合并字段时这个输入根本表达不出来。"""
+        got = self._candidates(n={"seal_ifu": "符合", "evar_ifu_status": "不符合"})
         assert got["EVAR"].status is CandidateStatus.EXCLUDED
 
     def test_bilateral_access_occlusion_is_exclusion(self) -> None:
@@ -677,7 +779,7 @@ class TestD32Candidates:
 
     def test_unilateral_access_occlusion_is_not_exclusion(self) -> None:
         """单侧闭塞不排除：对侧仍可建立入路。"""
-        got = self._candidates(n={"access_occlusion": "单侧闭塞", "seal_ifu": "未核验"})
+        got = self._candidates(n={"access_occlusion": "单侧闭塞", "evar_ifu_status": "未核验"})
         assert got["EVAR"].status is CandidateStatus.CONDITIONAL
 
     def test_missing_anatomy_is_unassessed_not_excluded(self) -> None:
@@ -687,14 +789,18 @@ class TestD32Candidates:
 
     def test_osr_is_always_mdt_pending(self) -> None:
         """OSR 恒为「需 MDT 评估」——VascCase 无开放解剖字段，没有判据就不下结论。"""
-        for overrides in ({}, {"n": {"seal_ifu": "不符"}}, {"n": {"access_occlusion": "双侧闭塞"}}):
+        for overrides in (
+            {},
+            {"n": {"evar_ifu_status": "不符合"}},
+            {"n": {"access_occlusion": "双侧闭塞"}},
+        ):
             got = self._candidates(**overrides)
             assert got["OSR"].status is CandidateStatus.MDT
 
     def test_osr_reason_changes_when_evar_excluded(self) -> None:
         """EVAR 被排除时 OSR 成为唯一方向——理由必须跟着变，否则读者分不清优先级。"""
         normal = self._candidates()["OSR"].reason
-        evar_out = self._candidates(n={"seal_ifu": "不符"})["OSR"].reason
+        evar_out = self._candidates(n={"evar_ifu_status": "不符合"})["OSR"].reason
         assert normal != evar_out
         assert "唯一候选" in evar_out
 
@@ -706,7 +812,7 @@ class TestD32Candidates:
 
     def test_uncertain_access_value_is_not_exclusion(self) -> None:
         """「未知」是有值但值不确定 → 只能不判，不得当成排除。"""
-        got = self._candidates(n={"access_occlusion": "未知", "seal_ifu": "未核验"})
+        got = self._candidates(n={"access_occlusion": "未知", "evar_ifu_status": "未核验"})
         assert got["EVAR"].status is CandidateStatus.CONDITIONAL
 
     def test_declining_consciousness_blocks_feasible_status(self) -> None:
@@ -715,7 +821,7 @@ class TestD32Candidates:
         这条同时守住一个曾存在的死分支：代码曾比较「新发意识下降」，而模型
         的 ``Literal`` 是「新发下降」——两者永不相等，导致该判断从没生效。
         """
-        got = self._candidates(n={"seal_ifu": "符合"}, v={"conscious_change": "新发下降"})
+        got = self._candidates(n={"evar_ifu_status": "符合"}, v={"conscious_change": "新发下降"})
         assert got["EVAR"].status is CandidateStatus.CONDITIONAL
         assert "不稳定" in got["EVAR"].reason
 
@@ -725,18 +831,18 @@ class TestD32Candidates:
         与上一条成对：如果这两个值被写成同一个分支，新发下降就再也拦不住
         「可行候选」——急诊最该降级的情形反而放行。
         """
-        got = self._candidates(n={"seal_ifu": "符合"}, v={"conscious_change": "基线未知"})
+        got = self._candidates(n={"evar_ifu_status": "符合"}, v={"conscious_change": "基线未知"})
         assert got["EVAR"].status is CandidateStatus.FEASIBLE
 
     def test_missing_sbp_is_unknown_not_unstable(self) -> None:
         """血压缺失 ≠ 不稳定，只能判 UNKNOWN。"""
-        got = self._candidates(n={"seal_ifu": "符合"}, v={"sbp": None})
+        got = self._candidates(n={"evar_ifu_status": "符合"}, v={"sbp": None})
         assert got["EVAR"].status is CandidateStatus.CONDITIONAL
         assert "患者状态待明确" in got["EVAR"].reason
 
     def test_no_candidate_mentions_device_model(self) -> None:
         """粒度红线：候选里不得出现品牌/SKU/尺寸——规格 5 处明文禁止。"""
-        got = self._candidates(n={"seal_ifu": "符合"})
+        got = self._candidates(n={"evar_ifu_status": "符合"})
         for cand in got.values():
             text = cand.render()
             for banned in ("SKU", "品牌", "型号", "mm 支架", "Endurant", "Excluder"):
@@ -781,10 +887,26 @@ class TestD31CtaPath:
 
         assert _d31_r03(self._state(**{"D3.CTA_FEASIBLE": "不确定"})) is None
 
-    def test_an_unrecorded_field_is_unknown(self) -> None:
+    def test_an_unrecorded_field_falls_back_to_vitals(self) -> None:
+        """``D3.CTA_FEASIBLE`` 未记录 ≠ 判不了 —— 该行允许值列本就含 V.SBP。
+
+        与上一条的区别：**「不确定」是医生说的「判不了」，「没填」只是没记**。
+        后者可以由生命体征回答同一个问题（稳不稳到能等 CTA）；前者系统不该替
+        医生判。两者在 ``eq`` 里都折成 ``None``，所以判据先读原始值区分。
+        """
         from src.tools.guideline_engine.nodes.d3_ruptured import _d31_r03
 
-        assert _d31_r03(self._state()) is None
+        # 基线 SBP 120 → 稳定 → 能等
+        assert _d31_r03(self._state()) is True
+
+        unstable = make_case(cl={"aaa_rupture": "疑似"}, v={"sbp": 70.0})
+        assert (
+            _d31_r03(GuidelineState(case=unstable, route=route(unstable), node_inputs={})) is False
+        )
+
+        # 生命体征也缺 → 判不了
+        blank = make_case(cl={"aaa_rupture": "疑似"}, v={"sbp": None})
+        assert _d31_r03(GuidelineState(case=blank, route=route(blank), node_inputs={})) is None
 
     # ---- R04：影像不够，临床还在怀疑 ----
 
@@ -850,19 +972,33 @@ class TestD3ResourceCoverage:
         return d3_2(GuidelineState(case=case, route=route(case), node_inputs=inputs))
 
     def test_clinical_suspicion_hits_the_suspected_rule(self) -> None:
-        """``D3.1.R02``：临床怀疑型（报告写疑似破裂、影像未见外溢）。
+        """``D3.1.R02``：疑似背景 **且** 血流动力学不稳定，两段缺一不可。
 
-        修前这条规则从未被判 True——不是判据错，是没有用例造出这种组合：
-        路由器走 ``G03.R07``（临床怀疑）而不是 ``G03.R01``（影像明确）。
+        修前只判前一段（``route.rule_id ∈ _D3_SUSPECTED``），于是血压 120 的
+        疑似病例也命中，危险提示里出现「疑似 rAAA 背景下 SBP<80 mmHg」而病人
+        血压是 120 —— 陈述与事实对不上。规格 G 列是两段合取。
         """
-        case = make_case(cl={"aaa_rupture": "疑似"}, c={"rupture_report": "疑似破裂"})
-        result = route(case)
-        assert result.rule_id == "G03.R07"
+        # 稳定：不命中（修严后的关键行为）
+        stable = make_case(cl={"aaa_rupture": "疑似"}, c={"rupture_report": "疑似破裂"})
+        stable_route = route(stable)
+        assert stable_route.rule_id == "G03.R07"
+        stable_out = d3_1(GuidelineState(case=stable, route=stable_route))
+        assert stable_out.verdicts["D3.1.R02"] is False
+        # 链路不断：稳定 + 未记录 D3.CTA_FEASIBLE → R03 按生命体征接手
+        assert stable_out.next_node == "D3.2"
 
-        outcome = d3_1(GuidelineState(case=case, route=result))
+        # 不稳定：命中
+        unstable = make_case(
+            cl={"aaa_rupture": "疑似"}, c={"rupture_report": "疑似破裂"}, v={"sbp": 70.0}
+        )
+        unstable_route = route(unstable)
+        assert unstable_route.rule_id == "G03.R04"
+        outcome = d3_1(GuidelineState(case=unstable, route=unstable_route))
         assert outcome.verdicts["D3.1.R02"] is True
         assert outcome.escalation == "G05"
-        assert outcome.next_node == "D3.2"
+        # 规格 M 列对 ``R02`` 只写「G05 急诊模式；快速控制/修复评估」——
+        # 值域里没有 D3.2。血压 70 的病人先稳定，不该同时讨论择期术式候选。
+        assert outcome.next_node is None
 
     def test_center_without_capacity_transfers_instead_of_operating(self) -> None:
         """院方明确做不了 → 转诊/现场救援，不能说「EVAR 一线」。
@@ -944,7 +1080,7 @@ class TestShadowedFallbacks:
         """腔内走不通 + 当前不能开刀 → MDT/转诊，而不是「不可手术」。"""
         case = make_case(
             cl={"aaa_diam": 56.0, "aaa_rupture": "未见相关证据", "diag_multi": None},
-            n={"seal_ifu": "不符"},
+            n={"seal_ifu": "不符合"},
         )
         state = GuidelineState(
             case=case, route=route(case), node_inputs={"D1": {"D1.OP_FITNESS": "当前不适合"}}
@@ -956,7 +1092,7 @@ class TestShadowedFallbacks:
     def test_d13_r08_stays_false_when_surgery_is_still_possible(self) -> None:
         case = make_case(
             cl={"aaa_diam": 56.0, "aaa_rupture": "未见相关证据", "diag_multi": None},
-            n={"seal_ifu": "不符"},
+            n={"seal_ifu": "不符合"},
         )
         state = GuidelineState(
             case=case, route=route(case), node_inputs={"D1": {"D1.OP_FITNESS": "可接受"}}
@@ -1168,9 +1304,31 @@ class TestD11Branches:
         assert outcome.escalation == "G03"
 
     def test_saccular_lesion_goes_to_special_assessment(self) -> None:
+        """囊状病变 → D5.3（规格 R07 的逐项分派，不是一个笼统终点）。"""
         outcome = self._outcome(cl={"saccular": "明确"})
         assert outcome.verdicts["D1.1.R07"] is True
-        assert outcome.terminal is not None and "D5.3" in outcome.terminal
+        assert outcome.next_node == "D5.3"
+        assert outcome.next_nodes == ("D5.3",)
+        assert outcome.terminal is None, "给了确定去处就不该停在本节点"
+
+    def test_infection_goes_to_d41_not_to_the_morphology_node(self) -> None:
+        """感染 → D4.1。规格把「感染或瘘」单列一档，不能笼统走 D5.3。"""
+        outcome = self._outcome(n={"infection_ctx": "医师明确"})
+        assert outcome.verdicts["D1.1.R07"] is True
+        assert outcome.next_node == "D4.1"
+
+    def test_coexisting_etiologies_dispatch_in_parallel(self) -> None:
+        """「多标签可以并存」：炎症 + 遗传 → D5.3 与 D1.2 都要去。
+
+        串行只走一个时，另一半在报告里彻底消失——而规格明写两者并存。
+        """
+        outcome = self._outcome(
+            n={"inflammatory_ctx": "影像高度提示", "genetic_ctx": "疑似遗传背景"}
+        )
+        assert outcome.verdicts["D1.1.R07"] is True
+        assert set(outcome.next_nodes) == {"D5.3", "D1.2"}
+        assert outcome.link is Link.PARALLEL
+        assert outcome.next_node == "D5.3", "主出口取紧迫度最高的那个"
 
     def test_special_morphology_blocks_threshold_path(self) -> None:
         """特殊形态不套普通梭形阈值：即使直径达阈值也不进 D1.2。
@@ -1181,7 +1339,7 @@ class TestD11Branches:
         outcome = self._outcome(cl={"aaa_diam": 60.0, "pseudo": "明确"})
         assert outcome.verdicts["D1.1.R05"] is None
         assert outcome.verdicts["D1.1.R07"] is True
-        assert outcome.next_node is None
+        assert outcome.next_node == "D5.3", "去特殊形态评估，不是 D1.2 的阈值分层"
 
     def test_genetic_clue_routes_to_d12(self) -> None:
         outcome = self._outcome(n={"genetic_ctx": "疑似遗传背景"})
@@ -1405,7 +1563,7 @@ class TestD13Candidates:
         assert outcome.verdicts["D1.3.R01"] is False
 
     def test_ifu_mismatch_excludes_evar_and_escalates(self) -> None:
-        outcome = _d13_outcome(n={"seal_ifu": "不符"})
+        outcome = _d13_outcome(n={"seal_ifu": "不符合"})
         assert _candidate(outcome, "EVAR").status is CandidateStatus.EXCLUDED
         assert outcome.escalation == "G06"
         assert outcome.verdicts["D1.3.R06"] is True
@@ -1466,7 +1624,7 @@ class TestD13Candidates:
 
     def test_escalation_does_not_leave_a_contradictory_terminal(self) -> None:
         """转复杂模式时不得再写「候选已列出」——两个互斥结论不能同现。"""
-        outcome = _d13_outcome(n={"seal_ifu": "不符"})
+        outcome = _d13_outcome(n={"seal_ifu": "不符合"})
         assert outcome.escalation == "G06"
         assert outcome.terminal is None
 
@@ -1824,16 +1982,28 @@ class TestD23Candidates:
         assert _candidate(d1_3(d13_state), "EVAR").status is CandidateStatus.CONDITIONAL
 
     def test_unverified_ifu_stays_a_pending_candidate(self) -> None:
-        outcome = d2_3(_d2_state(n={"seal_ifu": "未核验"}))
+        outcome = d2_3(_d2_state(n={"evar_ifu_status": "未核验"}))
         evar = _candidate(outcome, "EVAR")
         assert evar.status is CandidateStatus.CONDITIONAL
         assert "待核验候选" in evar.reason
         assert outcome.verdicts["D2.3.R06"] is True
 
     def test_ifu_mismatch_excludes_evar_and_escalates(self) -> None:
-        outcome = d2_3(_d2_state(n={"seal_ifu": "不符"}))
+        outcome = d2_3(_d2_state(n={"evar_ifu_status": "不符合"}))
         assert _candidate(outcome, "EVAR").status is CandidateStatus.EXCLUDED
         assert outcome.escalation == "G06"
+
+    def test_ifu_comes_from_the_whole_device_field_not_the_proximal_one(self) -> None:
+        """``D2.3`` 的 7 条规则读 ``N.EVAR_IFU_STATUS``，不是 ``N.SEAL_IFU``。
+
+        两个方向一起证明判据没串：近端符合 + 整体不符合 → 排除（合并字段时会
+        误判为可行）；近端未核验 + 整体符合 → 仍是可行候选（说明不看近端）。
+        """
+        contradictory = d2_3(_d2_state(n={"seal_ifu": "符合", "evar_ifu_status": "不符合"}))
+        assert _candidate(contradictory, "EVAR").status is CandidateStatus.EXCLUDED
+
+        whole_ok = d2_3(_d2_state(n={"seal_ifu": "未核验", "evar_ifu_status": "符合"}))
+        assert _candidate(whole_ok, "EVAR").status is CandidateStatus.FEASIBLE
 
     def test_branch_involvement_escalates_to_complex(self) -> None:
         outcome = d2_3(_d2_state(n={"renal_l": "明确受累"}))
@@ -1868,7 +2038,7 @@ class TestD23Candidates:
         assert "未评价" in osr.reason
 
     def test_osr_reason_marks_the_only_option_when_evar_out(self) -> None:
-        outcome = d2_3(_d2_state(n={"seal_ifu": "不符"}))
+        outcome = d2_3(_d2_state(n={"evar_ifu_status": "不符合"}))
         assert "唯一候选" in _candidate(outcome, "OSR").reason
 
     def test_display_rules_leave_traces(self) -> None:
@@ -1928,7 +2098,7 @@ class TestD2DegradedInputs:
                     "neck_d": None,
                     "neck_angle": None,
                     "access_occlusion": None,
-                    "seal_ifu": None,
+                    "evar_ifu_status": None,
                 }
             )
         )
@@ -1939,7 +2109,7 @@ class TestD2DegradedInputs:
         assert "IFU 未记录" in evar.reason
         joined = " ".join(outcome.gaps)
         assert "入路可行性未评估" in joined
-        assert "N.SEAL_IFU" in joined
+        assert "N.EVAR_IFU_STATUS" in joined
 
     def test_missing_cta_status_is_reported(self) -> None:
         outcome = d2_3(_d2_state(n={"cta_status": None}))
@@ -2058,8 +2228,22 @@ class TestD41Triage:
         assert outcome.next_node == "D4.3"
 
     def test_suspected_fistula_is_a_positive_trigger(self) -> None:
-        """``CL.FISTULA = 疑似`` 必须命中 R03 —— 「疑似」不是「没有」。"""
+        """``CL.FISTULA = 疑似`` 必须命中 R03 —— 「疑似」不是「没有」。
+
+        出口按规格 M 列「D4.3；**急症→**G03/G05」：无出血/休克/新破裂证据时
+        只走 D4.3，不通知 G03。修前无条件 ``escalate G03``，会让每个瘘病人都被
+        标成急症。
+        """
         outcome = d4_1(_d4_state(cl={"fistula": "疑似"}))
+        assert outcome.verdicts["D4.1.R03"] is True
+        assert outcome.next_node == "D4.3"
+        assert outcome.escalation is None
+        assert outcome.next_nodes == ("D4.3", "G03", "G05")
+        assert outcome.link is Link.PARALLEL
+
+    def test_fistula_with_active_bleeding_also_notifies_g03(self) -> None:
+        """规格「如伴活动性出血、休克或新破裂证据，**先**回 G03/G05」。"""
+        outcome = d4_1(_d4_state(cl={"fistula": "主动脉肠瘘"}, s={"gi_bleed": ["黑便"]}))
         assert outcome.verdicts["D4.1.R03"] is True
         assert outcome.next_node == "D4.3"
         assert outcome.escalation == "G03"
@@ -2136,7 +2320,9 @@ class TestD41Triage:
             )
         )
         assert outcome.verdicts["D4.1.R05"] is True
-        assert outcome.terminal is not None and "D5.3" in outcome.terminal
+        assert outcome.next_nodes == ("D4.2", "D5.3")
+        assert outcome.link is Link.PARALLEL
+        assert outcome.next_node == "D4.2"
 
     def test_inflammation_alone_does_not_trigger_the_dual_label(self) -> None:
         outcome = d4_1(
@@ -2669,6 +2855,21 @@ class TestD51Triage:
         assert outcome.verdicts["D5.1.R02"] is True
         assert outcome.next_node == "D5.3"
 
+    def test_the_infection_branch_parallels_only_when_infection_is_suspected(self) -> None:
+        """「感染疑似并行 D4.1」是有条件的，不能无条件分流。
+
+        ``R02`` 本身只判囊状/假性/炎症，不判感染。若把并行写死，每个囊状病变都会
+        多跑一遍感染分诊，报告里凭空多出一条「无感染证据」——把「没查」写成
+        「查过没有」，正是三值语义最忌的那种错。
+        """
+        without = d5_1(_d5_state(cl={"saccular": "明确"}))
+        assert without.next_nodes == ("D5.3",)
+        assert without.link is Link.EITHER
+
+        with_infection = d5_1(_d5_state(cl={"saccular": "明确"}, n={"infection_ctx": "医师明确"}))
+        assert with_infection.next_nodes == ("D5.3", "D4.1")
+        assert with_infection.link is Link.PARALLEL
+
     def test_inflammatory_context_alone_reaches_d53(self) -> None:
         """``G08.R10`` 的入口：没有 PAU/囊状，靠炎症状态进 D5。"""
         outcome = d5_1(_d5_state(n={"inflammatory_ctx": "影像高度提示"}))
@@ -2692,12 +2893,19 @@ class TestD51Triage:
         assert outcome.verdicts["D5.1.R03"] is True
         assert outcome.escalation == "G05"
 
-    def test_branch_involvement_keeps_both_the_escalation_and_d52(self) -> None:
-        """累及肾动脉：既要转复杂路径，也继续判复杂性 —— 两件事都不能丢。"""
+    def test_branch_involvement_goes_to_complex_without_continuing_d52(self) -> None:
+        """累及肾动脉 → 转复杂路径。
+
+        出口按规格 M 列「下一节点/终点：G04、G06 / 动作：G04/G06/专科路径」——
+        **值域里没有 D5.2**。修前的 ``also_next="D5.2"`` 是代码自加的：
+        规格既然把「复杂或转相关主动脉路径」写成唯一动作，就不该同时继续
+        在本病种节点里判复杂性（那会让同一个病人同时得到两套结论）。
+        """
         outcome = d5_1(_d5_state(cl={"pau": "明确"}, n={"renal_r": "明确受累"}))
         assert outcome.verdicts["D5.1.R05"] is True
         assert outcome.escalation == "G06"
-        assert outcome.next_node == "D5.2"
+        assert outcome.next_node is None
+        assert outcome.next_nodes == ("G04", "G06")
 
     def test_branch_involvement_outranks_the_plain_d52_route(self) -> None:
         """``R05`` 声明在 ``R01`` 之前：同优先级靠声明顺序，先声明的先命中。"""
@@ -3363,9 +3571,14 @@ class TestD63StructureAndTargetVessel:
         assert outcome.terminal is not None and "再血管化" in outcome.terminal
 
     def test_target_vessel_occlusion_with_malperfusion_is_a_p0(self) -> None:
+        """规格 M 列：「下一节点/终点：**G03** / 动作：急症→G03」——不是 G05。
+
+        G03 是重跑 21 条急诊筛查，G05 是直接进急诊模式；两者不是同一条路。
+        """
         outcome = d6_3(_d6_state(c={"branch": {"左肾动脉": "闭塞"}, "malperfusion": ["肾"]}))
         assert outcome.verdicts["D6.3.R06"] is True
-        assert outcome.escalation == "G05"
+        assert outcome.escalation == "G03"
+        assert outcome.next_nodes == ("G03",)
 
     def test_para_anastomotic_aneurysm_goes_to_reintervention_review(self) -> None:
         outcome = d6_3(
@@ -3396,7 +3609,7 @@ class TestD63StructureAndTargetVessel:
     def test_acute_limb_ischemia_escalates(self) -> None:
         outcome = d6_3(_d6_state(s={"limb": ["苍白", "运动障碍"]}))
         assert outcome.verdicts["D6.3.R06"] is True
-        assert outcome.escalation == "G05"
+        assert outcome.escalation == "G03"
 
     def test_clean_structure_reaches_follow_up(self) -> None:
         outcome = d6_3(_d6_state())
@@ -4329,6 +4542,178 @@ class TestClosingAdvice:
         )
 
 
+class TestSpecNextNodes:
+    """``RuleSlot.next_nodes`` 必须逐字等于规格 M 列「下一节点/终点」那一段。
+
+    为什么需要这条守门：``next_node`` 是单值，而规格那一列普遍多值。代码只记
+    一个时，丢掉的去处既不报错也不失败 —— 只有拿规格原文对账才发现得了。
+    本轮就是靠它查出 ``D4.3.R01`` 丢了 G03 与 D4.3、``D3.1.R02`` 多了 D3.2、
+    ``D5.1.R05`` 多了 D5.2、``D6.3.R06`` 把 G03 写成 G05。
+
+    规格文件不在本机时跳过（CI 无桌面文件）；本地跑则严格对账。
+    """
+
+    SPEC = SPEC_XLSX
+
+    @staticmethod
+    def _slots() -> tuple[RuleSlot, ...]:
+        out: list[RuleSlot] = []
+        for mod in (
+            d1_asymptomatic,
+            d2_symptomatic,
+            d3_ruptured,
+            d4_infected,
+            d5_special,
+            d6_postop,
+            d7_iliac,
+        ):
+            for name in dir(mod):
+                obj = getattr(mod, name)
+                if name.endswith("_SLOTS") and isinstance(obj, tuple):
+                    out.extend(obj)
+        return tuple(out)
+
+    @classmethod
+    def _spec_values(cls) -> dict[str, tuple[str, str]]:
+        """规则 → (值域元组, 动作原文)。值域按「、」「/」拆。"""
+        if cls.SPEC is None:
+            pytest.skip("规格 Excel 既不在仓库 docs/ 也不在桌面，跳过逐条对账")
+        from openpyxl import load_workbook
+
+        wb = load_workbook(cls.SPEC, read_only=True, data_only=True)
+        out: dict[str, tuple[str, str]] = {}
+        for sheet in wb.sheetnames:
+            if not re.fullmatch(r"D\d\.\d", sheet):
+                continue
+            for row in wb[sheet].iter_rows(min_row=1, values_only=True):
+                rid = str(row[0] or "").strip()
+                if not re.fullmatch(r"D\d\.\d\.R\d+", rid):
+                    continue
+                raw = re.sub(r"\s+", " ", str(row[12] or ""))
+                head, _, action = raw.partition("动作：")
+                nodes = head.replace("下一节点/终点：", "").strip()
+                values = tuple(n.strip() for n in re.split(r"[、/]", nodes) if n.strip())
+                out[rid] = (values, action.strip())
+        return out
+
+    def test_next_nodes_match_the_spec_column(self) -> None:
+        """只对**显式声明了值域**的槽位对账。
+
+        为什么不全查：``terminal`` 型槽位的 ``exit_value`` 是给医生看的终点描述
+        （「监测／风险管理（未达修复阈值）」），``next`` 型里也有一部分如此；
+        规格 M 列那一格写的却是节点 ID 或「终点动作/人工处理」。两者不是同一层
+        语言，机械对账会得到一堆假差异。真正会丢信息的是 ``escalate`` 型 ——
+        它的值域全是节点 ID，代码只记一个就会静默丢去处，本测试专查这一段。
+        """
+        spec = self._spec_values()
+        wrong: list[str] = []
+        for slot in self._slots():
+            if not slot.next_nodes:  # 未声明 = 规格那格只有一个值，由 exit_value 承担
+                continue
+            expected = spec.get(slot.rule_id)
+            if expected is None:
+                wrong.append(f"{slot.rule_id}: 规格里找不到这一行")
+                continue
+            if set(slot.next_nodes) != set(expected[0]):
+                wrong.append(f"{slot.rule_id}: 代码 {slot.next_nodes}，规格 {expected[0]}")
+        assert not wrong, "\n".join(wrong)
+
+    def test_escalate_slots_record_the_full_domain(self) -> None:
+        """``escalate`` 型槽位必须填 ``next_nodes`` —— 不填等于「规格只给了一个值」。"""
+        missing = [
+            s.rule_id for s in self._slots() if s.exit_kind == "escalate" and not s.next_nodes
+        ]
+        assert not missing, f"缺少 next_nodes：{missing}"
+
+    def test_multi_node_domains_are_declared(self) -> None:
+        """规格值域里出现**多于一个**病种节点时，必须声明 ``next_nodes``。
+
+        单值域不强制：``exit_value`` 就是那个值，缺省时 ``next_nodes`` 也回落成它，
+        没有信息可丢。纯终点描述（「终点动作/人工处理」）解析不出节点 ID，豁免。
+
+        为什么要这条：``next_nodes`` 当初只加在 ``escalate`` 型上，``next`` /
+        ``terminal`` 型的多值域**一直没登记**，扫描出来是 14 条（不是拍脑袋的 7 条）。
+        后果是报告里只剩一个去处，读者看不出规格还允许别的分支。
+
+        注意它只查「有没有登记」，不要求把每个分支都走一遍：``EITHER`` 的其余值
+        是**同一规则在不同证据下的替代去处**，本病例没命中就不该走。
+        """
+        spec = self._spec_values()
+        node_id = re.compile(r"^D\d\.\d$")
+        missing: list[str] = []
+        for slot in self._slots():
+            if slot.exit_kind not in ("next", "terminal") or slot.next_nodes:
+                continue
+            expected = spec.get(slot.rule_id)
+            if expected is None:
+                continue
+            nodes = tuple(v for v in expected[0] if node_id.match(v))
+            if len(nodes) > 1:
+                missing.append(f"{slot.rule_id}: 规格值域 {nodes}，代码未声明 next_nodes")
+        assert not missing, "\n".join(missing)
+
+    def test_parallel_slots_are_not_terminal(self) -> None:
+        """``PARALLEL`` 声明的另一条分支必须真能走到。
+
+        ``terminal`` 会让 ``_walk`` 停在本节点，此时写「并行 D4.1」只是在报告里
+        声明了一句系统不会执行的话——``D4.1.R05`` 修前就是这样：报告写着
+        「D4.2 与 D5.3 并行评估」，实际只停在 D4.1。
+
+        ``FOLLOW_UP`` 不受此约束：它的语义本来就是「先做 A，B 是之后的事」，
+        停在 A 的终点、把 B 留给下一轮是正确行为。
+        """
+        bad = [
+            s.rule_id
+            for s in self._slots()
+            if s.link is Link.PARALLEL and s.exit_kind == "terminal"
+        ]
+        assert not bad, f"并行出口却是 terminal：{bad}"
+
+    def test_link_kinds_are_used_consistently(self) -> None:
+        """关系与值域的形状必须自洽（措辞不规整，故只查结构不查文义）。
+
+        · ``EITHER`` 允许单值：规格写「A；急症→B」，命中时条件已落定，只剩一个去处；
+        · ``PARALLEL`` / ``FOLLOW_UP`` 至少要两个值 —— 一个值谈不上「并行」或「后续」。
+        """
+        bad = [
+            f"{s.rule_id}: {s.link.value} 却有 {len(s.next_nodes)} 个值"
+            for s in self._slots()
+            if s.next_nodes and s.link in (Link.PARALLEL, Link.FOLLOW_UP) and len(s.next_nodes) < 2
+        ]
+        assert not bad, "\n".join(bad)
+
+
+class TestSpecRuleRows:
+    """``RULE_ROWS`` 的源行必须等于该 rule_id 在 V3.6.2 工作簿里的**实际行**。
+
+    为什么需要它：``source_row`` 会随 ``GuidelineEntry`` 一起进报告与审计，
+    是「这条结论出自规格第几行」的唯一凭据。规格插行后行号会静默漂移 ——
+    D3.2 / D3.3 就漂了 9 条，而 172 条判据测试照样全绿（它们只断言 rule_id）。
+    """
+
+    SPEC = SPEC_XLSX
+
+    def test_source_rows_match_the_workbook(self) -> None:
+        if self.SPEC is None:
+            pytest.skip("规格 Excel 既不在仓库 docs/ 也不在桌面，跳过逐条对账")
+        from openpyxl import load_workbook
+
+        wb = load_workbook(self.SPEC, read_only=True, data_only=True)
+        actual: dict[str, str] = {}
+        for sheet in SPEC_NODE_SHEETS:
+            for i, row in enumerate(wb[sheet].iter_rows(min_row=1, values_only=True), start=1):
+                rid = str(row[0] or "").strip()
+                if rid in RULE_ROWS:
+                    actual[rid] = f"{sheet}!{i}"
+
+        wrong = [
+            f"{rid}: 代码 {row}，规格 {actual.get(rid) or '规格里没有这一行'}"
+            for rid, row in RULE_ROWS.items()
+            if actual.get(rid) != row
+        ]
+        assert not wrong, "\n".join(wrong)
+
+
 class TestEngineWideContracts:
     """跨节点的结构契约 —— 单条规则都对、组合起来却断链的那类缺陷。"""
 
@@ -4337,24 +4722,42 @@ class TestEngineWideContracts:
 
         ``D4.1.R91``（无感染证据 → 回 G08）是 ``exit_kind="escalate"`` 且无
         ``also_next``：它没有 ``terminal``。修复前报告会退回去取上一个带终点的
-        节点，于是「回 G08」的病例，末尾写的是 D1.1 的「特殊形态/病因：转 D5.3
-        或 D4.1 专项评估」——描述另一条分支，读者会当成结论。
+        节点，于是「回 G08」的病例，末尾写的是上游那条分支的终点——描述另一条
+        分支，读者会当成结论。
         """
         case = make_case(
-            cl={
-                "iliac_site": ["左侧", "CIA"],
-                "iliac_diam": {"左侧CIA": 42.0},
-                "aaa_reported": "否定",
-                "diag_multi": None,
-                "infection": "无证据",
-            },
+            cl={"aaa_reported": "否定", "diag_multi": None, "infection": "无证据"},
             n={"infection_ctx": "高度怀疑"},
         )
-        report = run(ToolRequest(case=case, route_result=route(case), node_inputs={"D7": _D7_PLAN}))
+        report = run(ToolRequest(case=case, route_result=route(case)))
         assert report.path[-1] == "D4.1"
         assert report.terminal is not None
         assert report.terminal.startswith("D4.1：")
-        assert "已回流 G08" in report.terminal
+        assert "下一节点：D4.2、D4.3、G08" in report.terminal
+        # 措辞只陈述规格 M 列写了什么，不声称系统执行了跨层跳转：
+        # ``_walk`` 只在病种节点之间走，G03/G05/G06/G08 都不在其中。
+        assert "已回流" not in report.terminal
+        assert "应回流" not in report.terminal
+
+    def test_the_parallel_branches_both_really_run(self) -> None:
+        """报告写「并行评估」，两个节点就都得真的执行过。
+
+        ``D4.1.R05`` 修前是 ``terminal`` + 一句「D4.2 与 D5.3 并行评估」——
+        文字写了，流程没动。``engine._walk`` 现在按 ``link is PARALLEL`` 展开。
+        """
+        case = make_case(
+            cl={
+                "aaa_reported": "否定",
+                "diag_multi": None,
+                "infection": "未评价",
+                "fistula": "否",
+            },
+            n={"inflammatory_ctx": "影像高度提示", "infection_ctx": "高度怀疑"},
+        )
+        report = run(ToolRequest(case=case, route_result=route(case)))
+        assert "D4.1" in report.path
+        assert "D4.2" in report.path, "并行的一支没执行"
+        assert "D5.3" in report.path, "并行的另一支没执行"
 
     def test_infection_verdicts_are_monotonic_across_nodes(self) -> None:
         """公共判据为真时，D4/D6/D7 三处都不得说「没有感染」。

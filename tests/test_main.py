@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import main as cli
@@ -107,11 +108,17 @@ def test_verbose_strictly_adds_lines(capsys) -> None:
 
 
 def test_gaps_are_grouped_by_domain(tmp_path, capsys) -> None:
+    """空病例的缺口按域分组呈现，标题用中文域名而不是裸域键 ``c``。
+
+    条数不写死：它等于「所有判 UNKNOWN 的规则所声明字段」的去重并集，
+    会随判据与字段声明变化。这里只断言**有缺口**且**按域分组**这两件事，
+    具体条数由 ``test_preop.py::test_empty_case_reports_gaps`` 那类用例守。
+    """
     empty = tmp_path / "empty.json"
     empty.write_text('{"case_id": "EMPTY"}', encoding="utf-8")
     cli.main(["--case", str(empty), "--no-persist"])
     out = capsys.readouterr().out
-    assert "判定资料缺口（路由层 40 项）" in out
+    assert re.search(r"判定资料缺口（路由层 \d+ 项）", out)
     assert "CTA 报告（" in out  # 域中文名出现在分组标题里，而非裸域键 c
 
 

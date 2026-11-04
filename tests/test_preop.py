@@ -1,4 +1,4 @@
-"""术前路由端到端基线 —— V3.1(2) 的**每条出口与每个优先级桶**都走到一次。
+"""术前路由端到端基线 —— V3.6.2 的**每条出口与每个优先级桶**都走到一次。
 
 本文件关心「**走得对不对**」：给定一份病例，``route()`` 是否把它送到正确的节点、
 命中的是不是该命中的那条规则、病种标签对不对。规则内部的判据细节由
@@ -250,7 +250,7 @@ class TestComplex:
         assert (result.mode, result.rule_id) == (RouteMode.COMPLEX, "G04.R07")
 
     def test_ifu_mismatch(self) -> None:
-        result = _route(n={"seal_ifu": "不符"})
+        result = _route(n={"seal_ifu": "不符合"})
         assert (result.mode, result.rule_id) == (RouteMode.COMPLEX, "G04.R08")
 
     def test_iliac_limitation(self) -> None:

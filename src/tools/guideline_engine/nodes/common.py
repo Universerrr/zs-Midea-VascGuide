@@ -26,8 +26,18 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ....models.preop.case import UNCERTAIN_TOKENS
-from ....rules.router import SAC_GROWTH_MM, SBP_SHOCK, Verdict, eq, has, or_, token
-from ..state import GuidelineEntry, GuidelineState, NodeOutcome
+from ....rules.router import (
+    FISTULA_LABELS,
+    INFECTION_LABELS,
+    SAC_GROWTH_MM,
+    SBP_SHOCK,
+    Verdict,
+    eq,
+    has,
+    or_,
+    token,
+)
+from ..state import GuidelineEntry, GuidelineState, Link, NodeOutcome
 
 __all__ = [
     "ILIAC_REPAIR_MM",
@@ -37,6 +47,7 @@ __all__ = [
     "THRESHOLD_MALE_MM",
     "DisplayRule",
     "ExitKind",
+    "Link",
     "Priority",
     "RuleSlot",
     "aaa_diameter",
@@ -49,13 +60,15 @@ __all__ = [
     "cta_evaluable",
     "display_entries",
     "evaluate_node",
+    "fistula_present",
     "gap_if_missing",
     "infection_typed",
-    "is_uncertain",
+    "is_spec_uncertain",
     "malperfusion",
     "missing_fields",
     "multi_field",
     "recorded",
+    "rupture_evidence",
     "sac_growing",
     "sbp_below_shock",
     "sex_threshold",
@@ -110,9 +123,55 @@ class RuleSlot:
     judge: Callable[[GuidelineState], bool | None]
     exit_kind: ExitKind
     exit_value: str
+    next_nodes: tuple[str, ...] = ()
+    """规格 M 列「下一节点/终点」的**完整值域**（含 ``exit_value``）。
+
+    留空表示该列只有 ``exit_value`` 一个值。填了就必须与 M 列逐字一致 ——
+    ``tests/test_guideline_engine.py::TestSpecNextNodes`` 拿它和规格原文对账。
+    """
+    link: Link = Link.EITHER
+    """``next_nodes`` 之间的关系，按规格**动作列**的措辞定档（见 :class:`Link`）。"""
     also_next: str | None = None
-    """``escalate`` 时附带的下一个病种节点（规格「→G05 并进入 D3.2」）。"""
+    """``escalate`` 时附带继续走的病种节点（规格「→G05 并进入 D3.2」）。"""
+    also_escalate: str | None = None
+    """``next`` 型规则在 ``escalate_if`` 成立时**并行**通知的上游节点。
+
+    规格 ``D4.1.R03``：「明确/疑似主动脉相关瘘→D4.3；**如伴**活动性出血、休克
+    或新破裂证据，先回 G03/G05」。主出口恒为 D4.3，急症是**附加义务**而不是
+    替代出口 —— 用 ``exit_kind="escalate"`` 表达会把「无急症的瘘」也标成急症。
+    """
+    escalate_if: Callable[[GuidelineState], bool | None] | None = None
+    """``also_escalate`` 的触发条件；``None`` 表示只要命中这条规则就并行通知。"""
     gaps: tuple[str, ...] = ()
+
+
+def _continuing_node(slot: RuleSlot) -> str | None:
+    """本次**继续往下走**的病种节点。
+
+    ``escalate`` 型：看 ``also_next``（规格「G05 并进入 D3.2」里的 D3.2）；
+    ``next`` 型：就是 ``exit_value``；
+    ``terminal`` 型：不走，返回 ``None``。
+    """
+    return slot.also_next or (slot.exit_value if slot.exit_kind == "next" else None)
+
+
+def _escalation_of(slot: RuleSlot, state: GuidelineState) -> str | None:
+    """本次需要通知的上游节点（急诊/重筛查/重分类）。
+
+    两种来源，语义不同：
+
+    · ``exit_kind="escalate"``：这条规则的**主出口**就是上游节点；
+    · ``also_escalate``：主出口是病种节点，``escalate_if`` 成立时才**并行**通知。
+      规格 ``D4.1.R03`` 的「瘘→D4.3；**如伴**活动性出血…先回 G03/G05」属于这种——
+      没有急症的瘘不该被标成急症。
+    """
+    if slot.exit_kind == "escalate":
+        return slot.exit_value
+    if slot.also_escalate is None:
+        return None
+    if slot.escalate_if is None:
+        return slot.also_escalate
+    return slot.also_escalate if slot.escalate_if(state) is True else None
 
 
 def evaluate_node(
@@ -147,7 +206,7 @@ def evaluate_node(
                 source_row=slot.source_row,
                 statement=slot.statement,
                 verdict=verdict,
-                next_node=slot.also_next or (slot.exit_value if slot.exit_kind == "next" else None),
+                next_node=_continuing_node(slot),
                 priority=slot.priority,
             )
         )
@@ -156,9 +215,11 @@ def evaluate_node(
                 node_id=node_id,
                 verdicts=verdicts,
                 entries=tuple(entries),
-                next_node=slot.also_next or (slot.exit_value if slot.exit_kind == "next" else None),
-                escalation=slot.exit_value if slot.exit_kind == "escalate" else None,
+                next_node=_continuing_node(slot),
+                escalation=_escalation_of(slot, state),
                 terminal=slot.exit_value if slot.exit_kind == "terminal" else None,
+                next_nodes=slot.next_nodes or (slot.exit_value,),
+                link=slot.link,
                 gaps=slot.gaps,
             )
 
@@ -178,16 +239,15 @@ def gap_if_missing(label: str, value: object) -> str | None:
 
     只用于**生成待补清单**，不参与判定——判定一律走 ``eq`` / ``has`` 等三值原语。
     分开的理由：缺口要给人看（要写清字段名和实际取值），判定要给机器算。
+    「算不算不确定」本身只走 :func:`is_spec_uncertain`，不在本函数里再判一次。
     """
     if value is None:
         return f"{label}：未记录"
     raw = getattr(value, "value", value)
-    if isinstance(raw, str) and raw in SPEC_UNCERTAIN_TOKENS:
-        return f"{label}：{raw}"
-    return None
+    return f"{label}：{raw}" if is_spec_uncertain(raw) else None
 
 
-def is_uncertain(value: object) -> bool:
+def is_spec_uncertain(value: object) -> bool:
     """取值本身不确定（「未核验」「未评估」「尚未讨论」等）。
 
     与 :func:`gap_if_missing` 的分工：本函数回答「这个值算不算不确定」，
@@ -195,24 +255,31 @@ def is_uncertain(value: object) -> bool:
 
     词表取 :data:`SPEC_UNCERTAIN_TOKENS`（**不是**模型层的 ``UNCERTAIN_TOKENS``）：
     本函数只服务于病种域字段，那里的「未评估」「尚未讨论」「未询问」同样是
-    「还没有结论」，但不在模型层词表里。
+    「还没有结论」，但不在模型层词表里。两者**不同名**是刻意的——同名同参却
+    答案不同（``「未评估」`` 在这里为真、在模型层为假），是最难查的那类错。
     """
     raw = getattr(value, "value", value)
     return isinstance(raw, str) and raw in SPEC_UNCERTAIN_TOKENS
 
 
 #: ``CL.INFECTION`` 里表示「有感染」的四个取值（明确 + 疑似，原生 + 移植物）。
-INFECTION_SUBTYPES: tuple[str, ...] = (
-    "原生感染明确",
-    "原生感染疑似",
-    "移植物感染明确",
-    "移植物感染疑似",
-)
+#: **直接复用判定层的同一份表** —— 两处各写一份，改规格时必有一处漏改。
+INFECTION_SUBTYPES: tuple[str, ...] = INFECTION_LABELS
 
 #: ``N.INFECTION_CTX`` 里表示「医生认为有感染」的两个取值。
 #: 「仅非特异征象」不在此列：规格 ``D4.NATIVE_CLINICAL`` 明写「发热或疼痛单项
 #: 不能确诊感染」，把它算成感染会让每个发热病例都进感染路径。
 INFECTION_DOCTOR_TOKENS: tuple[str, ...] = ("医师明确", "高度怀疑")
+
+
+def fistula_present(state: GuidelineState) -> Verdict:
+    """主动脉相关瘘（含「疑似」）—— **全引擎唯一判据**，D4 与 D6 共用。
+
+    取值表直接复用判定层的 :data:`~src.rules.router.FISTULA_LABELS`：D4 与 D6
+    原先各写一份四值元组，改规格时漏改一处，同一份报告就会一边说「有瘘」、
+    另一边说「没有」。
+    """
+    return eq(token(state.case.cl.fistula), *FISTULA_LABELS)
 
 
 def infection_typed(state: GuidelineState) -> Verdict:
@@ -341,7 +408,7 @@ def access_blocked(state: GuidelineState) -> Verdict:
         return True
     if occlusion is None or tortuosity is None:
         return None
-    if is_uncertain(occlusion) or is_uncertain(tortuosity):
+    if is_spec_uncertain(occlusion) or is_spec_uncertain(tortuosity):
         return None
     return False
 
@@ -398,7 +465,7 @@ def threshold_usable(state: GuidelineState) -> Verdict:
     「还没查」。临床上前者要改走专科确认，后者只要补一个字段——处理方式不同。
     """
     source = state.node_field("D1.SEX_THRESHOLD_SOURCE")
-    if source is not None and not is_uncertain(source):
+    if source is not None and not is_spec_uncertain(source):
         if source == "超声测量匹配":
             return True
         if source == "CTA需转换或专科确认":
@@ -406,7 +473,7 @@ def threshold_usable(state: GuidelineState) -> Verdict:
         return None
 
     method = token(state.node_field("D1.DIAM_METHOD"))
-    if method is None or is_uncertain(method):
+    if method is None or is_spec_uncertain(method):
         return None
     # 规格的阈值基准是超声 AP 内-内/外-外；其余方法一律按「需专科确认」处理。
     return "超声" in str(method)
@@ -462,6 +529,30 @@ def sbp_below_shock(state: GuidelineState) -> Verdict:
 def unstable(state: GuidelineState) -> Verdict:
     """血流动力学不稳定 —— 与 ``G03`` 同一定义（低血压或新发意识下降）。"""
     return or_(sbp_below_shock(state), eq(token(state.case.v.conscious_change), "新发下降"))
+
+
+def rupture_evidence(state: GuidelineState) -> Verdict:
+    """破裂/疑似破裂的可靠当前证据，或重大循环危险。
+
+    三处规格问的是同一件事，措辞不同：
+        ``D4.1.R03``「如伴活动性出血、休克或**新破裂证据**」
+        ``D6.1.R01``「**新出现急症危险**」
+        ``D7.1.R01``「**破裂/疑似破裂或重大循环危险**」
+
+    合成一个函数是因为它们读的字段完全一致（``CL.AAA_RUPTURE`` /
+    ``C.EXTRAV`` / ``C.HEMATOMA`` / ``V.SBP`` / ``V.CONSCIOUS_CHANGE``）。
+    各病种各写一份的话，改一处字段口径就会在另一个病种里留下旧的判断。
+
+    只认「明确」级影像征象：``C.EXTRAV`` / ``C.HEMATOMA`` 的可疑值走 UNKNOWN，
+    由调用方按自己的缺失策略处理（``D4.1`` 有出血时仍会转急症，
+    ``D7.1`` 则交给 ``R90`` 报缺口）。
+    """
+    return or_(
+        eq(token(state.case.cl.aaa_rupture), "明确", "疑似"),
+        eq(token(state.case.c.extrav), "明确"),
+        eq(token(state.case.c.hematoma), "明确"),
+        unstable(state),
+    )
 
 
 def malperfusion(state: GuidelineState) -> Verdict:

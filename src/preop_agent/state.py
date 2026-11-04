@@ -60,9 +60,10 @@ class PreopState(TypedDict, total=False):
         · ``audit_trail`` 使用 ``operator.add`` reducer —— 每个节点**追加**自己的
           审计记录，LangGraph 负责合并；节点无需读取既有轨迹，天然避免读写竞争。
         · ``tool_outputs`` 以工具名为键，缺项即代表该工具未执行（见 execution_layer）。
-        · ``tool_skips`` 是 ``tool_outputs`` 的**原因面**：只记 ``BEST_EFFORT``
-          工具的失败（急诊「不等待非必要分析」）。缺项 + 无 skip = 该工具不在
-          本模式计划内。三者语义互不重叠，故不合并成一个 dict。
+        · ``tool_skips`` 是 ``tool_outputs`` 的**原因面**：记 ``BEST_EFFORT``
+          工具的失败（急诊「不等待非必要分析」）**以及计划内尚未实现**的工具
+          （值以「未实现：」开头）。缺项 + 无 skip = 该工具不在本模式计划内。
+          三者语义互不重叠，故不合并成一个 dict。
         · ``input_snapshot_hash`` 由 input_layer 在**路由回填之前**计算 —— 那时
           ``case`` 还是纯粹的输入事实，哈希才有「输入快照」的意义（回填后 case 会被
           写入派生字段，再哈希就不是输入了）。
@@ -74,7 +75,7 @@ class PreopState(TypedDict, total=False):
 
     为什么单开一个通道而不是塞进 ``VascCase``：
 
-        ``VascCase`` 是**路由专用**（161 字段，进哈希）。而 ``D1.DIAM_METHOD``
+        ``VascCase`` 是**路由专用**（162 字段，进哈希）。而 ``D1.DIAM_METHOD``
         这类字段是**专科评估时医生填**的病种细节——它们既不影响路由判定，也不
         需要随路由结论一起进哈希。塞进去会让每一次路由哈希都随病种字段抖动，
         还会破坏「``VascCase`` 只装路由需要的字段」这条定位。

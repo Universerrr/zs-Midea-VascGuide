@@ -26,9 +26,9 @@
     ``tool_findings``  = **测量产物**（影像/评分/检索各算出了什么）。
     两者不互相复制 —— 同一条内容出现在两处，日后改一处就会不一致。
 
-## 两个留白（等外部输入，非本层能自行决定）
+## 一处已落地、一处留白
 
-**留白一（已部分落地）：主建议改为机械装配。**
+**已落地：主建议改为机械装配。**
     ``primary_recommendation`` 不再是占位符，而是把既有结论排成一句话
     （见 :func:`_build_primary_recommendation`）：:
 
@@ -37,8 +37,11 @@
     **它仍不含任何临床主张**：只重排 ``route_result`` 与 ``tool_outputs`` 里
     已有的内容，本层不引入任何「如果 A 则建议 B」的分支。
 
-    ``treatment_options`` 仍为空——方案清单的粒度是「具体术式（入路/器械/型号）」，
-    工具A 目前只给到「EVAR 候选 / 评估 OSR」这一层，留空是如实反映粒度而非遗漏。
+    ``treatment_options`` 取工具A 的 ``candidates``，每项是「术式：状态（原因）」，
+    如 ``EVAR：条件性候选（IFU 未核验）``。**不到**「EVAR，经右股动脉，用 XX 型号」
+    这一层——规格有 5 处明文禁止工具A 走到器械型号（``D1.3.R03/R06/R90``、
+    ``D7.3.R01/R04``），那属于手术规划，不在本系统范围。粒度由 ``D1.3.R91`` 定义：
+    「分别列出 EVAR/OSR 的可行候选、条件性候选和排除原因」。
 
 **留白二：LLM 输出转译。**
     ``translated_text`` 保持 ``None``（见 :data:`TRANSLATION_BLOCKED_REASON`）。
@@ -260,7 +263,7 @@ def _to_decision_steps(trace: Sequence[RuleTrace]) -> list[DecisionStep]:
     condition      ``RULES[rule_id].name``（规则名）
     result         ``verdict``（True / False / None 三值）
     rule_ref       ``rule_id``
-    note           ``RULES[rule_id].source``（V3.1(2) 源单元格）
+    note           ``RULES[rule_id].source``（V3.6.2 源单元格）
     ============  =====================================
     """
     steps: list[DecisionStep] = []
@@ -352,10 +355,19 @@ def _build_evidence(case: VascCase, result: RouteResult) -> list[EvidenceItem]:
     return items
 
 
-def _build_primary_recommendation(result: RouteResult, tool_outputs: Mapping[str, Any]) -> str:
+def _build_primary_recommendation(
+    result: RouteResult,
+    tool_outputs: Mapping[str, Any],
+    tool_skips: Mapping[str, str] | None = None,
+) -> str:
     """把已判出的结论排成**一句话** —— 只重排，不新增判断。
 
-    构成：``<模式> · <病种>：<工具A 终点>；待补 N 项关键资料``
+    构成：``<模式> · <病种>：<工具A 终点>；待补 N 项关键资料、M 项工具缺口``
+
+    为什么要分两类计数：它们补法不同 —— 资料缺口靠补检查/补记录，工具缺口靠
+    开发（当前 B/C/D/E 四个工具尚未实现）。合成一个数字会让「3 项」看起来
+    很快能补齐，而其中 4 项其实补不出来。数字必须与五段式 ``pending`` 的
+    构成对得上，否则读报告的人会以为下面列漏了。
 
     三段的来源都是既有结构：``route_result.mode`` / ``class_output`` /
     ``tool_outputs['guideline_engine'].terminal``。本函数**不含任何**
@@ -389,10 +401,23 @@ def _build_primary_recommendation(result: RouteResult, tool_outputs: Mapping[str
     terminal = getattr(report, "terminal", None)
     gaps = getattr(report, "gaps", ()) or ()
 
+    parts: list[str] = []
+    if gaps:
+        parts.append(f"{len(gaps)} 项关键资料")
+    if tool_skips:
+        parts.append(f"{len(tool_skips)} 项工具缺口")
+    tail = f"；待补 {'、'.join(parts)}" if parts else ""
+
     if not terminal:
-        return f"{head} · {diseases}：病种流程未给出结论"
-    tail = f"{terminal}；待补 {len(gaps)} 项关键资料" if gaps else str(terminal)
-    return f"{head} · {diseases}：{tail}"
+        # 急诊 + 零标签：系统只完成了分流，病种级建议根本不存在。
+        # 不能与「病种流程跑过但没给终点」共用一句话 —— 前者需要人接手，
+        # 后者是流程内部的问题。缺口计数照挂：这一句本身没有结论，
+        # 「待补 5 项」正是读者最需要知道的部分。
+        if result.mode is RouteMode.EMERGENCY and not result.class_output:
+            return f"{head} · 病种未分类：仅完成分流，无病种级建议，需人工判断{tail}"
+        return f"{head} · {diseases}：病种流程未给出结论{tail}"
+
+    return f"{head} · {diseases}：{terminal}{tail}"
 
 
 def _build_treatment_options(tool_outputs: Mapping[str, Any]) -> list[str]:
@@ -496,12 +521,37 @@ def _build_handoff(node_inputs: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _merge_pending(gaps: Sequence[str], tool_skips: Mapping[str, str]) -> list[str]:
+    """把「字段缺口」与「工具没产出」合成一份待补清单。
+
+    两类原因措辞分开，因为补法不同：
+
+    · 未实现 → 「工具尚未实现」：补资料也补不出来，属于能力缺口；
+    · 本次失败 → 原样带异常信息：补齐上游或修好数据后可能就拿到了。
+
+    为什么要并进来：五段式这一段回答的是「还差什么才能动手」。急诊里
+    「CTA 没量化」与「某个字段没填」对决策的影响是同一件事——术式方向都
+    建立在更少的信息上。分开写在两个地方，读报告的人只会看到一半。
+    """
+    pending = list(gaps)
+    for key in sorted(tool_skips):
+        spec = SPEC_BY_KEY.get(key)
+        label = spec.label if spec is not None else key
+        reason = tool_skips[key]
+        note = "工具尚未实现" if reason.startswith("未实现") else reason
+        line = f"{label}：本次未获取（{note}）"
+        if line not in pending:
+            pending.append(line)
+    return pending
+
+
 def build_emergency_brief(
     result: RouteResult,
     tool_outputs: Mapping[str, Any],
     evidence: Sequence[EvidenceItem],
     node_inputs: Mapping[str, Any],
     case: VascCase,
+    tool_skips: Mapping[str, str] | None = None,
 ) -> EmergencyBrief | None:
     """急诊五段式出口 —— 只在急诊模式下生成，其余模式返回 ``None``。
 
@@ -528,7 +578,19 @@ def build_emergency_brief(
         danger=_build_danger(result, report),
         known_facts=facts[:_MAX_BRIEF_FACTS],
         # 缺口不截断：它就是「还差什么才能动手」的清单，少一条都是漏。
-        pending=list(getattr(report, "gaps", ()) or ()),
+        # 这里同时并入「工具没产出」的原因 —— 对急诊来说，「CTA 没量化」与
+        # 「某个字段没填」是同一件事的两面：都意味着方案建立在更少的信息上。
+        pending=_merge_pending(
+            [
+                # 路由层的「未匹配病种流程」不在 ``report.gaps`` 里（那是工具A
+                # 自己的缺口清单），但它是急诊五段式最该被看到的一条：结论只到
+                # 分流层，病种级建议根本不存在。不并进来，R09/R10/R20 的待补段
+                # 就只剩工具缺口，读起来像「只差几个工具」。
+                *(g for g in result.evidence_gaps if "未匹配 D1–D7" in g),
+                *(getattr(report, "gaps", ()) or ()),
+            ],
+            tool_skips or {},
+        ),
         # 有候选就列候选；一个候选都没有时退到终点一句话，避免空段。
         rapid_assessment=candidates or ([str(terminal)] if terminal else []),
         handoff=_build_handoff(node_inputs),
@@ -556,13 +618,22 @@ def output_node(state: PreopState) -> dict[str, Any]:
         route_mode=result.mode,
         # 呈现：把既有结论排成一句话（不新增判断，见 _build_primary_recommendation）。
         primary_recommendation=_build_primary_recommendation(
-            result, state.get("tool_outputs") or {}
+            result,
+            state.get("tool_outputs") or {},
+            state.get("tool_skips") or {},
         ),
         # 治疗方案清单 = 工具A 的术式候选（EVAR/OSR 两列 × 候选状态）。
         # 不是「具体术式」：规格禁止工具A 走到器械型号，见 _build_treatment_options。
         treatment_options=_build_treatment_options(state.get("tool_outputs") or {}),
         confidence_level=result.confidence_level,
-        manual_review_required=result.kind is RouteKind.REVIEW,
+        # 两种情形必须人工接手：
+        #   · 出口本身就是 REVIEW（判定依据不足）；
+        #   · 急诊模式但零病种标签 —— 病种流程一个节点都没启动（R09/R10/R20
+        #     这三条确实无 D1–D7 可归），系统只完成了分流，没有给出任何术式结论。
+        manual_review_required=(
+            result.kind is RouteKind.REVIEW
+            or (result.mode is RouteMode.EMERGENCY and not result.class_output)
+        ),
         evidence_chain=evidence,
         decision_path=_to_decision_steps(result.trace),
         # 工具产物 → 呈现条目；未跑的工具不出现在这里（不编造「跑了但没结果」）。
@@ -577,6 +648,7 @@ def output_node(state: PreopState) -> dict[str, Any]:
             evidence,
             state.get("node_inputs") or {},
             case,
+            state.get("tool_skips") or {},
         ),
         # 留白二：等主建议措辞经临床确认后再接 LLM 转译。
         translated_text=None,

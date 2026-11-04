@@ -66,7 +66,7 @@ class DecisionStep(BaseModel):
         ),
     )
     rule_ref: str | None = Field(default=None, description="依据规则编号（如 G03.R04）。")
-    note: str | None = Field(default=None, description="规则来源（V3.1(2) 单元格，如 G03!12）。")
+    note: str | None = Field(default=None, description="规则来源（V3.6.2 单元格，如 G03!12）。")
 
 
 class ToolFinding(BaseModel):

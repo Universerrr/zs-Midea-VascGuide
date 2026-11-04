@@ -90,7 +90,7 @@ from ....rules.router import (
     or_,
     token,
 )
-from ..state import GuidelineState, NodeFn, NodeOutcome
+from ..state import GuidelineState, Link, NodeFn, NodeOutcome
 from .common import (
     DisplayRule,
     RuleSlot,
@@ -98,8 +98,9 @@ from .common import (
     acute_limb_ischemia,
     display_entries,
     evaluate_node,
+    fistula_present,
     infection_typed,
-    is_uncertain,
+    is_spec_uncertain,
     malperfusion,
     missing_fields,
     sac_growing,
@@ -121,9 +122,6 @@ _POST_REASON_LEAK: tuple[str, ...] = ("内漏", "瘤囊变化")
 
 #: ``CL.POST_REASON`` 里属于「结构/靶血管」的就诊原因（模型是单值）。
 _POST_REASON_STRUCTURE: tuple[str, ...] = ("再狭窄或闭塞", "假性动脉瘤")
-
-#: ``CL.FISTULA`` 里表示「瘘存在（含疑似）」的取值。
-_FISTULA_PRESENT: tuple[str, ...] = ("主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似")
 
 #: 从自由文本里抠出第一个数字（``D6.SEAL_LENGTH`` / ``D6.MIGRATION`` 允许带部位描述）。
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
@@ -172,7 +170,7 @@ def _endoleak_clear(state: GuidelineState) -> Verdict:
 def _endoleak_unresolved(state: GuidelineState) -> bool:
     """内漏状态是否判不了（缺失 / 未知 / 证据冲突）。"""
     raw = _endoleak(state)
-    return raw is None or is_uncertain(raw)
+    return raw is None or is_spec_uncertain(raw)
 
 
 def _sac_changed(state: GuidelineState) -> Verdict:
@@ -198,7 +196,7 @@ def _graft_failure(state: GuidelineState) -> Verdict:
 
 def _graft_unresolved(state: GuidelineState) -> bool:
     raw = token(state.case.n.graft_major)
-    return raw is None or is_uncertain(raw)
+    return raw is None or is_spec_uncertain(raw)
 
 
 def _branch_occlusion(state: GuidelineState) -> Verdict:
@@ -211,14 +209,13 @@ def _branch_occlusion(state: GuidelineState) -> Verdict:
     ]
     if any(flags):
         return True
-    if any(isinstance(v, str) and is_uncertain(v) for v in branch.values()):
+    if any(isinstance(v, str) and is_spec_uncertain(v) for v in branch.values()):
         return None
     return False
 
 
-def _fistula_present(state: GuidelineState) -> Verdict:
-    """主动脉相关瘘（含疑似）。"""
-    return eq(token(state.case.cl.fistula), *_FISTULA_PRESENT)
+# 瘘的判据与 D4 共用 ``common.fistula_present``（同一事实只许一个判据函数）。
+_fistula_present = fistula_present
 
 
 def _infection_suspected(state: GuidelineState) -> Verdict:
@@ -259,7 +256,7 @@ def _migration_significant(state: GuidelineState) -> Verdict:
         return False
     if ">10" in text or "伴症状" in text:
         return True
-    if is_uncertain(text):
+    if is_spec_uncertain(text):
         return None
     return None
 
@@ -416,6 +413,8 @@ _D61_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d61_r01,
         exit_kind="escalate",
         exit_value="G05",
+        next_nodes=("G03", "G05"),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D6.1.R03",
@@ -425,6 +424,7 @@ _D61_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d61_r03,
         exit_kind="next",
         exit_value="D6.3",
+        next_nodes=("D4.3", "D6.3"),
     ),
     RuleSlot(
         rule_id="D6.1.R02",
@@ -452,6 +452,7 @@ _D61_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d61_r91,
         exit_kind="terminal",
         exit_value="常规随访（随访间隔见下方计划；任何新发症状/内漏征象即升级）",
+        next_nodes=("D6.2", "D6.3", "G03"),
     ),
 )
 
@@ -736,6 +737,7 @@ _D62_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d62_r04,
         exit_kind="terminal",
         exit_value="人工复核（内漏分型或增长原因未明，先补充多模态影像/MDT）",
+        next_nodes=("D6.2", "D6.3"),
     ),
     RuleSlot(
         rule_id="D6.2.R90",
@@ -895,6 +897,9 @@ _D63_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d63_r08,
         exit_kind="escalate",
         exit_value="G05",
+        # 规格 M 列：「下一节点/终点：D4.3、G03、G05 / 动作：D4.3；急症→G03/G05」
+        next_nodes=("D4.3", "G03", "G05"),
+        link=Link.PARALLEL,
         also_next="D4.3",
     ),
     RuleSlot(
@@ -903,8 +908,13 @@ _D63_SLOTS: tuple[RuleSlot, ...] = (
         source_row="D6.3!17",
         statement="急性肢体缺血或肾/肠系膜灌注障碍 → 回 G03/G05；无急症但明确闭塞 → 及时评估再血管化",
         judge=_d63_r06,
+        # 规格 M 列：「下一节点/终点：**G03** / 动作：急症→G03；否则血管团队评估」。
+        # 修前写的是 G05 —— 值不在这一格里。G03 是重新筛查（21 条急诊规则重跑），
+        # G05 是直接进急诊模式，两者不是同一条路。
         exit_kind="escalate",
-        exit_value="G05",
+        exit_value="G03",
+        next_nodes=("G03",),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D6.3.R01",
@@ -932,6 +942,7 @@ _D63_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d63_r03,
         exit_kind="terminal",
         exit_value="吻合口旁动脉瘤再干预评估（已排除感染/瘘的前提下，腔内与开放方案由血管团队比较）",
+        next_nodes=("D4.3", "D6.3"),
     ),
     RuleSlot(
         rule_id="D6.3.R04",
@@ -941,6 +952,7 @@ _D63_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d63_r04,
         exit_kind="terminal",
         exit_value="结构故障再干预评估（先由医生确认影像，方案由血管团队确定）",
+        next_nodes=("D6.2", "D6.3", "G03", "G05"),
     ),
     RuleSlot(
         rule_id="D6.3.R90",

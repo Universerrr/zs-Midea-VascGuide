@@ -6,7 +6,7 @@
     uv run python main.py --case cases/example.json -v       # 展开全部规则与缺口
     uv run python main.py --case cases/example.json -vv      # 再加完整决策链
     uv run python main.py --case cases/example.json --json   # 机器可读
-    uv run python main.py --dump-template > cases/my.json    # 生成 160 字段空模板
+    uv run python main.py --dump-template > cases/my.json    # 生成 162 字段空模板
 
 本文件的定位是**呈现**，不是判定：不含任何临床阈值或分支逻辑。
 任何「如果 A 则 B」一旦出现在这里，就等于绕过 ``src/rules`` 另立一处规则。
@@ -16,7 +16,7 @@
     1. **不生成自然语言诊疗建议** —— ``primary_recommendation`` 只把既有结论
        排成一句话（模式 · 病种 · 工具A 终点 · 待补数），不含任何治疗主张；
     2. **不调用 LLM** —— 抽取器（病历 → VascCase）与转译器均未实现；
-    3. **不实现任何工具** —— 五个工具全部 blocked，``tool_findings`` 恒为空；
+    3. **不实现 B–E 四个工具** —— 它们仍 blocked；``tool_findings`` 只含工具A（指南引擎）的产物；
     4. **不做交互界面** —— 渲染器与可视化界面已推迟到术前 Agent 完成之后。
 
 因此当前跑通的含义是：**能正确判定「走哪个出口、为什么、缺什么资料」**，
@@ -398,7 +398,7 @@ def _render_conclusion(state: PreopRunResult, verbose: int) -> str:
 # ⑤ 模板导出
 # ---------------------------------------------------------------------------
 def _dump_template() -> str:
-    """空病例模板：160 个字段全部列出（值为 null），照着删/填。"""
+    """空病例模板：162 个字段全部列出（值为 null），照着删/填。"""
     return VascCase(case_id="TEMPLATE").model_dump_json(indent=2)
 
 

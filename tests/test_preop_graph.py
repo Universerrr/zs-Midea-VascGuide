@@ -408,11 +408,16 @@ class TestExecutionLayer:
             run_tool("imaging_quantifier", {"case": make_case()})  # type: ignore[arg-type]
 
     def test_node_runs_only_implemented_tools(self) -> None:
-        """指南模式计划 A+B：A 已实现则产出，B 未实现则静默缺席（不是空结论）。"""
+        """指南模式计划 A+B：A 已实现则产出，B 未实现则**留痕**。
+
+        修前 B 是静默缺席（``tool_skips == {}``），下游看到的是「该跑的都跑完了」。
+        后果很具体：急诊五段式的「待补关键资料」永远缺「CTA 未量化」。
+        """
         state = {"case": make_case(), "route_result": route(make_case())}  # type: ignore[arg-type]
         update = execution_node(state)  # type: ignore[arg-type]
         assert set(update["tool_outputs"]) == {"guideline_engine"}
-        assert update["tool_skips"] == {}
+        assert set(update["tool_skips"]) == {"imaging_quantifier"}
+        assert update["tool_skips"]["imaging_quantifier"].startswith("未实现：")
 
     def test_non_mode_result_runs_no_tool(self) -> None:
         """人工复核 / 资料核实不跑任何工具：判定依据不足时算出来的东西不可信。"""
@@ -1169,6 +1174,41 @@ class TestEmergencyDiseaseEntry:
         brief = state["final_recommendation"].emergency_brief
         assert brief is not None
         assert brief.danger
+
+    def test_emergency_without_disease_label_is_not_high_confidence(self) -> None:
+        """急诊 + 零病种标签：置信度必须降「低」并强制复核。
+
+        分流的结论是确定的（低血压就是低血压），但「病种级建议」根本不存在。
+        修前这种半截结论报「高置信度、无需复核」，读报告的人会以为系统看明白了。
+        """
+        state = self._run(make_case(case_id="GRAPH-R20-CONF", v={"sbp": 70.0, "hr": 118.0}))
+        route_result = state["route_result"]
+        assert route_result.class_output == []
+        assert route_result.confidence_level == "低"
+        assert any("未匹配 D1–D7" in gap for gap in route_result.evidence_gaps)
+
+        rec = state["final_recommendation"]
+        assert rec.manual_review_required is True
+        assert "需人工判断" in rec.primary_recommendation
+        assert rec.emergency_brief is not None
+        assert any("未匹配 D1–D7" in line for line in rec.emergency_brief.pending)
+
+    def test_emergency_brief_lists_unimplemented_tools_as_pending(self) -> None:
+        """未实现的工具必须进「待补关键资料」—— 修前它们被静默剔除。
+
+        后果很具体：急诊五段式的待补段永远缺「CTA 未量化」，而它恰恰是最该
+        被看到的那条。``tool_skips`` 与 ``pending`` 两处都要有。
+        """
+        state = self._run(make_case(case_id="GRAPH-R20-SKIP", v={"sbp": 70.0, "hr": 118.0}))
+        skips = state["tool_skips"]
+        assert "imaging_quantifier" in skips
+        assert skips["imaging_quantifier"].startswith("未实现：")
+
+        brief = state["final_recommendation"].emergency_brief
+        assert brief is not None
+        assert any("影像量化" in line and "本次未获取" in line for line in brief.pending)
+        # 主建议的两类缺口计数要与 pending 构成对得上
+        assert "项工具缺口" in state["final_recommendation"].primary_recommendation
 
 
 class TestGraphEndToEnd:

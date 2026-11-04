@@ -67,7 +67,7 @@ from ....rules.router import (
     or_,
     token,
 )
-from ..state import Candidate, CandidateStatus, GuidelineState, NodeFn, NodeOutcome
+from ..state import Candidate, CandidateStatus, GuidelineState, Link, NodeFn, NodeOutcome
 from .common import (
     SPEC_UNCERTAIN_TOKENS,
     DisplayRule,
@@ -75,9 +75,11 @@ from .common import (
     active_gi_bleed,
     display_entries,
     evaluate_node,
+    fistula_present,
     infection_typed,
     missing_fields,
     multi_field,
+    rupture_evidence,
     spec_token,
     unstable,
 )
@@ -89,9 +91,6 @@ _NATIVE_INFECTION: tuple[str, ...] = ("原生感染明确", "原生感染疑似"
 
 #: 模型 ``cl.infection`` 里「既往移植物感染」的两个取值。
 _GRAFT_INFECTION: tuple[str, ...] = ("移植物感染明确", "移植物感染疑似")
-
-#: 模型 ``cl.fistula`` 里表示「瘘存在（含疑似）」的取值 —— **含** ``疑似``。
-_FISTULA_PRESENT: tuple[str, ...] = ("主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似")
 
 #: ``s.gi_bleed`` 里属于「活动性出血」的表现（``无`` / ``未知`` 不在其中）。
 _GI_BLEED_SIGNS: tuple[str, ...] = ("呕血", "黑便", "便血")
@@ -163,9 +162,8 @@ def _fistula(state: GuidelineState) -> object:
     return token(state.case.cl.fistula)
 
 
-def _fistula_present(state: GuidelineState) -> Verdict:
-    """是否存在（含疑似）主动脉相关瘘。"""
-    return eq(_fistula(state), *_FISTULA_PRESENT)
+# 瘘的判据与 D6 共用 ``common.fistula_present``（同一事实只许一个判据函数）。
+_fistula_present = fistula_present
 
 
 def _aef_sign(state: GuidelineState) -> Verdict:
@@ -222,7 +220,7 @@ def _active_gi_bleed(state: GuidelineState) -> Verdict:
     return active_gi_bleed(state)
 
 
-def _unstable(state: GuidelineState) -> Verdict:
+def _hemodynamically_unstable(state: GuidelineState) -> Verdict:
     """血流动力学不稳定 —— 判据本体在 ``common.unstable``（与 ``G03`` 同一定义）。"""
     return unstable(state)
 
@@ -295,13 +293,25 @@ _D41_NATIVE_FIELDS: tuple[tuple[str, str], ...] = (
 
 
 def _d41_r03(state: GuidelineState) -> Verdict:
-    """P0-A：明确/疑似主动脉相关瘘（或影像直接线索）→ D4.3，并回 G03。
+    """P0-A：明确/疑似主动脉相关瘘（或影像直接线索）→ D4.3。
 
-    出血与休克的 **G05** 由 ``D4.3.R01``/``R07`` 接手：同一批事实（``S.GI_BLEED`` /
-    ``V.SBP`` / ``D4.AEF_WARNING``）在那边读得更全，这里先回 ``G03`` 保留完整证据链，
-    比在分诊台上直接跳急诊模式更可审计。
+    规格 M 列写的是两段：「下一节点/终点：D4.3、G03、G05 / 动作：**D4.3；急症→
+    G03/G05**」。也就是说**主出口恒为 D4.3**，回 G03/G05 是另一个条件分支，
+    由 :func:`_d41_r03_emergency` 单独判 —— 不写进本函数，否则「有没有急症」
+    会变成「命不命中这条规则」，两件事混成一个。
     """
     return or_(_fistula_present(state), _aef_sign(state))
+
+
+def _d41_r03_emergency(state: GuidelineState) -> Verdict:
+    """``D4.1.R03`` 的附加条件：「如伴活动性出血、休克或新破裂证据，先回 G03/G05」。
+
+    三项合起来就是 :func:`common.active_gi_bleed` + :func:`common.rupture_evidence`
+    （后者已含休克与新破裂证据）。**瘘本身不构成急症**：规格把「瘘→D4.3」写成
+    常规出口，把急症写成「如伴」的附加条件。修前无条件 ``escalate G03``，
+    于是没有出血的瘘病人，报告里也会出现「回 G03」。
+    """
+    return or_(_active_gi_bleed(state), rupture_evidence(state))
 
 
 def _d41_r01(state: GuidelineState) -> Verdict:
@@ -390,9 +400,14 @@ _D41_SLOTS: tuple[RuleSlot, ...] = (
         source_row="D4.1!13",
         statement="明确/疑似主动脉相关瘘（或影像直接交通线索）→ D4.3；伴活动性出血/休克先回 G03/G05",
         judge=_d41_r03,
-        exit_kind="escalate",
-        exit_value="G03",
-        also_next="D4.3",
+        # 规格 M 列：「下一节点/终点：D4.3、G03、G05 / 动作：D4.3；急症→G03/G05」
+        # 主出口是 D4.3；G03/G05 是**条件性并行义务**，由 escalate_if 判。
+        exit_kind="next",
+        exit_value="D4.3",
+        next_nodes=("D4.3", "G03", "G05"),
+        link=Link.PARALLEL,
+        also_escalate="G03",
+        escalate_if=_d41_r03_emergency,
     ),
     RuleSlot(
         rule_id="D4.1.R01",
@@ -427,8 +442,12 @@ _D41_SLOTS: tuple[RuleSlot, ...] = (
         source_row="D4.1!19",
         statement="炎症性与感染性证据重叠 → 保留双标签，D4.2 与 D5.3 并行评估（MDT）",
         judge=_d41_r05,
-        exit_kind="terminal",
-        exit_value="D4.2 与 D5.3 并行评估（MDT 确认；不得以炎症影像单独排除感染）",
+        exit_kind="next",
+        # 规格 M 列：「D4.2+D5.3 并行/MDT」——两个节点都要执行。
+        # 修前写成 terminal + 一句描述：「并行」两个字进了报告，另一条分支却没走。
+        exit_value="D4.2",
+        next_nodes=("D4.2", "D5.3"),
+        link=Link.PARALLEL,
     ),
     RuleSlot(
         rule_id="D4.1.R90",
@@ -447,6 +466,8 @@ _D41_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d41_r91,
         exit_kind="escalate",
         exit_value="G08",
+        # 规格 M 列：「下一节点/终点：D4.2、D4.3、G08」——三个值都在这一列里。
+        next_nodes=("D4.2", "D4.3", "G08"),
     ),
 )
 
@@ -922,7 +943,7 @@ def _d43_r01(state: GuidelineState) -> Verdict:
     唯一必须先于方案讨论处理的事。腔内止血可以按团队决定作桥接，但**不能默认
     它完成了感染源控制**（规格 G 列原话）。
     """
-    return or_(_active_gi_bleed(state), _unstable(state))
+    return or_(_active_gi_bleed(state), _hemodynamically_unstable(state))
 
 
 def _d43_r07(state: GuidelineState) -> Verdict:
@@ -1052,6 +1073,11 @@ _D43_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d43_r01,
         exit_kind="escalate",
         exit_value="G05",
+        # 规格 M 列：「下一节点/终点：G03、G05、D4.3 / 动作：G03/G05+MDT；**后续**D4.3」
+        # 三个值都记下；``also_next`` 刻意留空 —— D4.3 指回当前节点，本轮不再走一遍，
+        # 「后续」是急诊处置与 MDT 之后的事，不是本次运行能自动执行的跳转。
+        next_nodes=("G03", "G05", "D4.3"),
+        link=Link.FOLLOW_UP,
     ),
     RuleSlot(
         rule_id="D4.3.R07",
@@ -1061,6 +1087,9 @@ _D43_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d43_r07,
         exit_kind="escalate",
         exit_value="G05",
+        # 规格 M 列：「G03、G05、D4.3 / 动作：G03/G05**+**D4.3 MDT」——加号表示并行。
+        next_nodes=("G03", "G05", "D4.3"),
+        link=Link.PARALLEL,
     ),
     RuleSlot(
         rule_id="D4.3.R02",

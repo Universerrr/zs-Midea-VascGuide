@@ -11,7 +11,7 @@
       使用，定义在 ``audit.py``；
     · ``RouteMode`` —— 只被 ``FinalRecommendation.route_mode`` 及执行层消费，
       定义在 ``preop/recommendation.py``；
-    · 事实字段的取值域 —— V3.1(2) 起改用字段级 ``Literal``（中文值直写），
+    · 事实字段的取值域 —— 用字段级 ``Literal``（中文值直写），
       不再有「共享枚举文件」这一层。理由是「一列四义」的取值列无法用单一
       ``StrEnum`` 表达，强行共用会逼出归一化函数与隐式别名。
 """

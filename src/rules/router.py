@@ -32,7 +32,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal
 
-from ..models.preop.case import UNCERTAIN_TOKENS, VascCase
+from ..models.preop.case import (
+    UNCERTAIN_TOKENS,
+    GeneticDomain,
+    InflammatoryDomain,
+    VascCase,
+    VitalDomain,
+)
 from ..models.preop.measurement import VascMeasurement
 from ..models.preop.recommendation import RouteMode
 from .version import RULESET_VERSION
@@ -47,9 +53,9 @@ NextNode = Literal["G05", "G06", "G07", "人工复核", "资料核实", "无目�
 EmergencyLevel = Literal["明确危险", "高度疑似", "不能排除", "未触发", "冲突"]
 ConfidenceLevel = Literal["高", "中", "低"]
 TaaaGrade = Literal["符合", "疑似", "不符合", "不可评价"]
-"""``CL.TAAA_IV``（Ⅳ型 TAAA 解剖扩展）的四值 —— V3.1(2) 允许值原样。
+"""``CL.TAAA_IV``（Ⅳ型 TAAA 解剖扩展）的四值 —— V3.6.2 允许值原样。
 
-它是**判定产物**（映射表 ``01!163``），不进 ``VascCase``、不进 160 字段清单；
+它是**判定产物**，不进 ``VascCase``、不进 162 字段清单；
 由 :func:`g08_r08_taaa_iv_label` 算出后随 :class:`RouteResult` 带给下游工具。
 """
 
@@ -150,7 +156,7 @@ class RouteResult:
     """Ⅳ型 TAAA 解剖扩展（判定产物）。``None`` = 没跑到 G08（急诊出口）。
 
     为什么不放 ``VascCase``：它是规则算出来的，不是抽取出来的病例事实。
-    放进去会让「病例输入」与「判定输出」混在一处，且 160 字段的契约数字会失守。
+    放进去会让「病例输入」与「判定输出」混在一处，且 162 字段的契约数字会失守。
     下游（指南引擎）按「条目子集」需要它，从 ``route_result`` 取即可。
     """
     k_identity_conflict: str | None = None
@@ -329,13 +335,13 @@ class _Ctx:
         self.reflow_evidence: str | None = None
 
 
-def _news2(v: object) -> tuple[float | None, bool | None]:
+def _news2(v: VitalDomain) -> tuple[float | None, bool | None]:
     """NEWS2 总分与「是否有单项 3 分」。
 
     7 项**全部可算**才给总分；单项 3 分只要该项可算即可判。
     ``Scale2经确认`` 未实现 → 直接 UNKNOWN（用错量表比没分数更危险）。
     """
-    if _token(v.spo2_scale) == "Scale2经确认":  # type: ignore[attr-defined]
+    if _token(v.spo2_scale) == "Scale2经确认":
         return None, None
 
     def s_rr(x: float) -> int:
@@ -366,17 +372,17 @@ def _news2(v: object) -> tuple[float | None, bool | None]:
         return 3 if x <= 35.0 else 1 if x <= 36.0 else 0 if x <= 38.0 else 1 if x <= 39.0 else 2
 
     comps: dict[str, int | None] = {
-        "rr": None if _num(v.rr) is None else s_rr(_num(v.rr)),  # type: ignore[attr-defined]
-        "spo2": None if _num(v.spo2) is None else s_spo2(_num(v.spo2)),  # type: ignore[attr-defined]
-        "sbp": None if _num(v.sbp) is None else s_sbp(_num(v.sbp)),  # type: ignore[attr-defined]
-        "hr": None if _num(v.hr) is None else s_hr(_num(v.hr)),  # type: ignore[attr-defined]
-        "temp": None if _num(v.temp) is None else s_temp(_num(v.temp)),  # type: ignore[attr-defined]
+        "rr": None if _num(v.rr) is None else s_rr(_num(v.rr)),
+        "spo2": None if _num(v.spo2) is None else s_spo2(_num(v.spo2)),
+        "sbp": None if _num(v.sbp) is None else s_sbp(_num(v.sbp)),
+        "hr": None if _num(v.hr) is None else s_hr(_num(v.hr)),
+        "temp": None if _num(v.temp) is None else s_temp(_num(v.temp)),
     }
-    acvpu = _token(v.acvpu)  # type: ignore[attr-defined]
+    acvpu = _token(v.acvpu)
     comps["acvpu"] = (
         None if acvpu is None or _is_uncertain_token(acvpu) else (0 if acvpu == "A" else 3)
     )
-    oxygen = _token(v.oxygen)  # type: ignore[attr-defined]
+    oxygen = _token(v.oxygen)
     comps["oxygen"] = (
         None if oxygen is None or _is_uncertain_token(oxygen) else (2 if oxygen == "是" else 0)
     )
@@ -391,29 +397,61 @@ def _news2(v: object) -> tuple[float | None, bool | None]:
     return total, single3
 
 
-def _derive_genetic_ctx(gen: object) -> str | None:
+GENETIC_CONFIRMED_SYNDROMES: tuple[str, ...] = (
+    "Marfan",
+    "Loeys-Dietz",
+    "血管型EDS",
+    "其他确诊综合征",
+)
+"""``GEN.SYNDROME_TYPE`` 里表示「已确诊某种遗传综合征」的取值。"""
+
+
+def _genetic_confirmed(gen: GeneticDomain) -> bool:
+    """遗传证据是否已足以确诊（综合征名称或致病/可能致病变异）。"""
+    return _token(gen.syndrome_type) in GENETIC_CONFIRMED_SYNDROMES or _token(
+        gen.variant_class
+    ) in ("致病", "可能致病")
+
+
+def _genetic_suspected(gen: GeneticDomain) -> bool:
+    """是否只有**遗传评估线索**、尚未确诊。
+
+    四条线索任一成立即可：未确诊的综合征记录、家族史阳性、典型体征、早发
+    （首次确诊 < 60 岁）。规格 ``G04.R17`` 的「符合以上任一项」就是这四条 ——
+    它与 :func:`_derive_genetic_ctx` 共用本函数，避免同一事实两处判据。
+    """
+    age = gen.aaa_age_onset
+    return (
+        _token(gen.syndrome_type) == "疑似"
+        or _token(gen.family_aneurysm) == "阳性"
+        or bool(gen.syndromic_features)
+        or (age is not None and age < 60)
+    )
+
+
+def _derive_genetic_ctx(gen: GeneticDomain) -> str | None:
     """遗传证据明细 → 主状态（三层：``GEN.*`` → ``N.GENETIC_CTX`` → 规则）。
 
     只在抽取层没给主状态时兜底派生；证据不足以支撑结论时返回 ``None``。
     """
-    st = _token(gen.syndrome_type)  # type: ignore[attr-defined]
-    vc = _token(gen.variant_class)  # type: ignore[attr-defined]
-    if st in ("Marfan", "Loeys-Dietz", "血管型EDS", "其他确诊综合征") or vc in ("致病", "可能致病"):
+    if _genetic_confirmed(gen):
         return "确诊"
-    fam = _token(gen.family_aneurysm)  # type: ignore[attr-defined]
-    feats = gen.syndromic_features  # type: ignore[attr-defined]
-    age = gen.aaa_age_onset  # type: ignore[attr-defined]
-    if st == "疑似" or fam == "阳性" or feats or (isinstance(age, int) and age < 60):
+    if _genetic_suspected(gen):
         return "疑似遗传背景"
-    if fam == "明确无相关史" and isinstance(age, int) and age >= 60 and not feats:
+    if (
+        _token(gen.family_aneurysm) == "明确无相关史"
+        and gen.aaa_age_onset is not None
+        and gen.aaa_age_onset >= 60
+        and not gen.syndromic_features
+    ):
         return "无已知阳性线索"
     return None
 
 
-def _derive_inflammatory_ctx(inf: object) -> str | None:
+def _derive_inflammatory_ctx(inf: InflammatoryDomain) -> str | None:
     """炎症证据明细 → 主状态。**单纯 CRP/ESR 升高不触发**（G04.R16 明文）。"""
-    mantle = _token(inf.mantle_sign)  # type: ignore[attr-defined]
-    wall = _token(inf.wall_fibrosis)  # type: ignore[attr-defined]
+    mantle = _token(inf.mantle_sign)
+    wall = _token(inf.wall_fibrosis)
     if mantle == "明确存在":
         return "影像高度提示"
     if mantle == "可疑" or wall == "可疑":
@@ -433,11 +471,11 @@ MPF_UNCERTAIN = ("疑似", "未知", "证据冲突")
 def _materialize_malperfusion(x: _Ctx) -> tuple[Verdict, frozenset[str]]:
     """器官/肢体灌注障碍 → ``(三值, 受累器官集合)``。
 
-    ``C.MALPERFUSION`` 在 V3.6.2 只有定义行（``G04!C39``）、没有规则行，也没有
+    ``C.MALPERFUSION`` 在 V3.6.2 只有定义行（``G04!40``）、没有规则行，也没有
     独立的证据明细层（对照 ``GEN.*`` / ``INF.*`` 那种三层结构）。本函数补上
     这一层：抽取值优先，缺失时保守派生。
 
-    **本函数永不因分支解剖异常推出 ``True``。** 规格 ``G04!C39`` 明令
+    **本函数永不因分支解剖异常推出 ``True``。** 规格 ``G04!J40`` 明令
     「不能仅凭解剖狭窄自动推断器官缺血」——``C.BRANCH`` 异常只能导致 ``None``
     （无法排除），不能导致确认。确认通路只有一条：医生在病历里明确记录了
     器官/肢体灌注障碍，由抽取层写入 ``c.malperfusion``。
@@ -498,6 +536,22 @@ def _branch_occluded(x: _Ctx) -> Verdict:
     if any(_is_uncertain_token(v) for v in vals):
         return None
     return False
+
+
+REPAIR_KINDS: tuple[str, ...] = ("EVAR", "OSR", "其他")
+"""``CL.PREV_EVOR`` / ``N.PREV_REPAIR`` 里表示「做过修复」的取值。"""
+
+
+def _has_prior_repair(x: _Ctx) -> Verdict:
+    """有既往主动脉修复史。「无」是明确阴性；「未知」/未填是 UNKNOWN。
+
+    两个来源任一为阳性即可：``CL.PREV_EVOR``（分类域）与 ``N.PREV_REPAIR``
+    （解剖域）问的是同一件事，抽取层可能只填了其中一个。
+    """
+    return _or(
+        _eq(x.cl.prev_evor, *REPAIR_KINDS),
+        _eq(x.n.prev_repair, *REPAIR_KINDS),
+    )
 
 
 # ===========================================================================
@@ -678,7 +732,7 @@ def g03_r21_lactate_above_uln(x: _Ctx) -> Verdict:
 
 
 # ===========================================================================
-# G04 · 复杂度判定（18 条）
+# G04 · 复杂度判定（21 条）
 # ===========================================================================
 def g04_r01_short_neck(x: _Ctx) -> Verdict:
     return _and(
@@ -719,7 +773,7 @@ def g04_r07_infection_or_fistula(x: _Ctx) -> Verdict:
 
 
 def g04_r08_ifu_mismatch(x: _Ctx) -> Verdict:
-    return _eq(x.n.seal_ifu, "不符")
+    return _eq(x.n.seal_ifu, "不符合")
 
 
 def g04_r09_iliac_limitation(x: _Ctx) -> Verdict:
@@ -732,12 +786,19 @@ def g04_r10_access_occlusion(x: _Ctx) -> Verdict:
 
 
 def g04_r11_prior_repair_reintervention(x: _Ctx) -> Verdict:
+    """既往修复 + 确认 I/III 型内漏、结构重大异常或瘤囊增长 ≥10mm → 复杂。
+
+    「有修复史」统一走 :func:`_has_prior_repair`（``CL.PREV_EVOR`` 与
+    ``N.PREV_REPAIR`` 任一为阳性即可）。只看后者会让「分类域写了 EVAR、
+    解剖域没填」的病例漏判——而 ``R19``（术后无异常）用的正是前者，
+    两条规则对同一事实必须同一判据。
+    """
     evidence = _or(
         _eq(x.n.endoleak_type, "I", "III"),
         _eq(x.n.graft_major, "组件分离", "移位", "明显闭塞"),
         _ge(x.n.sac_growth, SAC_GROWTH_MM),
     )
-    return _and(_not(_eq(x.n.prev_repair, "无")), evidence)
+    return _and(_has_prior_repair(x), evidence)
 
 
 def g04_r12_physiologic_risk(x: _Ctx) -> Verdict:
@@ -750,6 +811,11 @@ def g04_r12_physiologic_risk(x: _Ctx) -> Verdict:
 
 
 def g04_r13_insufficient_for_low_complexity(x: _Ctx) -> Verdict:
+    """关键解剖字段缺失/不可评价 → 不得判低复杂。
+
+    ``_missing`` 已把「不可评价」这类不确定值算作缺失（``UNCERTAIN_TOKENS``），
+    故四个分支字段各判一次即可，不再逐值重复列举。
+    """
     anatomy = _or(
         _eq(x.n.cta_status, "缺失", "部分", "冲突"),
         _missing(x.n.neck_len),
@@ -757,10 +823,6 @@ def g04_r13_insufficient_for_low_complexity(x: _Ctx) -> Verdict:
         _missing(x.n.renal_r),
         _missing(x.n.sma),
         _missing(x.n.ca),
-        _eq(x.n.renal_l, "不可评价"),
-        _eq(x.n.renal_r, "不可评价"),
-        _eq(x.n.sma, "不可评价"),
-        _eq(x.n.ca, "不可评价"),
     )
     return _and(_aaa_suspected(x), anatomy)
 
@@ -789,16 +851,15 @@ def g04_r16_inflammatory(x: _Ctx) -> Verdict:
 
 
 def g04_r17_genetic_suspected(x: _Ctx) -> Verdict:
-    feats = x.gen.syndromic_features
-    feature_hit = True if feats else (None if feats is None else False)
-    return _and(
-        _or(_aaa_confirmed(x), _eq(x.d.dx_context, "疑似")),
-        _or(
-            _lt(x.gen.aaa_age_onset, 60),
-            _eq(x.gen.family_aneurysm, "阳性"),
-            feature_hit,
-        ),
-    )
+    """有主动脉病变 + 只有遗传评估线索（未确诊）→ 复杂，做专科遗传评估。
+
+    两条通路取并集：``GEN.*`` 明细支持「疑似」（见 :func:`_genetic_suspected`），
+    或抽取层直接给了 ``N.GENETIC_CTX="疑似遗传背景"``。修复前只读后者中的一半
+    ——明细里 ``GEN.SYNDROME_TYPE="疑似"`` 这一路永远不触发。
+    """
+    aortic = _or(_aaa_confirmed(x), _eq(x.d.dx_context, "疑似"))
+    suspected = _or(_genetic_suspected(x.gen), _eq(x.genetic_ctx, "疑似遗传背景"))
+    return _and(aortic, suspected)
 
 
 def g04_r18_inflammation_vs_infection(x: _Ctx) -> Verdict:
@@ -811,7 +872,7 @@ def g04_r18_inflammation_vs_infection(x: _Ctx) -> Verdict:
 def g04_r21_malperfusion(x: _Ctx) -> Verdict:
     """器官/肢体灌注障碍 → 复杂。
 
-    V3.6.2 只在 ``G04!C39`` 定义了 ``C.MALPERFUSION``，没有对应的规则行。
+    V3.6.2 只在 ``G04!40`` 定义了 ``C.MALPERFUSION``，没有对应的规则行。
     本规则是代码侧补齐的消费端，**来源性质登记为「工程安全规则」**——
     不得声称它是 ESVS 原文。
 
@@ -822,18 +883,6 @@ def g04_r21_malperfusion(x: _Ctx) -> Verdict:
 
 
 # ---- G04.R19 / R20（V3.6.2 新增）----
-REPAIR_KINDS: tuple[str, ...] = ("EVAR", "OSR", "其他")
-"""``CL.PREV_EVOR`` / ``N.PREV_REPAIR`` 里表示「做过修复」的取值。"""
-
-
-def _has_prior_repair(x: _Ctx) -> Verdict:
-    """有既往主动脉修复史。「无」是明确阴性；「未知」/未填是 UNKNOWN。"""
-    return _or(
-        _eq(x.cl.prev_evor, *REPAIR_KINDS),
-        _eq(x.n.prev_repair, *REPAIR_KINDS),
-    )
-
-
 def g04_r19_prior_repair_unremarkable(x: _Ctx) -> Verdict:
     """P3：仅有既往修复史、本次无危险征象或重要异常 —— 不因手术史判复杂。
 
@@ -926,11 +975,30 @@ def g08_r03_d3_ruptured(x: _Ctx) -> Verdict:
     return _eq(x.cl.aaa_rupture, "明确", "疑似")
 
 
+#: ``CL.INFECTION`` 里表示「有感染」的四个取值（原生/移植物 × 明确/疑似）。
+#: 病种层 ``common.INFECTION_SUBTYPES`` 直接复用它，不再抄一份取值表。
+INFECTION_LABELS: tuple[str, ...] = (
+    "原生感染明确",
+    "原生感染疑似",
+    "移植物感染明确",
+    "移植物感染疑似",
+)
+
+#: ``CL.FISTULA`` 里表示「有主动脉相关瘘」的四个取值。
+FISTULA_LABELS: tuple[str, ...] = ("主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似")
+
+
+def _infection_or_fistula_label(x: _Ctx) -> Verdict:
+    """分类域里的感染/瘘标签（``CL.INFECTION`` / ``CL.FISTULA``）—— D4 的唯一判据。
+
+    ``G08.R04`` 用它打 D4 标签，``G09.R05`` 在它之上再加「主状态」那一层；
+    两处若各抄一份取值域，「什么算感染」就会有两个版本。
+    """
+    return _or(_eq(x.cl.infection, *INFECTION_LABELS), _eq(x.cl.fistula, *FISTULA_LABELS))
+
+
 def g08_r04_d4_infected(x: _Ctx) -> Verdict:
-    return _or(
-        _eq(x.cl.infection, "原生感染明确", "原生感染疑似", "移植物感染明确", "移植物感染疑似"),
-        _eq(x.cl.fistula, "主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似"),
-    )
+    return _infection_or_fistula_label(x)
 
 
 def g08_r05_d5_special(x: _Ctx) -> Verdict:
@@ -975,7 +1043,7 @@ def _taaa_grade(v: Verdict) -> TaaaGrade:
     """``G08.R08`` 的三值 → ``CL.TAAA_IV`` 的四值。
 
     「疑似」当前**不可达**，这是有意的：三值求值只能给 成立 / 不成立 / 未判定，
-    而「疑似」要求「部分关键字段明确受累、部分可疑」这种细分判据 —— V3.1(2)
+    而「疑似」要求「部分关键字段明确受累、部分可疑」这种细分判据 —— V3.6.2
     没给。宁可不产出这个值，也不去猜一个听起来合理的中间态。
 
     于是映射是确定的：命中 → 符合；明确不命中 → 不符合；有未判定项 → 不可评价。
@@ -989,14 +1057,19 @@ def _taaa_grade(v: Verdict) -> TaaaGrade:
     return "不可评价"
 
 
-def g08_r09_multi_label_conflict(x: _Ctx) -> Verdict:
-    """D1/D2/D3 互斥；同时出现 ≥2 个即冲突（D3 危险优先）。
+def _exclusive_states(x: _Ctx) -> frozenset[str]:
+    """同属「同一病灶同一时点」的三个状态标签 —— D1 无症状 / D2 症状性 / D3 破裂。
 
-    两个来源都要看：① 本轮规则算出的 ``x.labels``；② 抽取层预填的
+    两个来源合并：本轮规则算出的 ``x.labels``，以及抽取层预填的
     ``cl.diag_multi``（外部给的标签同样可能自相矛盾，不能只信自己算的）。
+    其余标签（D4–D7、Ⅳ型TAAA 扩展）按 ``G09.R09`` 都是**允许共存**的。
     """
-    seen = set(x.labels) | {str(v) for v in (x.cl.diag_multi or [])}
-    return sum(1 for lab in ("D1", "D2", "D3") if lab in seen) >= 2
+    return frozenset(set(x.labels) | set(x.cl.diag_multi or ())) & {"D1", "D2", "D3"}
+
+
+def g08_r09_multi_label_conflict(x: _Ctx) -> Verdict:
+    """D1/D2/D3 是同一动脉瘤的三种状态，同时出现 ≥2 个即冲突（D3 危险优先）。"""
+    return len(_exclusive_states(x)) >= 2
 
 
 def g08_r10_inflammatory_as_d5_subtype(x: _Ctx) -> Verdict:
@@ -1015,11 +1088,9 @@ def _infection_site(x: _Ctx) -> str | None:
     之间分流，二值表达不了。求值仍走 ``_token``，不确定词折成 ``None``。
     """
     v = _token(x.cl.infection)
-    if v in ("原生感染明确", "原生感染疑似"):
-        return "native"
-    if v in ("移植物感染明确", "移植物感染疑似"):
-        return "graft"
-    return None
+    if not isinstance(v, str) or v not in INFECTION_LABELS:
+        return None
+    return "native" if v.startswith("原生") else "graft"
 
 
 def g08_r12_infection_origin(x: _Ctx) -> Verdict:
@@ -1036,7 +1107,7 @@ def g08_r12_infection_origin(x: _Ctx) -> Verdict:
     if _infection_site(x) is not None:
         return True
     v = _token(x.cl.infection)
-    if v is None or v == "未评价" or _is_uncertain_token(v):
+    if v is None or _is_uncertain_token(v):  # 「未评价」等不确定值已在白名单里
         return None
     return None if _has_prior_repair(x) is True else False
 
@@ -1142,18 +1213,13 @@ def g09_r04_classify_and_stop(x: _Ctx) -> Verdict:
 
 # ---- G09.R05–R09（V3.6.2 新增）----
 def _active_infection_or_fistula(x: _Ctx) -> Verdict:
-    """当前有感染或主动脉相关瘘证据（含疑似）。"""
-    return _or(
-        _eq(
-            x.cl.infection,
-            "原生感染明确",
-            "原生感染疑似",
-            "移植物感染明确",
-            "移植物感染疑似",
-        ),
-        _eq(x.cl.fistula, "主动脉肠瘘", "主动脉腔静脉瘘", "其他瘘", "疑似"),
-        _eq(x.n.infection_ctx, "医师明确", "高度怀疑"),
-    )
+    """当前有感染或主动脉相关瘘证据（含疑似）。
+
+    在 ``G08.R04`` 的分类标签之上，多读一层 ``N.INFECTION_CTX``（抽取层给的
+    主状态）：分类域没打标签、但主状态说「医师明确/高度怀疑」时，同样是
+    「分类期间新发现的感染」，不能因为前者没填就当成没有。
+    """
+    return _or(_infection_or_fistula_label(x), _eq(x.n.infection_ctx, "医师明确", "高度怀疑"))
 
 
 def g09_r05_infection_or_fistula_reflow(x: _Ctx) -> Verdict:
@@ -1171,8 +1237,9 @@ def g09_r05_infection_or_fistula_reflow(x: _Ctx) -> Verdict:
 
 def g09_r06_postop_abnormality(x: _Ctx) -> Verdict:
     """P1：术后出现内漏/瘤囊增长/移植物故障 —— 进 D6 对应节点，急症回 G03。"""
-    if _has_prior_repair(x) is not True:
-        return None if _has_prior_repair(x) is None else False
+    repaired = _has_prior_repair(x)
+    if repaired is not True:
+        return repaired
     return _or(
         _eq(x.n.endoleak_type, "I", "II", "III", "IV", "V", "疑似"),
         _ge(x.n.sac_growth, SAC_GROWTH_MM),
@@ -1215,29 +1282,20 @@ def g09_r08_unclassifiable(x: _Ctx) -> Verdict:
 
 
 def g09_r09_multilabel_coexistence(x: _Ctx) -> Verdict:
-    """P3：允许共存的多标签 vs 真正互斥的冲突。
+    """P3：**允许共存**的多标签（True）与真正互斥的冲突（False）之分。
 
     规格列举的共存组合：AAA+髂动脉瘤、感染+动脉瘤、炎症性AAA+感染疑似、
-    术后状态+新病变 —— 都可以同时成立，不自动判冲突。只有**同一病灶/同一时点
-    的互斥状态**（例如「明确破裂」与「同一可靠检查明确排除」）才是真冲突。
+    术后状态+新病变 —— 都可以同时成立，不自动判冲突。只有**同一病灶/同一
+    时点的互斥状态**（D1/D2/D3 中 ≥2 个）才是真冲突。
 
-    ``G08.R09`` 现在的实现把 D1/D2/D3 两两当互斥，这条规则补上「哪些不算冲突」
-    的白名单。两者合起来才是规格的完整口径。
+    ``G08.R09`` 判「有没有互斥标签」，本条判「这个多标签集合能不能共存」——
+    两者是同一判据的正反面，共用 :func:`_exclusive_states`。返回值是
+    **「允许共存」**，不是「存在冲突」：调用方据此决定要不要升级成冲突。
     """
-    if len(x.labels) < 2:
+    all_labels = set(x.labels) | set(x.cl.diag_multi or ())
+    if len(all_labels) < 2:
         return False
-    return _mutually_exclusive(x)
-
-
-def _mutually_exclusive(x: _Ctx) -> Verdict:
-    """同一病灶、同一时点的互斥组合 —— 只有这几种才叫真冲突。
-
-    D1（无症状）/D2（症状性未破裂）/D3（破裂）是**同一病灶的三种状态**，
-    天然互斥。其余多标签（感染+动脉瘤、炎症+感染、术后+新病变）都是共存。
-    """
-    seen = set(x.labels)
-    rupture_states = {"D1", "D2", "D3"} & seen
-    return len(rupture_states) >= 2
+    return len(_exclusive_states(x)) < 2
 
 
 # ===========================================================================
@@ -1250,7 +1308,13 @@ class RuleSpec:
     exit: NextNode
     name: str
     fields: tuple[str, ...] = ()
-    level: EmergencyLevel = "明确危险"
+    level: EmergencyLevel = "未触发"
+    """命中后 ``R.AORTIC_EMERGENCY`` 的取值。
+
+    只在 G03 的 P0-A/P0-G 规则上显式声明（那才是「主动脉急症危险」）；
+    其余规则即便命中也不是急症结论，故默认「未触发」。给它们一律填
+    「明确危险」会让 ``RULES`` 里 40 多条规则声称自己是急症判据。
+    """
 
 
 RULE_SOURCE: dict[str, tuple[SourceKind, str | None]]
@@ -1287,13 +1351,15 @@ RULES: dict[str, RuleSpec] = {
         "G05",
         "明确主动脉壁外造影剂外溢",
         ("c.extrav", "c.extrav_contig", "q.cta_enhance", "c.source_kind"),
+        "明确危险",
     ),
     "G03.R02": RuleSpec(
         g03_r02_aneurysm_with_hematoma,
         "G03!10",
         "G05",
         "主动脉瘤伴相邻血肿",
-        ("c.hematoma", "c.hematoma_adj", "c.aorta"),
+        ("c.hematoma", "c.hematoma_adj", "c.source_kind"),
+        "明确危险",
     ),
     "G03.R03": RuleSpec(
         g03_r03_rupture_reported,
@@ -1301,13 +1367,14 @@ RULES: dict[str, RuleSpec] = {
         "G05",
         "医师报告明确主动脉破裂",
         ("c.rupture_report", "q.idmatch"),
+        "明确危险",
     ),
     "G03.R04": RuleSpec(
         g03_r04_suspected_rupture_unstable,
         "G03!12",
         "G05",
         "疑似破裂伴血流动力学不稳定",
-        ("d.dx_context", "v.sbp", "v.conscious_change", "s.pain_current"),
+        ("q.idmatch", "d.dx_context", "c.rupture_report", "v.sbp", "v.conscious_change"),
         "高度疑似",
     ),
     "G03.R05": RuleSpec(
@@ -1316,6 +1383,7 @@ RULES: dict[str, RuleSpec] = {
         "G05",
         "AAA 合并急性相关疼痛",
         ("s.pain_current", "s.pain_site", "s.pain_attrib"),
+        "明确危险",
     ),
     "G03.R06": RuleSpec(
         g03_r06_aaa_sudden_pain_unattributed,
@@ -1339,6 +1407,7 @@ RULES: dict[str, RuleSpec] = {
         "G05",
         "主动脉移植物史合并消化道出血",
         ("d.surg", "s.gi_bleed"),
+        "明确危险",
     ),
     "G03.R09": RuleSpec(
         g03_r09_acute_limb_ischemia,
@@ -1346,6 +1415,7 @@ RULES: dict[str, RuleSpec] = {
         "G05",
         "急性肢体缺血危险征象",
         ("s.limb", "s.pulse_deficit", "c.branch"),
+        "明确危险",
     ),
     "G03.R10": RuleSpec(
         g03_r10_news2_critical,
@@ -1353,6 +1423,7 @@ RULES: dict[str, RuleSpec] = {
         "G05",
         "NEWS2 严重恶化（≥7）",
         ("v.rr", "v.sbp", "v.hr", "v.spo2", "v.acvpu", "v.temp", "v.oxygen"),
+        "明确危险",
     ),
     "G03.R11": RuleSpec(
         g03_r11_news2_urgent_review,
@@ -1425,6 +1496,7 @@ RULES: dict[str, RuleSpec] = {
         "G05",
         "严重低血压（不依赖已知 AAA）",
         ("v.sbp", "q.idmatch"),
+        "明确危险",
     ),
     "G03.R21": RuleSpec(
         g03_r21_lactate_above_uln,
@@ -1433,7 +1505,7 @@ RULES: dict[str, RuleSpec] = {
         "乳酸高于同次检验上限",
         ("lab.lact", "lab.lact_uln", "q.unit"),
     ),
-    # ---- G04（18）----
+    # ---- G04（21）----
     "G04.R01": RuleSpec(
         g04_r01_short_neck,
         "G04!42",
@@ -1535,7 +1607,7 @@ RULES: dict[str, RuleSpec] = {
         "G04!58",
         "G06",
         "存在遗传评估线索但尚未确诊",
-        ("gen.aaa_age_onset", "gen.family_aneurysm", "gen.syndromic_features"),
+        ("n.genetic_ctx", "gen.aaa_age_onset", "gen.family_aneurysm", "gen.syndromic_features"),
     ),
     "G04.R18": RuleSpec(
         g04_r18_inflammation_vs_infection,
@@ -1546,7 +1618,7 @@ RULES: dict[str, RuleSpec] = {
     ),
     "G04.R21": RuleSpec(
         g04_r21_malperfusion,
-        "G04!39",
+        "G04!40",
         "G06",
         "器官或肢体灌注障碍",
         ("c.malperfusion", "c.branch", "s.limb"),
@@ -1585,7 +1657,7 @@ RULES: dict[str, RuleSpec] = {
         "G08!26",
         "G06",
         "D3 破裂/疑似破裂 AAA 入口",
-        ("cl.aaa_rupture", "cl.aaa_reported"),
+        ("cl.aaa_rupture",),
     ),
     "G08.R04": RuleSpec(
         g08_r04_d4_infected,
@@ -1606,11 +1678,9 @@ RULES: dict[str, RuleSpec] = {
         "G08!29",
         "G06",
         "D6 EVAR/OSR 术后入口",
-        ("cl.prev_evor", "cl.post_reason"),
+        ("cl.prev_evor", "n.prev_repair"),
     ),
-    "G08.R07": RuleSpec(
-        g08_r07_d7_iliac, "G08!30", "G06", "D7 髂动脉瘤入口", ("cl.iliac_site", "cl.iliac_diam")
-    ),
+    "G08.R07": RuleSpec(g08_r07_d7_iliac, "G08!30", "G06", "D7 髂动脉瘤入口", ("cl.iliac_site",)),
     "G08.R08": RuleSpec(
         g08_r08_taaa_iv_label,
         "G08!31",
@@ -1626,14 +1696,14 @@ RULES: dict[str, RuleSpec] = {
         "G08!33",
         "G06",
         "炎症性 AAA 归入 D5 特殊病种",
-        ("n.inflammatory_ctx", "inf.mantle_sign"),
+        ("n.inflammatory_ctx",),
     ),
     "G08.R11": RuleSpec(
         g08_r11_genetic_as_modifier,
         "G08!34",
         "G06",
         "遗传综合征保留为病因修饰标签",
-        ("n.genetic_ctx", "gen.syndrome_type"),
+        ("n.genetic_ctx",),
     ),
     "G08.R12": RuleSpec(
         g08_r12_infection_origin,
@@ -1686,7 +1756,7 @@ RULES: dict[str, RuleSpec] = {
         "G09!13",
         "G06",
         "输出疾病分类并停止",
-        ("k.classifiable", "k.class_output"),
+        ("k.diag_conflict",),
     ),
     "G09.R05": RuleSpec(
         g09_r05_infection_or_fistula_reflow,
@@ -1716,14 +1786,14 @@ RULES: dict[str, RuleSpec] = {
         "G09!8",
         "资料核实",
         "诊断未定、资料不足或无法分类",
-        ("k.classifiable", "k.diag_conflict", "n.cta_status"),
+        ("k.classifiable", "k.diag_conflict"),
     ),
     "G09.R09": RuleSpec(
         g09_r09_multilabel_coexistence,
         "G09!7",
         "人工复核",
         "允许共存的多标签与真正冲突的区分",
-        ("k.diag_conflict", "cl.aaa_reported", "cl.infection", "cl.prev_evor"),
+        ("cl.diag_multi",),
     ),
 }
 
@@ -1777,7 +1847,7 @@ RULE_SOURCE = {
     "G03.R19": ("工程安全规则", None),
     "G03.R20": ("ESVS原文", "§6"),
     "G03.R21": ("其他指南", None),  # 检验参考区间，非破裂诊断阈值
-    # ---- G04 复杂度（18）：ESVS 14 / 工程 4 ----
+    # ---- G04 复杂度（21）：ESVS 15 / 工程 6 ----
     "G04.R01": ("ESVS原文", "§8.1"),
     "G04.R02": ("ESVS原文", "§8.1"),
     "G04.R03": ("ESVS原文", "§8.1"),
@@ -1799,7 +1869,7 @@ RULE_SOURCE = {
     "G04.R21": ("工程安全规则", None),
     "G04.R19": ("ESVS原文", "§7"),  # K 列：ESVS 2024 章节来源已定位
     "G04.R20": ("工程安全规则", None),  # K 列：工程安全规则（非指南原文）
-    # ---- G08 病种分类（15）：ESVS 10 / 工程 4 / 其他 1 ----
+    # ---- G08 病种分类（15）：ESVS 10 / 工程 3 / 其他 2 ----
     "G08.R01": ("ESVS原文", "§2"),
     "G08.R02": ("其他指南", None),  # ACC/AHA 2022
     "G08.R03": ("ESVS原文", "§6"),
@@ -1976,13 +2046,16 @@ G04_BLOCKING = (
 于是一个未排除感染的病人被当成低复杂择期处理。这正是 ``all_clear`` 要挡的事。
 """
 G04_EXTRA = ("G04.R15", "G04.R16", "G04.R17", "G04.R21")
-"""加分型：遗传/炎症/灌注线索。命中→复杂；其 UNKNOWN **不阻断** G07 放行。
+"""加分型：遗传 / 炎症 / 灌注线索。命中 → 复杂；其 UNKNOWN **不阻断** G07 放行。
 
-规格对这三类（遗传、炎症、灌注）明写「UNKNOWN 不算命中、也不阻断」——它们
-描述的是**病因修饰**，不是「必须排除的危险」。``G04.R18`` 不在其中，见上。
+规格对遗传与炎症明写「**仅因**未做遗传检测 / CRP 不强制所有常规病例升复杂」
+（``G04!55``）——这两类描述的是**病因修饰**，不是「必须排除的危险」。
+``G04.R18`` 不在其中，见上。
 
-``G04.R21`` 是本条唯一一条**代码侧补齐**的规则（V3.6.2 只有 ``G04!C39`` 字段行、
-没有规则行），来源性质登记为「工程安全规则」，不得计入 ESVS 原文。
+``G04.R21`` 是本条唯一一条**代码侧补齐**的规则（V3.6.2 只有 ``G04!40``
+``C.MALPERFUSION`` 字段行、没有规则行），放在加分型是同一逻辑：灌注障碍缺证据时
+不该把整例挡在 G07 之外，但一旦确认就必须进复杂。来源性质登记为「工程安全规则」，
+不得计入 ESVS 原文。
 """
 G08_RULES = (
     "G08.R01",
@@ -2031,8 +2104,22 @@ def _collect_gaps(x: _Ctx, rule_ids: tuple[str, ...], trace: list[RuleTrace]) ->
     return gaps + [g for g in x.gaps_extra if g not in gaps]
 
 
-def _confidence(gaps: list[str], unknown_decisive: bool) -> ConfidenceLevel:
-    if unknown_decisive:
+def _confidence(
+    gaps: list[str],
+    unknown_decisive: bool,
+    *,
+    emergency_without_label: bool = False,
+) -> ConfidenceLevel:
+    """置信度的三档口径。
+
+    ``emergency_without_label`` 是「急诊模式但一个 D1–D7 标签都没打出来」——
+    它不是「资料待补」，而是**本次结论只到分流层**：``G03.R09`` 急性肢体缺血、
+    ``G03.R10`` NEWS2 恶化、``G03.R20`` 严重低血压这三条本就无病种可归，
+    工具A 一个节点都启动不了。此时若仍报「高」，等于说「系统看明白了」，
+    而实际上后面什么都没有。降「低」是让它进人工复核，不是降低危险等级
+    （危险提示照给，那由 ``emergency_level`` 与五段式承担）。
+    """
+    if unknown_decisive or emergency_without_label:
         return "低"
     return "中" if gaps else "高"
 
@@ -2071,7 +2158,18 @@ def _make(
     next_nodes: list[str] | None = None,
     class_output: list[str] | None = None,
 ) -> RouteResult:
-    gap_list = gaps or []
+    labels_out = list(class_output) if class_output is not None else list(x.labels)
+    gap_list = list(gaps or [])
+
+    # 急诊模式 + 零标签 = 病种流程无法启动。补一条能被输出层直接展示的缺口，
+    # 并降置信度（见 ``_confidence``）。三条无病种规则（R09/R10/R20）走的就是这里：
+    # 危险提示是对的，但「病种级建议」确实不存在，报告不能假装它存在。
+    emergency_without_label = mode is RouteMode.EMERGENCY and not labels_out
+    if emergency_without_label:
+        marker = f"未匹配 D1–D7 病种流程（{rule_id}）：病种级建议不可用，需人工判断"
+        if marker not in gap_list:
+            gap_list.append(marker)
+
     return RouteResult(
         kind=kind,
         rule_id=rule_id,
@@ -2082,8 +2180,12 @@ def _make(
         emergency_level=level,
         mode=mode,
         evidence_gaps=gap_list,
-        confidence_level=_confidence(gap_list, unknown_decisive),
-        class_output=list(class_output) if class_output is not None else list(x.labels),
+        confidence_level=_confidence(
+            gap_list,
+            unknown_decisive,
+            emergency_without_label=emergency_without_label,
+        ),
+        class_output=labels_out,
         cl_taaa_iv=x.taaa_iv,
         k_identity_conflict="是" if _token(x.q.idmatch) == "不一致" else None,
         k_diag_conflict=None if x.diag_conflict is None else ("是" if x.diag_conflict else "否"),
@@ -2096,7 +2198,7 @@ def route(case: VascCase, measurement: VascMeasurement | None = None) -> RouteRe
     """术前路由主入口：G03 → G04 →（G05 | G06 | G07）→ G08 → G09。
 
     参数：
-        case: V3.1(2) 病例（160 字段）。
+        case: V3.6.2 病例（162 字段）。
         measurement: 工具 B 的影像量化值；为 ``None`` 时按 B6 回落读 ``CL.AAA_DIAM``，
             并在 ``evidence_gaps`` 里登记 ``数据源=报告值``（不与量化值混淆）。
 
@@ -2301,7 +2403,7 @@ def _finish_mode(
     trace.append(RuleTrace("G08.R09", raw_conflict, "人工复核"))
     trace.append(RuleTrace("G09.R09", coexist, "人工复核"))
     # R09 的白名单意义在这里落地：被判为「允许共存」的多标签不升级成冲突。
-    x.diag_conflict = False if coexist is True else bool(raw_conflict)
+    x.diag_conflict = bool(raw_conflict) and coexist is not True
 
     # ---- G09.R05 分类中新发现的感染/主动脉瘘 ----
     # 规格：「新增感染/瘘证据时保留疑似/确诊状态并路由 D4；如活动性出血、休克
@@ -2353,7 +2455,9 @@ def _finish_mode(
     trace.append(RuleTrace("G09.R04", RULES["G09.R04"].func(x), "G06"))
 
     # ---- G09.R03 冲突 → 人工复核 ----
-    if x.diag_conflict:
+    # 求值而不是硬写 True：留痕里的 ``verdict`` 必须是这条规则自己算出来的，
+    # 否则「R03 成立」这句话在审计里没有依据（``diag_conflict`` 恒为 bool）。
+    if RULES["G09.R03"].func(x) is True:
         trace.append(RuleTrace("G09.R03", True, "人工复核"))
         return _make(
             x,
@@ -2440,6 +2544,7 @@ __all__ = [
     "EMERGENCY_LABELS",
     "EMERGENCY_NO_LABEL",
     "FALLBACK_VERIFY",
+    "FISTULA_LABELS",
     "G03_P01",
     "G03_P02",
     "G03_P03",
@@ -2447,6 +2552,7 @@ __all__ = [
     "G04_BLOCKING",
     "G04_EXTRA",
     "G08_RULES",
+    "INFECTION_LABELS",
     "LABEL_BY_RULE",
     "MANUAL_URGENCY",
     "OUTCOME_PRIORITY",

@@ -68,6 +68,7 @@ from ..state import (
     Candidate,
     CandidateStatus,
     GuidelineState,
+    Link,
     NodeFn,
     NodeOutcome,
 )
@@ -121,7 +122,7 @@ _D21_FIELDS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _pain(state: GuidelineState) -> object:
+def _pain_present(state: GuidelineState) -> object:
     return token(state.case.s.pain_present)
 
 
@@ -187,14 +188,14 @@ def _rupture_excluded(state: GuidelineState) -> Verdict:
     return None
 
 
-def _symptom_present(state: GuidelineState) -> Verdict:
+def _aaa_symptom_present(state: GuidelineState) -> Verdict:
     """当前是否有 AAA 相关症状 —— 规格 R01 列的三项：疼痛 / 触痛 / 肢体缺血。
 
     「触痛不确定」记 UNKNOWN 而非 True：规格明写「触痛本身也不能单独确诊
     症状性 AAA」，把它算成确认症状会让 ``R01`` 在只有一次含糊查体时放行。
     """
     return or_(
-        eq(_pain(state), "是", "可疑"),
+        eq(_pain_present(state), "是", "可疑"),
         eq(_tender(state), "明确阳性"),
         _limb_ischemia(state),
     )
@@ -203,7 +204,7 @@ def _symptom_present(state: GuidelineState) -> Verdict:
 def _suspected_symptom(state: GuidelineState) -> Verdict:
     """症状**疑似**（而非确认）—— 规格 ``R02`` 的「但有疑似症状」。"""
     return or_(
-        eq(_pain(state), "可疑"),
+        eq(_pain_present(state), "可疑"),
         eq(_tender(state), "不确定"),
     )
 
@@ -248,7 +249,7 @@ def _d21_r05(state: GuidelineState) -> Verdict:
     不同——本规则继续去 ``D2.2`` 做快速评估，``R04`` 要停在人工复核。
     """
     return and_(
-        eq(_pain(state), "是"),
+        eq(_pain_present(state), "是"),
         True if _attrib_unjudged(state) else None,
     )
 
@@ -283,19 +284,19 @@ def _d21_r04(state: GuidelineState) -> Verdict:
 
     只判「有症状 + 归因未判」。「无疼痛」的病例归因本来就是「未判断」（没症状
     何来归因），若一并阻断会让所有非疼痛病例都停在人工复核——故以
-    :func:`_symptom_present` 为前提。
+    :func:`_aaa_symptom_present` 为前提。
     """
-    if _attrib_unjudged(state) and _symptom_present(state) is True:
+    if _attrib_unjudged(state) and _aaa_symptom_present(state) is True:
         return True
-    return False if _symptom_present(state) is False else None
+    return False if _aaa_symptom_present(state) is False else None
 
 
 def _d21_r90(state: GuidelineState) -> Verdict:
     """P2：当前症状、归因或破裂状态未知/冲突 → 不得进入确定无症状 D1。"""
     return any(
         (
-            _pain(state) is None,
-            _attrib_unjudged(state) and _symptom_present(state) is True,
+            _pain_present(state) is None,
+            _attrib_unjudged(state) and _aaa_symptom_present(state) is True,
             token(state.case.cl.aaa_rupture) is None,
         )
     )
@@ -305,7 +306,7 @@ def _d21_r01(state: GuidelineState) -> Verdict:
     """P3：AAA 已确认 + 有症状 + 归因相关 + 无壁破裂证据 → D2.2。"""
     return and_(
         eq(token(state.case.cl.aaa_reported), "确认"),
-        _symptom_present(state),
+        _aaa_symptom_present(state),
         _attributed(state),
         not_(_wall_breach(state)),
     )
@@ -321,7 +322,7 @@ def _d21_r91(state: GuidelineState) -> Verdict:
     return and_(
         _rupture_excluded(state),
         or_(
-            eq(_pain(state), "否"),
+            eq(_pain_present(state), "否"),
             eq(_attrib(state), _ATTRIB_OTHER),
         ),
     )
@@ -337,6 +338,8 @@ _D21_SLOTS: tuple[RuleSlot, ...] = (
         exit_kind="escalate",
         exit_value="G03",
         also_next="D3.1",
+        next_nodes=("G03", "D3.1"),
+        link=Link.FOLLOW_UP,
     ),
     RuleSlot(
         rule_id="D2.1.R05",
@@ -347,6 +350,8 @@ _D21_SLOTS: tuple[RuleSlot, ...] = (
         exit_kind="escalate",
         exit_value="G03",
         also_next="D2.2",
+        next_nodes=("D2.2", "G03", "D3.1"),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D2.1.R06",
@@ -356,6 +361,7 @@ _D21_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d21_r06,
         exit_kind="next",
         exit_value="D2.2",
+        next_nodes=("D2.2", "D5.3", "G03"),
     ),
     RuleSlot(
         rule_id="D2.1.R02",
@@ -401,6 +407,7 @@ _D21_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d21_r91,
         exit_kind="next",
         exit_value="D1.1",
+        next_nodes=("D1.1", "D2.2", "G03", "D3.1"),
     ),
 )
 
@@ -444,7 +451,7 @@ def _stability(state: GuidelineState) -> object:
     return spec_token(state.node_field("D2.CLINICAL_STABILITY"))
 
 
-def _unstable(state: GuidelineState) -> Verdict:
+def _clinically_unstable(state: GuidelineState) -> Verdict:
     """当前不稳定 —— 只读医生的稳定性结论，不自己拿单次血压判。
 
     规格 ``V.SBP`` 的 G 列明写「不得将单一阈值用于确诊 AAA 破裂」，
@@ -483,13 +490,13 @@ def _d22_r04(state: GuidelineState) -> Verdict:
     为什么这里用 ``G05`` 而不是 ``G03``：病人**已经在快速评估通道里**，再回判定层
     重判等于把最急的一类往后排。规格 M 列写「G03/G05、D3.1、D3.2」，取最急的一支。
     """
-    return or_(_deteriorating(state), _unstable(state))
+    return or_(_deteriorating(state), _clinically_unstable(state))
 
 
 def _d22_r01(state: GuidelineState) -> Verdict:
     """P0-A：不稳定、破裂新证据或不能排除破裂 → 回 G03 并进 D3.1。"""
     return or_(
-        _unstable(state),
+        _clinically_unstable(state),
         eq(token(state.case.cl.aaa_rupture), "明确", "疑似", "无法评价"),
         _wall_breach(state),
     )
@@ -597,6 +604,8 @@ _D22_SLOTS: tuple[RuleSlot, ...] = (
         exit_kind="escalate",
         exit_value="G05",
         also_next="D3.2",
+        next_nodes=("G03", "G05", "D3.1", "D3.2"),
+        link=Link.FOLLOW_UP,
     ),
     RuleSlot(
         rule_id="D2.2.R01",
@@ -607,6 +616,8 @@ _D22_SLOTS: tuple[RuleSlot, ...] = (
         exit_kind="escalate",
         exit_value="G03",
         also_next="D3.1",
+        next_nodes=("G03", "D3.1"),
+        link=Link.FOLLOW_UP,
     ),
     RuleSlot(
         rule_id="D2.2.R06",
@@ -652,6 +663,8 @@ _D22_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d22_r03,
         exit_kind="escalate",
         exit_value="G03",
+        next_nodes=("G03",),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D2.2.R91",
@@ -706,7 +719,14 @@ def _team_absent(state: GuidelineState) -> Verdict:
 
 
 def _ifu(state: GuidelineState) -> object:
-    return token(state.case.n.seal_ifu)
+    """``N.EVAR_IFU_STATUS`` —— **整体** EVAR 器械适配（不是近端密封区）。
+
+    ``D2.3`` 全部 7 条规则的「允许值」列都点名这个字段。用它而不是
+    ``n.seal_ifu``：后者规格明写「只代表近端密封项，不代表整体 EVAR 适配」，
+    拿近端合格冒充整体合格，会让候选栏写出「IFU 符合」而实际只核了密封区
+    （``D2.3.R06`` 明令禁止）。
+    """
+    return token(state.case.n.evar_ifu_status)
 
 
 def _d23_r01(state: GuidelineState) -> Verdict:
@@ -725,7 +745,7 @@ def _d23_r02(state: GuidelineState) -> Verdict:
     return and_(
         or_(
             access_blocked(state),
-            eq(_ifu(state), "不符"),
+            eq(_ifu(state), "不符合"),
             branch_involved(state),
         ),
         eq(_risk(state), "可接受"),
@@ -749,15 +769,15 @@ def _d23_r05(state: GuidelineState) -> Verdict:
     不具备（IFU 不符、入路阻断、团队不可用）。
     """
     return or_(
-        eq(_ifu(state), "不符"),
+        eq(_ifu(state), "不符合"),
         access_blocked(state),
         _team_absent(state),
     )
 
 
 def _d23_r06(state: GuidelineState) -> Verdict:
-    """P3：IFU 未核验/未选型号 → 只标「待核验候选」，不得输出「符合 IFU」。"""
-    return eq(_ifu(state), "未核验", "未选型号")
+    """P3：IFU 未核验/未选择型号 → 只标「待核验候选」，不得输出「符合 IFU」。"""
+    return eq(_ifu(state), "未核验", "未选择型号")
 
 
 _D23_DISPLAY_RULES: tuple[DisplayRule, ...] = (
@@ -828,6 +848,8 @@ _D23_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d23_r03,
         exit_kind="escalate",
         exit_value="G06",
+        next_nodes=("G06",),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D2.3.R05",
@@ -837,6 +859,8 @@ _D23_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d23_r05,
         exit_kind="escalate",
         exit_value="G06",
+        next_nodes=("G06",),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D2.3.R91",
@@ -867,7 +891,7 @@ def _evar_candidate(state: GuidelineState) -> Candidate:
             "双侧股髂闭塞或严重迂曲，无法建立入路",
             ("D2.3.R05",),
         )
-    if ifu == "不符":
+    if ifu == "不符合":
         return Candidate(
             "EVAR",
             CandidateStatus.EXCLUDED,
@@ -900,7 +924,7 @@ def _evar_candidate(state: GuidelineState) -> Candidate:
         reasons.append("瘤颈参数不全")
     if blocked is None:
         reasons.append("入路可行性未评估")
-    if ifu in ("未核验", "未选型号"):
+    if ifu in ("未核验", "未选择型号"):
         reasons.append("IFU 未核验（待核验候选）")
     elif ifu is None:
         reasons.append("IFU 未记录")
@@ -921,7 +945,7 @@ def _osr_candidate(state: GuidelineState) -> Candidate:
     """
     risk = _risk(state)
     evar_out = (
-        access_blocked(state) is True or _ifu(state) == "不符" or branch_involved(state) is True
+        access_blocked(state) is True or _ifu(state) == "不符合" or branch_involved(state) is True
     )
     if risk is None:
         return Candidate("OSR", CandidateStatus.UNASSESSED, "当前手术风险未评价")
@@ -951,7 +975,7 @@ def _d23_gaps(state: GuidelineState) -> tuple[str, ...]:
     if cta_evaluable(state) is None:
         gaps.append("N.CTA_STATUS：本次 CTA 对本节点任务的可评价性未记录")
     if _ifu(state) is None:
-        gaps.append("N.SEAL_IFU：器械 IFU 未记录（待核验候选）")
+        gaps.append("N.EVAR_IFU_STATUS：器械整体 IFU 未记录（待核验候选）")
     gaps.extend(missing_fields(state, _D23_FIELDS))
     return tuple(gaps)
 

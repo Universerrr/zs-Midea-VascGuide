@@ -30,10 +30,12 @@
     5 个工具**全部是确定性算子**，不是「交给 LLM 自行决定是否调用的 tool」。
     它们由代码写死调用，性质等同于 ``import math``；本层不得引入任何 LLM 客户端。
 
-当前状态：**5 个工具全部未实现**（:data:`IMPLEMENTED_TOOLS` 为空）。
-    每个工具都在 ``src/tools/<tool>.py`` 里写明了**阻塞原因**——不是「待办」，
-    而是缺什么具体资源。缺少资源的工具不应仓促实现，否则产生无法验证的产物。
-    因此本节点当前返回空的 ``tool_outputs``；下游据此保持谨慎（人工复核）。
+当前状态：**工具A（指南引擎）已实现，B–E 未实现**（:data:`IMPLEMENTED_TOOLS` 只含
+    ``guideline_engine``）。未实现的四个工具都在 ``src/tools/<tool>.py`` 的 ``SPEC`` 里
+    写明了**阻塞原因**——不是「待办」，而是缺什么具体资源：影像句柄与分割算法、
+    临床量表、历史病例库、模型系数。缺少资源的工具不应仓促实现，否则产生无法验证的产物。
+    计划内但未实现的工具不执行，但会以「未实现：<原因>」记进 ``tool_skips``，
+    下游据此保持谨慎（人工复核）。
 """
 
 from __future__ import annotations
@@ -133,8 +135,12 @@ def execution_node(state: PreopState) -> dict[str, Any]:
 
         · ``tool_outputs`` 以**工具键**为键；缺项即代表该工具未执行
           （与 ``..state`` 约定一致）；
-        · ``tool_skips`` 以**工具键**为键、值为失败原因，只记 ``BEST_EFFORT``
-          工具的失败。``REQUIRED`` 工具失败会直接抛出，不会出现在这里。
+        · ``tool_skips`` 以**工具键**为键、值为原因，记三种情况：
+          ``BEST_EFFORT`` 工具本次失败（值为 ``<异常类型>: <原因>``）、
+          **计划内但尚未实现**（值以「未实现：」开头，附 ``SPEC.blocked_reason``）、
+          以及 ``REQUIRED`` 工具失败——后者会直接抛出，不会出现在这里。
+          「未实现」也记进来，是因为它同样是「本次没拿到」：静默剔除会让下游
+          误以为该跑的都跑完了（急诊五段式的「CTA 未量化」就是这么丢的）。
 
     非模式出口（人工复核 / 资料核实）**不跑任何工具**：那两个出口的含义就是
     「判定依据不足，先别算」，此时跑工具等于用不可信输入产出看似正常的产物。
@@ -152,10 +158,34 @@ def execution_node(state: PreopState) -> dict[str, Any]:
         # REVIEW / VERIFY：无模式即无计划，返回空产物（不抛错，这是正常路径）。
         return {"tool_outputs": {}, "tool_skips": {}}
     plan = plan_for(result.mode)
+    ordered = execution_order(plan, IMPLEMENTED_TOOLS)
+    scheduled = {item.tool for item in ordered}
 
     outputs: dict[str, Any] = {}
     skips: dict[str, str] = {}
-    for item in execution_order(plan, IMPLEMENTED_TOOLS):
+
+    # 计划内但**尚未实现**的工具：不执行，但必须留下记录。
+    #
+    # 修前这里什么都不记 —— ``execution_order`` 只保留已实现的，于是四个未实现
+    # 工具既不执行也不进 ``tool_skips``，下游看到的是「该跑的都跑完了」。
+    # 后果很具体：急诊五段式的「待补关键资料」永远缺「CTA 未量化」这一条，
+    # 而它恰恰是最该被看到的那条。
+    #
+    # 为什么记进 ``tool_skips`` 而不抛错：这两种失败性质不同。``REQUIRED`` 工具
+    # **跑了但失败**必须抛（用缺失的上游算产物）；而**整个工具还没实现**是能力
+    # 缺口，用户知道它没实现，抛错只会让系统在当前阶段完全跑不动。区别写进
+    # 值里：前者是 ``<异常类型>: <原因>``，后者以「未实现」开头。
+    for item in plan:
+        if item.tool in scheduled:
+            continue
+        spec = SPEC_BY_KEY.get(item.tool)
+        if spec is None:
+            # 计划里出现未登记的工具，``execution_order`` 已经会抛错；这里只是
+            # 让「测试用假注册表替换」的场景不至于崩在 KeyError 上。
+            continue
+        skips[item.tool] = f"未实现：{spec.blocked_reason}"
+
+    for item in ordered:
         try:
             outputs[item.tool] = run_tool(item.tool, state, upstream=outputs)
         except Exception as exc:

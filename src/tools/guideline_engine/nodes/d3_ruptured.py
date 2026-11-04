@@ -17,7 +17,7 @@
     而不是「不判」。
 
     判据全部走 ``VascCase`` 现成字段：``n.neck_len`` / ``n.neck_d`` /
-    ``n.neck_angle``（解剖）、``n.seal_ifu``（IFU 结论）、
+    ``n.neck_angle``（解剖）、``n.evar_ifu_status``（**整体** IFU 适配）、
     ``n.access_occlusion`` / ``n.access_tortuosity``（入路）、
     ``v.sbp`` / ``v.conscious_change``（患者状态）。规格那 5 个 ``D3.*`` 字段
     有 4 个就是这样派生的；只有「团队资源 / 血液准备 / 麻醉 / 复苏」这 4 项
@@ -30,7 +30,7 @@
 
 ## 为什么病种域字段不进 ``VascCase``
 
-``VascCase`` 是路由专用（161 字段，进哈希）。``D3.TEAM_RESOURCE`` 这类字段
+``VascCase`` 是路由专用（162 字段，进哈希）。``D3.TEAM_RESOURCE`` 这类字段
 既不影响路由，也不需要进路由哈希——塞进去会让每一次路由哈希都随病种字段抖动。
 本文件因此把「能派生的派生，不能派生的留空 + 记缺口」，两点都不新增模型字段。
 """
@@ -48,7 +48,7 @@ from ....rules.router import (
     or_,
     token,
 )
-from ..state import Candidate, CandidateStatus, GuidelineState, NodeFn, NodeOutcome
+from ..state import Candidate, CandidateStatus, GuidelineState, Link, NodeFn, NodeOutcome
 from .common import (
     DisplayRule,
     RuleSlot,
@@ -74,7 +74,7 @@ _D3_SUSPECTED: frozenset[str] = D3_EMERGENCY_RULES - _D3_CONFIRMED
 #: 规格该节点共引用 5 个字段，其中 4 个能由 ``VascCase`` 现成字段派生，见下表::
 #:
 #:     D3.ANATOMY_INFO_STATUS  ← n.neck_len / n.neck_d / n.neck_angle 是否有值
-#:     N.EVAR_IFU_STATUS       ← n.seal_ifu（符合 / 不符 / 未核验 / 未选型号）
+#:     N.EVAR_IFU_STATUS       ← n.evar_ifu_status（独立字段，**不是** n.seal_ifu）
 #:     D3.ACCESS_PLAN          ← n.access_occlusion + n.access_tortuosity + cl.iliac_diam
 #:     D3.PATIENT_STATUS       ← v.sbp + v.conscious_change
 #:
@@ -119,12 +119,29 @@ def _d31_r01(state: GuidelineState) -> Verdict:
 
 
 def _d31_r02(state: GuidelineState) -> Verdict:
-    """临床怀疑型触发（疑似破裂 / 急性疼痛 / 可疑征象 / 无可靠 CTA）。
+    """P0-A：疑似 rAAA 背景下 SBP<80 或新发意识变化 → 血流动力学不稳定（``D3.1!11``）。
 
-    同样复用判定层结论：``G03.R04/R05/R06/R07/R12`` 都属「临床高度怀疑」，
-    与 R01 的「影像明确」分开记录，审计时才看得出是「拍到了」还是「怀疑」。
+    规格 G 列是**两段合取**：「在疑似 rAAA 背景下」**且**「SBP<80 mmHg 或
+    意识丧失/降低」。两段缺一不可：
+
+    1. **疑似背景** —— 读判定层结论 ``route.rule_id`` 是否属于「临床怀疑型」
+       触发（``G03.R04–R07``、``R16``）。不在这里重拼 ``c.extrav`` /
+       ``c.hematoma``：``G03.R01–R07`` 已经判过一遍，再拼就是同一事实的第二处判据。
+    2. **不稳定** —— 复用 :func:`_patient_evaluable`（它读的正是 ``V.SBP`` 与
+       ``V.CONSCIOUS_CHANGE``，且注释里写明与本规则同一阈值），不在判据里
+       再写一个 ``SBP < 80`` 字面量。
+
+    ⚠️ 旧实现只判第 1 段（``route.rule_id in _D3_SUSPECTED``），于是
+    ``G03.R16``（医生写「疑似破裂」、血压 120）也命中，危险提示里出现
+    「疑似 rAAA 背景下 SBP<80 mmHg」而病人血压是 120 —— 陈述与事实对不上。
     """
-    return state.route.rule_id in _D3_SUSPECTED
+    if state.route.rule_id not in _D3_SUSPECTED:
+        return False
+    evaluable = _patient_evaluable(state)
+    if evaluable is None:
+        # SBP 80–89 属临界：规格没给判据，保持「判不了」而不是判「未命中」。
+        return None
+    return evaluable is False
 
 
 def _d31_r03(state: GuidelineState) -> Verdict:
@@ -145,14 +162,30 @@ def _d31_r03(state: GuidelineState) -> Verdict:
     「不可评价」是「这个值的状态不明」，``D3.*`` 的「不可评价」是「影像
     确实无法评价」这个确定结论。
 
-    ⚠️ **端到端不可达，但不是「判据没写」**：``class_output`` 含 ``D3`` 只在
-    ``D3_EMERGENCY_RULES``（G03 九条）命中时发生，而那九条全部落在
-    ``_D3_CONFIRMED`` 或 ``_D3_SUSPECTED`` 里 —— ``R01``/``R02`` 必有一条先命中
-    （同为 P0-A 且声明在前）。所以本规则只在手动调用、或将来 R01/R02
-    的覆盖范围收缩时才会执行。保留真判据的理由：占位 ``return None`` 与
-    「实现了但被遮蔽」在工程上是两件事——后者不是待办，前者是。
+    ⚠️ ``D3.CTA_FEASIBLE`` 未记录时，**退到生命体征**而不是判「不知道」：
+    规格该行的允许值列写的是 ``D3.CTA_FEASIBLE;V.SBP;V.CONSCIOUS_CHANGE;
+    CL.AAA_RUPTURE`` —— 生命体征本就是本规则的合法输入。G 列问的是
+    「病人稳不稳到能等 CTA」，医生没填这一项时，用 ``SBP`` 与意识状态回答
+    同一问题不越界。没有这层回落时，``G03.R16``（医生写疑似破裂、血压正常、
+    未填 D3.CTA_FEASIBLE）会让 D3.1 七条规则全部不命中，链路直接断在分诊层。
+    回落判据复用 :func:`_patient_evaluable`，不另写阈值。
+
+    ⚠️ **可达性在 2026-11-03 发生变化**：``D3.1.R02`` 修严（真判 SBP<80 或
+    意识变化）之后，``G03.R16`` 这类「临床怀疑但血压正常」的病例不再被 R02
+    接管，本规则就真的会执行。此前 R02 用宽判据（``route.rule_id ∈
+    _D3_SUSPECTED``）吃掉了全部疑似病例，R03/R04 只由单测覆盖。
+
+    ⚠️ **只对「未记录」回落，不对「不确定」回落**：规格 J 列写的是
+    「不确定→紧急团队判断」——医生明确说了判不了，系统不该替他判。
+    两者在 ``eq`` 里都折成 ``None``，所以必须先读原始值 ``token`` 区分：
+    字段没填才走生命体征回落。
     """
-    return eq(token(state.node_field("D3.CTA_FEASIBLE")), "可以")
+    raw = token(state.node_field("D3.CTA_FEASIBLE"))
+    if raw is None:
+        # 医生没填「能否等 CTA」：用生命体征回答同一个问题（该行允许值列
+        # 本就含 V.SBP / V.CONSCIOUS_CHANGE）。稳定 → 能等；临界/缺失 → 判不了。
+        return _patient_evaluable(state)
+    return eq(raw, "可以")
 
 
 #: ``D3.CTA_COVERAGE`` 里表示「影像不足以判」的三档（规格 F 列值域）。
@@ -208,7 +241,21 @@ def _d31_r90(state: GuidelineState) -> Verdict:
 
 
 def _d31_r91(state: GuidelineState) -> Verdict:
-    """P3 出口：可靠评估支持**未见**破裂，且无任何阳性证据。"""
+    """P3 出口：可靠评估支持**未见**破裂，**且授权医生确认**（``D3.1!8``）。
+
+    G 列是两段合取，缺一段都不能回择期路径：
+
+    1. 影像三征象全部阴性；
+    2. **授权医生确认**未见破裂 —— 读 ``d.dx_context``。
+
+    为什么第 2 段必须判：``G03.R16``（医生写「疑似破裂」）也会把病人送进 D3，
+    此时若只看影像，一份「CTA 报阴性」的病例会被直接送回 D1.1/D2.1 ——
+    等于系统替医生撤销了他自己写的怀疑。规格特意加了「授权医生确认」，
+    防的就是这件事。未记录同样不算确认（``None is not True`` → False）。
+    """
+    confirmed = eq(token(state.case.d.dx_context), "确认")
+    if confirmed is not True:
+        return False
     return and_(
         eq(_rupture(state), "未见相关证据"),
         eq(_extrav(state), "未见"),
@@ -226,6 +273,8 @@ _D31_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d31_r01,
         exit_kind="escalate",
         exit_value="G05",
+        next_nodes=("G05", "D3.2"),
+        link=Link.PARALLEL,  # 规格 M 列：「G05急诊模式并进入D3.2」
         also_next="D3.2",
     ),
     RuleSlot(
@@ -236,7 +285,11 @@ _D31_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d31_r02,
         exit_kind="escalate",
         exit_value="G05",
-        also_next="D3.2",
+        # 规格 M 列值域只有 G05（「G05急诊模式；快速控制/修复评估」）。
+        # 修前写着 also_next="D3.2" —— 那是把 R01 的处置复制了过来。不稳定的
+        # 病人先稳定，不该同时讨论择期术式候选。
+        next_nodes=("G05",),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D3.1.R05",
@@ -244,9 +297,31 @@ _D31_SLOTS: tuple[RuleSlot, ...] = (
         source_row="D3.1!17",
         statement="破裂分级不可评价或与报告冲突 → 不得降级为「排除破裂」，保持急诊疑似",
         judge=_d31_r05,
-        exit_kind="escalate",
-        exit_value="G05",
-        also_next="D3.2",
+        # 规格 M 列：「下一节点/终点：D3.2 / 动作：D3.2或持续急诊评估」——
+        # 值域只有 D3.2，没有 G05。修前写成 escalate G05 是把「持续急诊评估」
+        # 当成了独立出口，而它描述的是 D3.2 内部的持续观察。
+        exit_kind="next",
+        exit_value="D3.2",
+        link=Link.EITHER,
+    ),
+    RuleSlot(
+        rule_id="D3.1.R90",
+        priority="P2",
+        source_row="D3.1!9",
+        statement="破裂状态或关键影像不可评价 → 保留疑似/不能排除，紧急团队复核",
+        judge=_d31_r90,
+        exit_kind="terminal",
+        exit_value="人工复核",
+    ),
+    RuleSlot(
+        rule_id="D3.1.R91",
+        priority="P3",
+        source_row="D3.1!8",
+        statement="可靠评估支持未见破裂且授权医生确认 → 按症状状态回 D1.1 或 D2.1",
+        judge=_d31_r91,
+        exit_kind="terminal",
+        exit_value="回 D1.1/D2.1（按症状归因）",
+        next_nodes=("G05", "D1.1", "D2.1"),
     ),
     RuleSlot(
         rule_id="D3.1.R03",
@@ -267,24 +342,6 @@ _D31_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d31_r04,
         exit_kind="next",
         exit_value="D3.2",
-    ),
-    RuleSlot(
-        rule_id="D3.1.R90",
-        priority="P2",
-        source_row="D3.1!9",
-        statement="破裂状态或关键影像不可评价 → 保留疑似/不能排除，紧急团队复核",
-        judge=_d31_r90,
-        exit_kind="terminal",
-        exit_value="人工复核",
-    ),
-    RuleSlot(
-        rule_id="D3.1.R91",
-        priority="P3",
-        source_row="D3.1!8",
-        statement="可靠评估支持未见破裂且授权医生确认 → 按症状状态回 D1.1 或 D2.1",
-        judge=_d31_r91,
-        exit_kind="terminal",
-        exit_value="回 D1.1/D2.1（按症状归因）",
     ),
 )
 
@@ -352,7 +409,7 @@ def _d32_r01(state: GuidelineState) -> Verdict:
     return and_(
         anatomy_available(state),
         not_(access_blocked(state)),
-        eq(token(state.case.n.seal_ifu), "符合"),
+        eq(token(state.case.n.evar_ifu_status), "符合"),
         _patient_evaluable(state),
     )
 
@@ -365,7 +422,7 @@ def _d32_r02(state: GuidelineState) -> Verdict:
     """
     return or_(
         access_blocked(state),
-        eq(token(state.case.n.seal_ifu), "不符"),
+        eq(token(state.case.n.evar_ifu_status), "不符合"),
     )
 
 
@@ -441,7 +498,7 @@ _D32_SLOTS: tuple[RuleSlot, ...] = (
     RuleSlot(
         rule_id="D3.2.R01",
         priority="P0-A",
-        source_row="D3.2!10",
+        source_row="D3.2!8",
         statement="破裂 AAA 解剖适合 EVAR 且团队/设备可用 → EVAR 为指南推荐的一线治疗选项（仍需术者即时确认）",
         judge=_d32_r01,
         exit_kind="terminal",
@@ -459,7 +516,7 @@ _D32_SLOTS: tuple[RuleSlot, ...] = (
     RuleSlot(
         rule_id="D3.2.R90",
         priority="P2",
-        source_row="D3.2!6",
+        source_row="D3.2!7",
         statement="急诊解剖资料不完整 → 不宣称 IFU 已符合，由急诊血管团队基于可用信息决策",
         judge=_d32_r90,
         exit_kind="terminal",
@@ -468,7 +525,7 @@ _D32_SLOTS: tuple[RuleSlot, ...] = (
     RuleSlot(
         rule_id="D3.2.R03",
         priority="P3",
-        source_row="D3.2!16",
+        source_row="D3.2!10",
         statement="立即提示可实施方案与资源缺口；现场救援或转诊由临床团队决定",
         judge=_d32_r03,
         exit_kind="terminal",
@@ -477,7 +534,7 @@ _D32_SLOTS: tuple[RuleSlot, ...] = (
     RuleSlot(
         rule_id="D3.2.R04",
         priority="P3",
-        source_row="D3.2!15",
+        source_row="D3.2!14",
         statement="解剖可行且入路无阻断 → EVAR 候选；记录具体依据与 IFU 核验程度",
         judge=_d32_r04,
         exit_kind="terminal",
@@ -486,7 +543,7 @@ _D32_SLOTS: tuple[RuleSlot, ...] = (
     RuleSlot(
         rule_id="D3.2.R91",
         priority="P3",
-        source_row="D3.2!5",
+        source_row="D3.2!6",
         statement="可及时安全实施且解剖候选符合 → EVAR 候选；否则评估 OSR／现场救援／转诊",
         judge=_d32_r91,
         exit_kind="terminal",
@@ -498,13 +555,13 @@ _D32_SLOTS: tuple[RuleSlot, ...] = (
 _D32_DISPLAY_RULES: tuple[DisplayRule, ...] = (
     DisplayRule(
         rule_id="D3.2.R06",
-        source_row="D3.2!18",
+        source_row="D3.2!15",
         statement="显示缺失的术者、手术室、影像、器械、血库/ICU 能力；现场救援或转诊由临床团队决定",
         judge=_d32_r06,
     ),
     DisplayRule(
         rule_id="D3.2.R07",
-        source_row="D3.2!19",
+        source_row="D3.2!17",
         statement="疑似/明确 rAAA 并行组织复苏、血液准备、手术室与修复策略；不生成具体复苏医嘱或固定目标",
         judge=_d32_r07,
     ),
@@ -521,8 +578,8 @@ def _d32_gaps(state: GuidelineState) -> tuple[str, ...]:
 
     if anatomy_available(state) is not True:
         gaps.append("解剖参数不足以比较 EVAR 与 OSR（瘤颈长度/直径/角度）")
-    if eq(token(state.case.n.seal_ifu), "符合", "不符") is None:
-        gaps.append("EVAR 器械 IFU 未核验（seal_ifu = 未核验/未选型号）")
+    if eq(token(state.case.n.evar_ifu_status), "符合", "不符合") is None:
+        gaps.append("EVAR 器械整体 IFU 未核验（evar_ifu_status = 未核验/未选择型号）")
     if access_blocked(state) is None:
         gaps.append("入路可行性未评估（股髂直径/钙化/迂曲）")
     if _patient_evaluable(state) is None:
@@ -548,7 +605,10 @@ def _evar_candidate(state: GuidelineState) -> Candidate:
     """
     anatomy = anatomy_available(state)
     blocked = access_blocked(state)
-    ifu_ok = eq(token(state.case.n.seal_ifu), "符合")
+    ifu_ok = eq(token(state.case.n.evar_ifu_status), "符合")
+    # 近端密封区的核验结果是**另一件事**，只在解释「为什么整体还没核」时用：
+    # 近端已确认 + 整体未记录 = 只核了一半，措辞要说清楚，不能含糊成「IFU 未核验」。
+    proximal_ok = eq(token(state.case.n.seal_ifu), "符合")
     evaluable = _patient_evaluable(state)
 
     if blocked is True:
@@ -592,7 +652,9 @@ def _evar_candidate(state: GuidelineState) -> Candidate:
     if blocked is None:
         reasons.append("入路可行性未评估")
     if ifu_ok is None:
-        reasons.append("IFU 未核验")
+        reasons.append(
+            "整体 IFU 未核验，仅近端密封区已确认" if proximal_ok is True else "整体 IFU 未核验"
+        )
     if evaluable is None:
         reasons.append("患者状态待明确")
     elif evaluable is False:
@@ -625,7 +687,7 @@ def _osr_candidate(state: GuidelineState) -> Candidate:
             ("D3.2.R03",),
         )
     evar_excluded = (
-        access_blocked(state) is True or eq(token(state.case.n.seal_ifu), "符合") is False
+        access_blocked(state) is True or eq(token(state.case.n.evar_ifu_status), "符合") is False
     )
     reason = (
         "EVAR 不可行，本方向成为唯一候选；开放解剖与麻醉评估无输入"
@@ -783,7 +845,7 @@ def _d33_r01(state: GuidelineState) -> Verdict:
 
 
 def _d33_r90(state: GuidelineState) -> Verdict:
-    """P2：五项规定字段任一未完成 → 不得自动判定不修复（``D3.3!6``）。
+    """P2：五项规定字段任一未完成 → 不得自动判定不修复（``D3.3!7``）。
 
     清单取规格 R90 的 F 列（可行性／意愿／能力／预后／目标）。它与 R03 的
     F 列不是同一组：R03 少 ``D3.PROGNOSIS``、多 ``D3.NONREPAIR_REASON``。
@@ -860,7 +922,7 @@ _D33_SLOTS: tuple[RuleSlot, ...] = (
     RuleSlot(
         rule_id="D3.3.R90",
         priority="P2",
-        source_row="D3.3!6",
+        source_row="D3.3!7",
         statement="患者意愿、决策能力、修复可行性或获益评估未完成 → 不得自动判定不修复",
         judge=_d33_r90,
         exit_kind="terminal",
@@ -869,7 +931,7 @@ _D33_SLOTS: tuple[RuleSlot, ...] = (
     RuleSlot(
         rule_id="D3.3.R91",
         priority="P3",
-        source_row="D3.3!5",
+        source_row="D3.3!6",
         statement="授权医生记录可行性、获益风险、患者/代理意愿与转诊可能性后确认处置",
         judge=_d33_r91,
         exit_kind="terminal",
@@ -909,14 +971,11 @@ NODES: dict[str, NodeFn] = {
 #: 已登记的规则 → 规格源行。``D3.1`` 7 条 + ``D3.2`` 8 条 + ``D3.3`` 5 条（共 20）。
 #:
 #: 可达性分三层，不要笼统说「已实现」：
-#:   * ``D3.1.R03/R04`` —— 图可达、**求值不可达**：``class_output`` 含 ``D3``
-#:     只在 ``D3_EMERGENCY_RULES``（G03 九条）命中时发生，而那九条**全部**
-#:     落在 ``_D3_CONFIRMED`` 或 ``_D3_SUSPECTED`` 里 —— 即 ``R01``/``R02``
-#:     必有一条先命中（同为 P0-A、声明在前）。判据是真判据，不是占位；
-#:     只在手动调用或 R01/R02 覆盖范围收缩时执行。
-#:   * ``D3.3.R01–R03`` —— 判据完整、**图不可达**：规格 M 列对 D3.3 每行都是
-#:     「人工」，没有入边。见该节模块注释。
-#:   * 其余 14 条 —— 三层全通，由端到端用例覆盖。
+#:   * ``D3.3.R01–R03/R90/R91`` —— 判据完整、**图不可达**：规格 M 列对 D3.3
+#:     每行都是「人工决策／医生确认／终点动作」，没有入边。见该节模块注释。
+#:   * 其余 15 条 —— 三层全通。``D3.1.R03/R04`` 原本也在不可达之列（被 R02
+#:     的宽判据遮蔽），2026-11-03 把 R02 修严成「疑似 **且** 不稳定」之后，
+#:     「临床怀疑但血压正常」的病例会落到它们身上，端到端已实测命中。
 RULE_ROWS: dict[str, str] = {
     **{slot.rule_id: slot.source_row for slot in (*_D31_SLOTS, *_D32_SLOTS, *_D33_SLOTS)},
     **{rule.rule_id: rule.source_row for rule in _D32_DISPLAY_RULES},

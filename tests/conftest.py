@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -136,6 +137,7 @@ def baseline_kwargs() -> dict[str, Any]:
             "neck_d": 22.0,
             "neck_angle": 20.0,
             "seal_ifu": "符合",
+            "evar_ifu_status": "符合",
             "iliac_bilat": "无",
             "iia_left": "通畅",
             "iia_right": "通畅",
@@ -230,3 +232,22 @@ def emergency_case() -> VascCase:
 def complex_case() -> VascCase:
     """短颈 8mm：命中 G04 阻断型规则（G06）。"""
     return make_case(case_id="BASE-COMPLEX", n={"neck_len": 8.0})
+
+
+#: 规格工作簿的定位顺序 —— **仓库内优先**。
+#:
+#: 为什么要有这个常量：三条「源行对账」测试（router 66 条 / 病种 172 条 / M 列值域）
+#: 都需要读工作簿。此前三处各硬编码了一份桌面绝对路径，规格一移进 ``docs/``
+#: 就三处同时静默 skip —— 而对账测试一旦 skip，源行漂移就再也没有东西拦得住。
+#: 统一在这里解析：先找仓库内副本，再退到旧的位置，都没有才 ``None``（调用方 skip）。
+SPEC_XLSX: Path | None = next(
+    (
+        p
+        for p in (
+            Path(__file__).resolve().parents[1] / "docs" / "VascGuide_V3.6.2.xlsx",
+            Path.home() / "Desktop" / "VascGuide_V3.6.2.xlsx",
+        )
+        if p.exists()
+    ),
+    None,
+)

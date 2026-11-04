@@ -1,11 +1,29 @@
-"""V3.1(2) 术前字段模型 —— **160 字段 / 14 个按域子模型**。
+"""V3.6.2 术前字段模型 —— **162 字段 / 14 个按域子模型**。
 
-口径（详见映射表 `11_字段模型底稿` 与 `12_工程决策`）::
+口径（对着 V3.6.2 工作簿逐条数出来，不是估算）::
 
-    170（V3.1(2) 原文 169 + 补入 1 个 N.ACCESS_TORTUOSITY）
-      − 7  判定产物：G03.P01–P04、N.COMPLEX_STATUS、R.CLINICAL_AORTIC_SUSPECT、CL.TAAA_IV
+    172（V3.6.2 字段 ID 去重）
+      − 3  判定产物：N.COMPLEX_STATUS、CL.TAAA_IV、R.CLINICAL_AORTIC_SUSPECT
       − 3  物化派生：L.HB_DELTA、V.NEWS2_SCORE、V.NEWS2_SINGLE3
-      = 160
+      − 3  并入同名上位字段：CL.FISTULA_TYPE→CL.FISTULA、S.GI_BLEED_TYPE→S.GI_BLEED、
+           S.LIMB_SIGNS→S.LIMB
+      − 2  归病种通道：INF.IGG4、INF.PET_MRI（D5.3 专用，走 ``node_inputs``）
+      + 1  补入：N.ACCESS_TORTUOSITY（规格未单列，入路评估要用）
+      = 162
+
+**``N.EVAR_IFU_STATUS`` 为什么不再并入 ``N.SEAL_IFU``（2026-11-04 改）**：
+两者覆盖面不同——前者是整体适配（近远端密封 + 瘤颈 + 分支 + 髂股入路 + 组件兼容），
+后者只管近端密封区。规格在 ``N.SEAL_IFU`` 的判据列写死了「**只代表近端密封项，
+不代表整体 EVAR 适配**」。合并后 D2.3 / D3.2 共 12 条规则在按规格判「整体」，
+实际拿到的却是「近端」，会把「近端合格」渲染成「IFU 符合」。故拆为独立字段。
+
+**为什么判定产物不进模型**：它们是规则算出来的，不是抽取出来的病例事实。
+放进来会让「输入」与「输出」混在一处，也会让字段数随规则变化而漂移。
+它们是 ``RouteResult`` 的字段，由需要的一方从 ``route_result`` 取。
+
+**为什么病种域字段不进模型**：``D1.*`` / ``D3.*`` 是专科评估时医生填的记录，
+不影响路由，也不该进路由哈希；它们走 ``ToolRequest.node_inputs`` 通道。
+详见 :class:`~src.tools.guideline_engine.state.GuidelineState`。
 
 **落点纪律（W12）**：14 个子模型类与组装类 :class:`VascCase` 全部写在**本文件**，
 不新建 ``v31/`` 子包；导入路径 ``from src.models.preop import VascCase`` 全程不变。
@@ -18,7 +36,7 @@
 3. **有阈值的判断存原值**（颈长、Hb、SBP、eGFR…），阈值留在规则层；
    只有「本身无阈值」的事实才用布尔 / 三态枚举。反例 ``S.PAIN_SEVERE_SCREEN`` 保留但**仅展示**。
 
-非域字段（不计入 160）
+非域字段（不计入 162）
 ----------------------
 ``case_id``（系统身份）、``urgency_flag``（人工覆盖通道）、``urgency_flag_audit``（留痕）、
 ``field_evidence``（字段级证据链）挂在 :class:`VascCase` 上，属于模型级的横切属性。
@@ -52,6 +70,22 @@ CtaGrade = Literal["明确", "可疑", "未见", "不可评价"]
 
 Label = Literal["D1", "D2", "D3", "D4", "D5", "D6", "D7", "Ⅳ型TAAA扩展"]
 """病种标签（G08 / K.CLASS_OUTPUT 共用）。"""
+
+IfuStatus = Literal["符合", "不符合", "未核验", "无法评价", "未选择型号"]
+"""IFU 核验结论五态 —— **逐字**取规格「允许值」列。
+
+``N.SEAL_IFU``（``G04!11`` / ``D1.3!3``）与 ``N.EVAR_IFU_STATUS``（``D2.3!3`` /
+``D3.2!3``）共用这一套取值，但**不是同一个字段**：
+
+    ``N.SEAL_IFU``        只判**近端密封区**。规格 G 列末句：「只代表近端密封项，
+                          **不代表整体 EVAR 适配**」。
+    ``N.EVAR_IFU_STATUS`` 判**整体**适配：近远端密封、瘤颈、分支、髂股入路、
+                          组件兼容与限制，且绑定品牌/型号/地区注册/IFU 版本。
+
+为什么必须是两个字段而不是一个：整体符合 ⇒ 近端必然符合，反之不成立。合并后
+「近端合格」会被当成「整体合格」，而 ``D2.3.R06`` 明令「IFU 缺失、地区不适用或
+型号未指定 → 只标记『待核验候选』，**不得输出『符合 IFU』**」。
+"""
 
 
 # ===========================================================================
@@ -278,10 +312,10 @@ class CtaDomain(_StrictDomain):
 
 
 # ===========================================================================
-# N. 解剖与病生理（27）
+# N. 解剖与病生理（28）
 # ===========================================================================
 class AnatomyDomain(_StrictDomain):
-    """N. 解剖、合并症与病因状态（27 字段）。N.COMPLEX_STATUS 为判定产物，不在此处。"""
+    """N. 解剖、合并症与病因状态（28 字段）。N.COMPLEX_STATUS 为判定产物，不在此处。"""
 
     cta_status: Literal["完整", "部分", "缺失", "冲突"] | None = None  # 判断复杂解剖的 CTA
     neck_len: float | None = None  # 肾下瘤颈长度 mm
@@ -292,7 +326,10 @@ class AnatomyDomain(_StrictDomain):
     thoracic: Literal["是", "否", "不可评价"] | None = None  # 是否明显累及降胸主动脉
     neck_d: float | None = None  # 近端瘤颈最大直径 mm
     neck_angle: float | None = None  # 近端瘤颈角度 度（0–180）
-    seal_ifu: Literal["符合", "不符", "未核验", "未选型号"] | None = None  # 近端密封区 IFU
+    seal_ifu: IfuStatus | None = None  # N.SEAL_IFU：**仅近端密封区**是否符合 IFU
+    evar_ifu_status: IfuStatus | None = (
+        None  # N.EVAR_IFU_STATUS：**整体** EVAR 器械适配（含髂股入路/组件兼容）
+    )
     iliac_bilat: Literal["双侧", "单侧", "无", "不详"] | None = None  # 双侧髂动脉瘤/重要累及
     iia_left: Literal["通畅", "闭塞", "严重狭窄", "未知"] | None = None  # 左内髂灌注
     iia_right: Literal["通畅", "闭塞", "严重狭窄", "未知"] | None = None  # 右内髂灌注
@@ -300,7 +337,7 @@ class AnatomyDomain(_StrictDomain):
         None  # 双侧常规髂股通路是否存在闭塞
     )
     access_tortuosity: Literal["双侧严重迂曲", "单侧严重迂曲", "未见严重迂曲", "未知"] | None = (
-        None  # 双侧髂动脉入路迂曲（V3.1(2) 补入，路由暂不消费）
+        None  # 双侧髂动脉入路迂曲（规格未单列；工具A 入路评估消费，路由层不读）
     )
     genetic_ctx: Literal["确诊", "疑似遗传背景", "无已知阳性线索", "未评价", "证据冲突"] | None = (
         None  # 遗传背景主状态（由 GEN.* 明细派生；不新增 D8，作病因修饰）
@@ -472,7 +509,7 @@ class ResultDomain(_StrictDomain):
 # 组装
 # ===========================================================================
 class VascCase(BaseModel):
-    """V3.1(2) 术前病例 —— 161 个路由字段（14 个域子模型）+ 4 个非域字段。
+    """V3.6.2 术前病例 —— 162 个路由字段（14 个域子模型）+ 4 个非域字段。
 
     访问形式：``case.n.neck_len`` / ``case.cl.aaa_diam`` / ``case.p.age``。
 
@@ -500,7 +537,7 @@ class VascCase(BaseModel):
     k: CheckDomain = Field(default_factory=CheckDomain)
     r: ResultDomain = Field(default_factory=ResultDomain)
 
-    # ---- 非域字段（不计入 160）----
+    # ---- 非域字段（不计入 162）----
     urgency_flag: bool = Field(
         default=False,
         description="人工置位：医生主动标记「本次必须按急症处理」（可越级进 G05）。",
@@ -533,7 +570,7 @@ class VascCase(BaseModel):
         }
 
 
-# 各域字段数（与 V3.1(2) 一一对应；改动必须同步映射表 11 表）
+# 各域字段数（与 V3.6.2 一一对应；改动必须同步本文件顶部的口径算式）
 DOMAIN_FIELD_COUNTS: dict[str, int] = {
     "p": 4,
     "t": 1,
@@ -543,14 +580,14 @@ DOMAIN_FIELD_COUNTS: dict[str, int] = {
     "v": 17,
     "lab": 11,
     "c": 20,
-    "n": 27,
+    "n": 28,
     "gen": 5,
     "inf": 6,
     "cl": 18,
     "k": 5,
     "r": 2,
 }
-TOTAL_FIELD_COUNT = sum(DOMAIN_FIELD_COUNTS.values())  # = 161
+TOTAL_FIELD_COUNT = sum(DOMAIN_FIELD_COUNTS.values())  # = 162
 
 
 def _check_field_counts() -> None:
@@ -587,7 +624,7 @@ UNCERTAIN_TOKENS: frozenset[str] = frozenset(
         "未知",
         "不详",
         "未核验",
-        "未选型号",
+        "未选择型号",
         "未提及",
         "证据冲突",
         "冲突",

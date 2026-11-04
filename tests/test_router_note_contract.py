@@ -1,10 +1,10 @@
 """判定结论自证契约 —— 每条 ``RouteResult`` 必须让人**独立复核**「为什么是这个结论」。
 
-V3.1(2) 重写后，旧的 ``note`` 文本契约（``<结论句>（<检查项>；…）``）已随十步流水线一起废弃。
+V3.6.2 下，旧的 ``note`` 文本契约（``<结论句>（<检查项>；…）``）已随十步流水线一起废弃。
 取而代之的是**四个可机械校验的自证要素**：
 
 1. ``rule_id`` 可回溯：命中的规则必须在 ``RULES`` 里（或显式登记为人工覆盖），
-   且每条规则带 V3.1(2) 源行号 —— 否则「某条规则判了它」这句话无法查证。
+   且每条规则带 V3.6.2 源行号 —— 否则「某条规则判了它」这句话无法查证。
 2. ``reason`` 说人话：非空、含规则编号、不含 ``None``/``nan`` 这类占位泄漏。
 3. ``evidence_gaps`` 可用：每条路径都能在模型里解析；**且不得把已命中规则的字段
    算成缺口**（命中的规则已经闭环，它的其余字段为空是正常状态）。
@@ -26,10 +26,10 @@ import pytest
 from conftest import make_case
 
 from src.models.preop.case import VascCase
-from src.rules.router import RULES, RouteKind, RouteResult, _read_path, route
+from src.rules.router import RULES, RouteKind, RouteMode, RouteResult, _read_path, route
 
 ENGINE_RULE_IDS = frozenset({"MANUAL.URGENCY", "FALLBACK.VERIFY"})
-"""两个**不是 V3.1(2) 规则**的标识，必须显式白名单：
+"""两个**不是 V3.6.2 规则**的标识，必须显式白名单：
 
 - ``MANUAL.URGENCY``：医生置位 ``urgency_flag``，跳过自动判定；
 - ``FALLBACK.VERIFY``：没有任何规则能判定（资料不足）——兜底不是规则判的，
@@ -64,7 +64,7 @@ class TestRuleIdIsTraceable:
 
     @pytest.mark.parametrize("label", sorted(SCENARIOS))
     def test_rule_id_has_a_source_cell(self, label: str) -> None:
-        """能回溯到 V3.1(2) 的具体单元格，否则「规则判的」这句话没法查。"""
+        """能回溯到 V3.6.2 的具体单元格，否则「规则判的」这句话没法查。"""
         rule_id = _results()[label].rule_id
         if rule_id in ENGINE_RULE_IDS:
             pytest.skip("兜底 / 人工越级不是规格规则")
@@ -155,10 +155,21 @@ class TestConfidenceIsRecomputable:
         assert {r.confidence_level for r in _results().values()} <= {"高", "中", "低"}
 
     def test_low_implies_verify_or_review(self) -> None:
-        """置信度低却直接进模式（还带标签）是最危险的组合。"""
+        """置信度低却直接进模式（还带标签）是最危险的组合。
+
+        例外只有一种：**急诊 + 零病种标签**。``G03.R09/R10/R20`` 确实没有
+        D1–D7 可归，分流结论本身是确定的（低血压就是低血压），缺的是病种级
+        建议。这类病例已由 ``manual_review_required`` 强制人工接手，不属于
+        「低置信度还假装有结论」——它们是「置信度低，且明确说了没有结论」。
+        """
         for label, result in _results().items():
-            if result.confidence_level == "低":
-                assert result.kind in (RouteKind.VERIFY, RouteKind.REVIEW), label
+            if result.confidence_level != "低":
+                continue
+            if result.mode is RouteMode.EMERGENCY and not result.class_output:
+                assert result.kind is RouteKind.MODE, label
+                assert any("未匹配 D1–D7" in gap for gap in result.evidence_gaps), label
+                continue
+            assert result.kind in (RouteKind.VERIFY, RouteKind.REVIEW), label
 
 
 # ===========================================================================

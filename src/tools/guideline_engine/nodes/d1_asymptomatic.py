@@ -58,6 +58,7 @@ from ..state import (
     CandidateStatus,
     GuidelineEntry,
     GuidelineState,
+    Link,
     NodeFn,
     NodeOutcome,
 )
@@ -73,7 +74,7 @@ from .common import (
     display_entries,
     evaluate_node,
     gap_if_missing,
-    is_uncertain,
+    is_spec_uncertain,
     missing_fields,
     recorded,
     sex_threshold,
@@ -112,6 +113,43 @@ def _special_morphology(state: GuidelineState) -> Verdict:
     )
 
 
+def _d11_special_targets(state: GuidelineState) -> tuple[str, ...]:
+    """``D1.1.R07`` 的去处 —— 规格 G 列**逐项指定**，不是同一句话的几种说法。
+
+    规格原文：「囊状/假性病变→D5.3；炎症性 AAA→D5.3；遗传背景→D1.2 个体化阈值；
+    感染或瘘→D4.1。**多标签可以并存**。」
+
+    ===================  ==========================================
+    证据                  去处
+    ===================  ==========================================
+    感染（医师明确/高度怀疑）  D4.1 感染分诊
+    囊状 / 假性 / 炎症性     D5.3 特殊形态专科评估
+    遗传背景               D1.2 个体化阈值
+    ===================  ==========================================
+
+    排序按临床紧迫度，第一个即主出口：感染要清创与抗感染，先于形态学评估；
+    遗传只影响阈值口径，最后。两病因并存时（炎症 + 感染）两个节点都去。
+
+    两条**不走本条**的路，写在这里免得被当成漏判：
+
+    · 纯遗传背景 → ``R10``（同 P1、声明在后、判据更专）；
+    · 纯主动脉肠/腔静脉瘘 → ``G08.R04`` 会把它分类成 D4，入口直接是 ``D4.1``，
+      到不了 ``D1.1``。
+    """
+    targets: list[str] = []
+    if eq(token(state.case.n.infection_ctx), "医师明确", "高度怀疑") is True:
+        targets.append("D4.1")
+    if (
+        eq(token(state.case.cl.saccular), "明确", "疑似") is True
+        or eq(token(state.case.cl.pseudo), "明确", "疑似") is True
+        or eq(token(state.case.n.inflammatory_ctx), "临床确认", "影像高度提示") is True
+    ):
+        targets.append("D5.3")
+    if _genetic_clue(state) is True:
+        targets.append("D1.2")
+    return tuple(targets)
+
+
 def _genetic_clue(state: GuidelineState) -> Verdict:
     """遗传评估线索：确诊/疑似遗传背景，或首次发病 <60 岁。
 
@@ -127,7 +165,7 @@ def _genetic_clue(state: GuidelineState) -> Verdict:
     young = True if onset is not None and onset < 60 else None
 
     family = state.node_field("D1.FAMILY_HISTORY")
-    if family is None or is_uncertain(family):
+    if family is None or is_spec_uncertain(family):
         by_family = None
     else:
         by_family = family != "阴性"
@@ -217,7 +255,11 @@ def _d11_r05(state: GuidelineState) -> Verdict:
 
 
 def _d11_r07(state: GuidelineState) -> Verdict:
-    """P1：特殊形态/病因 → 转 D5.3 / D4.1 专项评估，不套用普通梭形 AAA 阈值。"""
+    """P1：不适用普通 AAA 单一路径的特殊形态/病因。
+
+    判据仍是「有没有需要单独评估的病变」——**去哪几个节点由
+    :func:`_d11_special_targets` 按病因决定**，在 :func:`d1_1` 里落到出口上。
+    """
     return _special_morphology(state)
 
 
@@ -264,6 +306,8 @@ _D11_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d11_r01,
         exit_kind="escalate",
         exit_value="G03",
+        next_nodes=("D2.1", "G03", "D3.1"),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D1.1.R02",
@@ -273,6 +317,8 @@ _D11_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d11_r02,
         exit_kind="terminal",
         exit_value="疑似快速增长（年化 ≥10 mm），待复测复核",
+        next_nodes=("D1.1", "D1.2"),
+        link=Link.FOLLOW_UP,
     ),
     RuleSlot(
         rule_id="D1.1.R05",
@@ -287,10 +333,16 @@ _D11_SLOTS: tuple[RuleSlot, ...] = (
         rule_id="D1.1.R07",
         priority="P1",
         source_row="D1.1!22",
-        statement="囊状/假性/炎症性/感染性病变 → 转 D5.3 / D4.1 专项评估，不套用普通梭形阈值",
+        statement="囊状/假性/炎症性/感染性病变 → 按病因转 D5.3 / D4.1 / D1.2 专项评估，"
+        "不套用普通梭形阈值",
         judge=_d11_r07,
-        exit_kind="terminal",
-        exit_value="特殊形态/病因：转 D5.3 或 D4.1 专项评估",
+        exit_kind="next",
+        # 默认主出口取 D5.3（形态/炎症是本条最常见的触发）；实际去向在 ``d1_1``
+        # 里按病因收窄——规格是**分派**，不是「三个都去」。
+        exit_value="D5.3",
+        next_nodes=("D1.2", "D4.1", "D5.3"),
+        # 「多标签可以并存」：炎症 + 感染同时成立时 D5.3 与 D4.1 都要执行。
+        link=Link.PARALLEL,
     ),
     RuleSlot(
         rule_id="D1.1.R10",
@@ -336,6 +388,7 @@ _D11_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d11_r91,
         exit_kind="terminal",
         exit_value="监测／风险管理（按性别与直径安排随访）",
+        next_nodes=("D1.2", "D2.1", "D4.1", "D5.3"),
     ),
 )
 
@@ -406,6 +459,20 @@ def d1_1(state: GuidelineState) -> NodeOutcome:
     ``R03``/``R04``（P3 的监测出口）永远不执行——分档结论就丢了。
     """
     outcome = evaluate_node("D1.1", state, _D11_SLOTS)
+
+    # R07 的规格值是**按病因分派**（D1.2 / D4.1 / D5.3），不是「三个都去」。
+    # 槽位只能写一个静态值域，实际去哪几个取决于本病例检出了哪些病因，
+    # 所以在节点层收窄；多病因并存时按并行展开（``engine._walk`` 依 link 处理）。
+    if outcome.verdicts.get("D1.1.R07") is True:
+        targets = _d11_special_targets(state)
+        if targets:
+            outcome = replace(
+                outcome,
+                next_node=targets[0],
+                next_nodes=targets,
+                link=Link.PARALLEL if len(targets) > 1 else Link.EITHER,
+            )
+
     gaps = _d11_gaps(state)
     if gaps:
         outcome = replace(outcome, gaps=gaps)
@@ -739,6 +806,7 @@ _D12_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d12_r06,
         exit_kind="terminal",
         exit_value="待医生确认的优化清单与复评时间",
+        next_nodes=("D1.2", "D1.3"),
     ),
     RuleSlot(
         rule_id="D1.2.R91",
@@ -910,7 +978,7 @@ _D13_DISPLAY_RULES: tuple[DisplayRule, ...] = (
 def _d13_r90(state: GuidelineState) -> Verdict:
     """P2：关键解剖、IFU 版本或入路资料缺失 → 只输出草案，不批准具体术式。
 
-    只判**完全没记录**的项。``seal_ifu = 未核验/未选型号`` **不**算缺失：本系统
+    只判**完全没记录**的项。``seal_ifu = 未核验/未选择型号`` **不**算缺失：本系统
     按规格明令不在本节点选器械型号（``D1.3.R03``/``R06``），「未核验」是结构性
     常态而非缺陷，据它阻断会让所有病例都停在草案。
 
@@ -936,7 +1004,7 @@ def _d13_r08(state: GuidelineState) -> Verdict:
     """
     evar_out = or_(
         access_blocked(state),
-        eq(token(state.case.n.seal_ifu), "不符"),
+        eq(token(state.case.n.seal_ifu), "不符合"),
         anatomy_available(state) is False,
     )
     return and_(evar_out, eq(_d12_value(state, "D1.OP_FITNESS"), "当前不适合"))
@@ -953,7 +1021,7 @@ def _d13_r06(state: GuidelineState) -> Verdict:
     与 ``D3.2.R02`` 判同一个字段，但出口不同：急诊判「评估 OSR」（等不起 FEVAR），
     择期判「转复杂规划」（等得起，FEVAR/BEVAR 与复杂开放修复都要比）。
     """
-    return eq(token(state.case.n.seal_ifu), "不符")
+    return eq(token(state.case.n.seal_ifu), "不符合")
 
 
 def _d13_r04(state: GuidelineState) -> Verdict:
@@ -1001,6 +1069,8 @@ _D13_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d13_r03,
         exit_kind="escalate",
         exit_value="G06",
+        next_nodes=("G06",),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D1.3.R06",
@@ -1010,6 +1080,8 @@ _D13_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d13_r06,
         exit_kind="escalate",
         exit_value="G06",
+        next_nodes=("G06",),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D1.3.R04",
@@ -1049,7 +1121,7 @@ def _evar_candidate(state: GuidelineState) -> Candidate:
             "双侧股髂闭塞或严重迂曲，无法建立入路",
             ("D1.3.R01",),
         )
-    if ifu == "不符":
+    if ifu == "不符合":
         return Candidate(
             "EVAR",
             CandidateStatus.EXCLUDED,
@@ -1085,7 +1157,7 @@ def _evar_candidate(state: GuidelineState) -> Candidate:
         reasons.append("入路可行性未评估")
     if ifu == "符合":
         reasons.append("远端密封区（D1.DISTAL_SEAL）未评估")
-    elif ifu in ("未核验", "未选型号"):
+    elif ifu in ("未核验", "未选择型号"):
         reasons.append("IFU 未核验（未选定型号，无法逐项核对）")
     else:
         reasons.append("IFU 未记录")
@@ -1158,7 +1230,7 @@ def _d13_gaps(state: GuidelineState) -> tuple[str, ...]:
     seal = token(state.case.n.seal_ifu)
     if seal is None:
         gaps.append("N.SEAL_IFU：器械近端密封区 IFU 未记录")
-    elif seal in ("未核验", "未选型号"):
+    elif seal in ("未核验", "未选择型号"):
         gaps.append("N.SEAL_IFU：未选定型号，无法逐项核对正式 IFU")
 
     if recorded(state, "D1.DISTAL_SEAL") is not True:

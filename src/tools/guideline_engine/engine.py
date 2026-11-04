@@ -1,62 +1,57 @@
-"""工具A · 指南引擎 —— 病种 + 解剖分型 + 直径 → 指南推荐条目。
+"""工具A · 指南引擎 —— 病种 + 解剖分型 + 直径 → 病种层结论。
 
 定位：
-    把「病例落在哪一档」翻译成「指南怎么说」。这是唯一能产出**指南原文级**依据的
-    工具，也是「病例锚定」在输出侧的落点：每条推荐都要能回溯到
-    指南章节 → 推荐序号 → DOI。
+    把「病例落在哪一档」翻译成「规格这一档要求做什么」。这是唯一能产出
+    **逐条可回溯到规格行**的结论的工具，也是「病例锚定」在输出侧的落点：
+    每条结论都带 ``rule_id`` + ``source_row``（如 ``D3.1!10``），审计时可回查原文。
 
-输入契约（``SPEC.consumes``）：
-    ``case.cl.diag_multi``       病种标签 —— 决定查哪一族条目
-    ``case.c.maxd``              主动脉最大径（CTA 报告提取值）—— 决定 A01（小型）/
-                                 A02（较大）档位。**不是** ``cl.aaa_diam``：后者是
-                                 工具 B 的影像量化值，用报告值才能保证总有输入
-                                 （B6 回落口径）
-    ``route_result.cl_taaa_iv``  解剖分型 —— 决定条目子集。取值 符合 / 疑似 /
-                                 不符合 / 不可评价。「不可评价」必须单独处理：
-                                 资料不足 ≠ 不是 Ⅳ 型，不能按「否」选条目
+输入契约（``SPEC.consumes`` 逐项列出）：
+    ``route_result.class_output``  病种标签（G08 的产物）—— 决定从哪几个入口进
+    ``route_result.cl_taaa_iv``    解剖分型（判定产物，不重算）—— 决定条目子集
+    ``case.*``                     判据要读的病例事实（见 ``spec.py``）
+    ``request.node_inputs``        病种域字段（``D1.*`` / ``D3.*`` 等），按前缀分组
 
 输出契约：
-    ``tuple[GuidelineEntry, ...]``，按相关度降序。每条至少含四个属性：
+    :class:`~.state.GuidelineReport`，五个部分各回答一个问题：
 
-    ``section``             章节 / 推荐序号（如 ``§4.4; Rec 22``）
-    ``recommendation``      推荐原文
-    ``evidence_attribute``  证据属性枚举（指南直接来源 / 工程设计来源 /
-                            工程条件·非 ESVS 统一阈值 / 临床扩展待审核）
-    ``doi``                 文献 DOI
+    ``entries``    每条结论凭什么 —— ``rule_id`` / ``source_row`` / 三值 ``verdict``
+    ``gaps``       还差什么资料 —— 输出层「待补关键资料」的唯一来源
+    ``path``       实际走过哪些节点 —— 与 ``entries`` 粒度不同
+    ``terminal``   本轮停在哪、为什么停
+    ``candidates`` 术式维度（EVAR / OSR 各一行状态），喂给 ``FinalRecommendation``
 
-    空元组表示「没有命中条目」。**不得**用泛泛而谈的默认文案填充——
+    空报告表示「没有可用结论」。**不得**用泛泛而谈的默认文案填充——
     「查不到」本身就是要如实上报的结论。
 
 实现要点（验收标准）：
-    1. 条目来源是 ``VascGuide_V3_6.xlsx`` 的 ``D1.1–D7.3`` 共 21 个 sheet /
-       172 条病种规则（外部规格，只读）。``docs/`` 下的旧路由表与决策流程图
-       均已作废，**不得回看**——它们与 V3.6 的坐标系不同，混用会产生两套判据。
-    2. ``evidence_attribute`` 必须是枚举而非自由文本。规格已把「ESVS 原文」
-       与「工程条件·非 ESVS 统一阈值」（如 D6 的 15mm/45°/7mm）分开标注；
-       输出侧若合并成一段话，审计时无法判断哪条真是指南说的。
-    3. 每条带 ``doi``。当前单一指南源为 ESVS 2024（Wanhainen et al.，
-       ``10.1016/j.ejvs.2023.11.002``）。
-    4. 条目库需要「结构化入库 + 检索接口」，而不是运行时读 Excel：
-       规格文件在仓库外且会被修订，运行时依赖它会让审计无法复现。
-    5. **已知缺口（待口径裁定，勿擅自补）**：``consumes`` 未含 ``CL.ILIAC_DIAM``，
-       而设计表第 9 条要求髂瘤 40mm 单独分层。该值在 V3.1(2) 里已有落点
-       （``case.cl.iliac_diam``），但「40mm 是否单列一档、算不算 ESVS 原文阈值」
-       尚未裁定——补齐前不要在本工具里硬编码 40mm，也不要把直径判定搬回
-       ``router.py``（``05_说明与待确认`` 第 17 条与 ``03_P1-P8判定映射`` 的
-       P7 行对此**自相矛盾**，须先裁定）。
-    6. 解剖分型 ``CL.TAAA_IV`` 是**判定产物**（不进 ``VascCase``），已由
-       ``RouteResult.cl_taaa_iv`` 带出（2026-10-26 裁定，与 ``K.*`` 回填同路）。
-       本工具**从 ``request.route_result`` 读**，不得从 ``c.aorta`` + ``c.maxd``
-       重算——那是第二处判据。取「不可评价」时按资料不足处理：宁可少给条目，
-       也不要按「不是 Ⅳ 型」错选子集。
+    1. 条目来源是 ``docs/VascGuide_V3.6.2.xlsx`` 的 ``D1.1``–``D7.3`` 共 21 个 sheet /
+       172 条病种规则（规格副本，只读）。``docs/`` 下曾有的旧路由表与决策流程图
+       （``路由表1/2.xlsx``、``诊断决策路由.pdf``、``VascCase字段设计表.xlsx``）
+       已于 2026-11-04 删除——它们与 V3.6 的坐标系不同，混用会产生两套判据。
+       现行 ``docs/`` 只留规格副本、思维导图与 ``spec-diff``。
+    2. 判据写在 ``nodes/`` 里、不运行时读 Excel：规格会被修订，运行时依赖它会让
+       审计无法复现。行号只作为 ``source_row`` 存下来做凭据；对账由
+       ``tests/test_guideline_engine.py::TestSpecRuleRows`` 在测试期完成。
+    3. 三值求值：``True`` / ``False`` / ``None``。未命中（``False``）与无法判定
+       （``None``）在审计里是两回事——前者是「查过，没有」，后者是「查不了」。
+    4. 规格条目是**本项目转写**的判据与动作，不是 ESVS 推荐原文。要输出
+       「章节 + 推荐序号 + DOI」需要另建结构化条目库（尚未实现），届时按
+       ``source_row`` 关联，不必改判据。
+    5. 解剖分型 ``CL.TAAA_IV`` 是**判定产物**（不进 ``VascCase``），已由
+       ``RouteResult.cl_taaa_iv`` 带出。本工具**从 ``request.route_result`` 读**，
+       不得从 ``c.aorta`` + ``c.maxd`` 重算——那是第二处判据。取「不可评价」时
+       按资料不足处理：宁可少给条目，也不要按「不是 Ⅳ 型」错选子集。
+    6. 髂瘤 40mm 的修复阈值归 ``nodes/common.py`` 的 ``ILIAC_REPAIR_MM``
+       （``D7`` 判据消费），**不在本文件里再写一遍**。
 
 模块结构（本包）：
     ``spec.py``   ``SPEC`` 定义（``run()`` 要引用 ``SPEC.label``，故不能在
                   ``__init__.py`` 里定义，否则循环导入）
     ``engine.py`` 本文件 —— 图装配 + 驱动 + 出口转换
     ``state.py``  节点图状态与产物类型
+    ``registry.py`` 21 个节点 / 172 条规则的登记表
     ``nodes/``    21 个病种节点，按病种分文件（D1–D7 各 3 节点）+ ``common.py``
-                  承载 R90 兜底 / R91 出口 / 跳转守卫（21 个 sheet 各 2 条，7 病种共用）
+                  承载 R90 兜底 / R91 出口 / 跳转守卫与跨节点共用判据
 """
 
 from __future__ import annotations
@@ -65,7 +60,7 @@ from dataclasses import replace
 
 from ..base import ToolRequest
 from .registry import NODES, SPEC_NODE_SHEETS
-from .state import GuidelineReport, GuidelineState, NodeOutcome
+from .state import GuidelineReport, GuidelineState, Link, NodeOutcome
 
 __all__ = ["run"]
 
@@ -132,6 +127,22 @@ def _walk(state: GuidelineState) -> None:
         if outcome.terminal is not None or not outcome.next_node:
             continue
 
+        # 并行出口：规格写「A **并进入** B」时两个节点都要执行（如 ``D4.1.R05``
+        # 「D4.2 与 D5.3 并行评估」）。只走 ``next_node`` 会让另一半静默消失——
+        # 报告里出现「并行评估」四个字，实际只执行了一边。
+        #
+        # 只在 ``link is PARALLEL`` 时展开：``EITHER`` 的两个值互斥（走了急症就
+        # 不走常规），``FOLLOW_UP`` 有先后（先做 A，B 是之后的事），都不该在这里
+        # 一次走完。
+        #
+        # 非节点目标（``G03`` / ``G05`` / ``人工复核``）自然被 ``in NODES`` 滤掉，
+        # 它们由 ``escalation``/``terminal`` 承载，不是病种节点。
+        if outcome.link is Link.PARALLEL:
+            parallel = [t for t in outcome.next_nodes if t in NODES and t not in seen]
+            if parallel:
+                queue[:0] = parallel
+                continue
+
         target = outcome.next_node
         if target in NODES:
             if target not in seen:
@@ -159,16 +170,36 @@ def _walk(state: GuidelineState) -> None:
         )
 
 
+def _exit_phrase(outcome: NodeOutcome) -> str:
+    """把规格 M 列的「下一节点/终点」原样搬进结论句。
+
+    为什么不再写「应回流 X」：规格里没有「回流」这个概念。D 层各表的 M 列写的是
+    「下一节点/终点：G03、G05、D4.3」这类**去处的值域**，动作列才说明怎么选
+    （择一 / 并行 / 后续）。用「回流」描述它，等于给一个不存在于规格的动作命名，
+    再把「系统没执行这个动作」当成缺陷 —— 而规格从未要求工具A 自己去跳。
+
+    ``_walk`` 只在 :data:`NODES` 内部跳转，G03/G05/G06/G08 不在其中，所以这些
+    去处只能交给编排层/临床团队。措辞只陈述规格写了什么，不声称系统做了什么。
+    """
+    nodes = outcome.next_nodes
+    if not nodes:
+        return ""
+    listed = "、".join(nodes)
+    if len(nodes) == 1:
+        return f"（下一节点：{listed}）"
+    return f"（下一节点：{listed}；{outcome.link.value}）"
+
+
 def _closing_advice(state: GuidelineState) -> str | None:
     """本次运行停在哪、为什么停——报告的 ``terminal``。
 
     先看末端节点自己的 ``terminal``；没有就用它**命中的那条规则**拼一句。
 
     为什么不能退回去找更早节点的 ``terminal``（修复前的写法）：14 条
-    ``exit_kind="escalate"`` 且无 ``also_next`` 的规则（``D1.1.R01`` 回 G03、
-    ``D4.3.R01`` 回 G05、``D4.1.R91`` 回 G08…）都只给回流信号、不给终点。
+    ``exit_kind="escalate"`` 且无 ``also_next`` 的规则（``D1.1.R01`` 去 G03、
+    ``D4.3.R01`` 去 G05、``D4.1.R91`` 去 G08…）都只给去处、不给终点。
     此时上游节点还留着它的终点，于是一份「无感染证据 → 回 G08」的病例，
-    报告末尾写的是 D1.1 的「特殊形态/病因：转 D5.3 或 D4.1 专项评估」——
+    报告末尾写的是上游那条分支的终点（例如「疑似快速增长，待复测复核」）——
     描述的是另一条分支，读起来像结论，其实什么都没说。
     """
     if not state.visited:
@@ -181,9 +212,7 @@ def _closing_advice(state: GuidelineState) -> str | None:
     hit = next((entry for entry in last.entries if entry.verdict is True), None)
     if hit is None:
         return None
-    if last.escalation:
-        return f"{last.node_id}：{hit.statement}（已回流 {last.escalation}）"
-    return f"{last.node_id}：{hit.statement}"
+    return f"{last.node_id}：{hit.statement}{_exit_phrase(last)}"
 
 
 def run(request: ToolRequest) -> GuidelineReport:

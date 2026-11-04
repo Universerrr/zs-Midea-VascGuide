@@ -72,7 +72,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from ....rules.router import Verdict, and_, eq, has, not_, or_, token
-from ..state import Candidate, CandidateStatus, GuidelineState, NodeFn, NodeOutcome
+from ..state import Candidate, CandidateStatus, GuidelineState, Link, NodeFn, NodeOutcome
 from .common import (
     ILIAC_REPAIR_MM,
     DisplayRule,
@@ -82,11 +82,11 @@ from .common import (
     display_entries,
     evaluate_node,
     infection_typed,
-    is_uncertain,
+    is_spec_uncertain,
     missing_fields,
     multi_field,
+    rupture_evidence,
     spec_token,
-    unstable,
 )
 
 __all__ = ["NODES", "d7_1", "d7_2", "d7_3"]
@@ -210,15 +210,15 @@ def _symptom_items(state: GuidelineState) -> list[object] | None:
     return multi_field(state, "D7.SYMPTOM_COMPRESSION")
 
 
-def _symptom_present(state: GuidelineState) -> Verdict:
+def _compression_symptom_present(state: GuidelineState) -> Verdict:
     """髂动脉瘤相关症状/压迫是否存在 —— 三值。"""
     items = _symptom_items(state)
     if not items:
         return None
     tokens = [token(value) for value in items]
-    if any(value != _SYMPTOM_NEGATIVE and not is_uncertain(value) for value in tokens):
+    if any(value != _SYMPTOM_NEGATIVE and not is_spec_uncertain(value) for value in tokens):
         return True
-    if any(is_uncertain(value) for value in tokens):
+    if any(is_spec_uncertain(value) for value in tokens):
         return None
     return False
 
@@ -228,7 +228,7 @@ def _symptom_recorded(state: GuidelineState) -> bool:
     items = _symptom_items(state)
     if not items:
         return False
-    return not any(is_uncertain(token(value)) for value in items)
+    return not any(is_spec_uncertain(token(value)) for value in items)
 
 
 def _emergent_symptom(state: GuidelineState) -> Verdict:
@@ -303,19 +303,18 @@ def _aaa_present(state: GuidelineState) -> Verdict:
 
 
 def _rupture_or_unstable(state: GuidelineState) -> Verdict:
-    """破裂/疑似破裂或重大循环危险（``D7.1.R01`` 的判据）。"""
-    return or_(
-        eq(token(state.case.cl.aaa_rupture), "明确", "疑似"),
-        eq(token(state.case.c.extrav), "明确"),
-        eq(token(state.case.c.hematoma), "明确"),
-        unstable(state),
-    )
+    """破裂/疑似破裂或重大循环危险（``D7.1.R01`` 的判据）。
+
+    判据本体在 :func:`common.rupture_evidence` —— ``D4.1.R03`` / ``D6.1.R01``
+    问的是同一件事，三处共用一份，避免字段口径分叉。
+    """
+    return rupture_evidence(state)
 
 
 def _rupture_unresolved(state: GuidelineState) -> bool:
     """破裂状态是否判不了（缺失 / 无法评价 / 证据冲突）。"""
     raw = token(state.case.cl.aaa_rupture)
-    return raw is None or is_uncertain(raw)
+    return raw is None or is_spec_uncertain(raw)
 
 
 def _growth_comparable(state: GuidelineState) -> Verdict:
@@ -361,7 +360,7 @@ def _seal_blocked(state: GuidelineState) -> Verdict:
 def _access_ok(state: GuidelineState) -> Verdict:
     """髂股入路是否可用于腔内 —— 只有**双侧闭塞**才算阻断（与 ``common.access_blocked`` 同口径）。"""
     value = token(state.case.n.access_occlusion)
-    if value is None or is_uncertain(value):
+    if value is None or is_spec_uncertain(value):
         return None
     return value != "双侧闭塞"
 
@@ -421,7 +420,7 @@ def _iia_at_risk(state: GuidelineState) -> Verdict:
         return True
     left = _iia_status(state, "left")
     right = _iia_status(state, "right")
-    if left is None or right is None or is_uncertain(left) or is_uncertain(right):
+    if left is None or right is None or is_spec_uncertain(left) or is_spec_uncertain(right):
         return None
     return bool(left != "通畅" and right != "通畅")
 
@@ -429,7 +428,7 @@ def _iia_at_risk(state: GuidelineState) -> Verdict:
 def _iia_unresolved(state: GuidelineState) -> bool:
     """双侧内髂状态是否都判不了（``D7.3.R90`` 的第二个阻断项）。"""
     both = [_iia_status(state, side) for side in ("left", "right")]
-    return all(value is None or is_uncertain(value) for value in both)
+    return all(value is None or is_spec_uncertain(value) for value in both)
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +477,7 @@ def _d71_r04(state: GuidelineState) -> Verdict:
     的处置由 ``D7.2.R06``（P0-A）执行——判据里带「未达 40 mm」的前提，所以
     达阈值的病例仍由 ``R02`` 走正常的修复评估路径。
     """
-    return _symptom_present(state)
+    return _compression_symptom_present(state)
 
 
 def _d71_r05(state: GuidelineState) -> Verdict:
@@ -573,6 +572,8 @@ _D71_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d71_r01,
         exit_kind="escalate",
         exit_value="G05",
+        next_nodes=("G03", "G05"),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D7.1.R05",
@@ -692,7 +693,7 @@ def _d71_exit(state: GuidelineState, outcome: NodeOutcome) -> NodeOutcome:
 # ---------------------------------------------------------------------------
 # D7.2 直径与监测 / 修复指征
 # ---------------------------------------------------------------------------
-def _below_repair_threshold(state: GuidelineState) -> Verdict:
+def _below_iliac_repair_threshold(state: GuidelineState) -> Verdict:
     """最大髂动脉径是否**低于**择期修复阈值 —— 三值。"""
     diameter = _iliac_diameter(state)
     if diameter is None:
@@ -725,8 +726,8 @@ def _d72_r02(state: GuidelineState) -> Verdict:
 def _d72_r03(state: GuidelineState) -> Verdict:
     """P1：低于阈值且无症状、无复杂病因 → 进入影像监测。"""
     return and_(
-        _below_repair_threshold(state),
-        not_(_symptom_present(state)),
+        _below_iliac_repair_threshold(state),
+        not_(_compression_symptom_present(state)),
         not_(_pathologic_type(state)),
         # 不知道「怎么量的」就不能给间隔：那是 R04 的「复测」要解决的问题。
         # 不加这一项，R03（P1）会先命中并把方法缺失的病例直接送进监测计划。
@@ -767,8 +768,8 @@ def _d72_r06(state: GuidelineState) -> Verdict:
     ``R02`` 从此永不执行，报告上写的是「未达 40 mm 但有症状」——与事实相反。
     """
     return and_(
-        _below_repair_threshold(state),
-        or_(_symptom_present(state), _pathologic_type(state)),
+        _below_iliac_repair_threshold(state),
+        or_(_compression_symptom_present(state), _pathologic_type(state)),
     )
 
 
@@ -878,7 +879,7 @@ def _d72_gaps(state: GuidelineState) -> tuple[str, ...]:
             "CL.ILIAC_DIAM：只记录了 1 个血管段 —— 左右 CIA/IIA/EIA 应逐段测量，"
             "否则「最大径」可能取自非目标段"
         )
-    if _at_repair_threshold(state) is True and _symptom_present(state) is True:
+    if _at_repair_threshold(state) is True and _compression_symptom_present(state) is True:
         gaps.append(
             "有症状/压迫且已达 40 mm：修复指征同时来自症状与直径，症状归因须由医生确认（D7.1.R04）"
         )
@@ -1223,7 +1224,7 @@ def _d73_gaps(state: GuidelineState) -> tuple[str, ...]:
             "病变性质为假性/感染性/术后吻合口旁：术式候选已封顶在「需 MDT 评估」，"
             "不按退变性髂动脉瘤的解剖阈值决定（D7.1.R05）"
         )
-    if _symptom_present(state) is True:
+    if _compression_symptom_present(state) is True:
         gaps.append(
             "有症状/压迫：修复指征不受 40 mm 阈值限制，症状归因与时机由医生确认（D7.1.R04）"
         )
@@ -1316,7 +1317,7 @@ def d7_3(state: GuidelineState) -> NodeOutcome:
     needs_symptom_note = (
         terminal is not None
         and verdicts.get("D7.3.R90") is not True
-        and _symptom_present(state) is True
+        and _compression_symptom_present(state) is True
     )
     if needs_symptom_note:
         terminal += "；修复指征来自症状/压迫，不依赖 40 mm 直径阈值（症状归因由医生确认）"

@@ -77,7 +77,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from ....rules.router import Verdict, and_, eq, has, not_, or_, token
-from ..state import GuidelineState, NodeFn, NodeOutcome
+from ..state import GuidelineState, Link, NodeFn, NodeOutcome
 from .common import (
     DisplayRule,
     RuleSlot,
@@ -86,7 +86,8 @@ from .common import (
     display_entries,
     evaluate_node,
     gap_if_missing,
-    is_uncertain,
+    infection_typed,
+    is_spec_uncertain,
     missing_fields,
     multi_field,
     sex_threshold,
@@ -173,7 +174,7 @@ def _infection_excluded(state: GuidelineState) -> Verdict:
     # 一侧说查过没有、另一侧说还没查。按三值口径只能给 UNKNOWN——
     # 给 True 会让「感染未排除」的标签被一个影像描述消掉。
     for other in (ctx, classified):
-        if other is not None and is_uncertain(other):
+        if other is not None and is_spec_uncertain(other):
             return None
     return True
 
@@ -306,7 +307,7 @@ def _d51_unresolved_names(state: GuidelineState) -> list[str]:
     names: list[str] = []
     for (spec_id, label), value in zip(_D51_MORPHOLOGY, values, strict=True):
         raw = token(value)
-        if raw is None or is_uncertain(raw):
+        if raw is None or is_spec_uncertain(raw):
             names.append(f"{spec_id}（{label}）：{raw or '未记录'}")
     return names
 
@@ -318,7 +319,7 @@ def _d51_gaps(state: GuidelineState) -> tuple[str, ...]:
         gaps.extend(_d51_unresolved_names(state))
     if _d51_r02(state) is True:
         cause = state.node_field("D5.CAUSE")
-        if cause is None or is_uncertain(cause) or cause in ([], ()):
+        if cause is None or is_spec_uncertain(cause) or cause in ([], ()):
             gaps.append("D5.CAUSE：病因/背景未记录（感染/创伤/医源性/既往修复/退变）")
     if _infection_excluded(state) is not True:
         gaps.append("感染证据未排除（N.INFECTION_CTX / CL.INFECTION）：按 D4.1 并行评估")
@@ -377,6 +378,8 @@ _D51_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d51_r03,
         exit_kind="escalate",
         exit_value="G05",
+        next_nodes=("G03", "G05"),
+        link=Link.EITHER,
     ),
     RuleSlot(
         rule_id="D5.1.R02",
@@ -386,6 +389,8 @@ _D51_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d51_r02,
         exit_kind="next",
         exit_value="D5.3",
+        next_nodes=("D5.3", "D4.1"),
+        link=Link.PARALLEL,
     ),
     RuleSlot(
         rule_id="D5.1.R90",
@@ -404,7 +409,9 @@ _D51_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d51_r05,
         exit_kind="escalate",
         exit_value="G06",
-        also_next="D5.2",
+        # 规格 M 列：「下一节点/终点：G04、G06 / 动作：G04/G06/专科路径」——
+        # 值域里没有 D5.2。修前写的 also_next="D5.2" 是代码自加的，规格没有。
+        next_nodes=("G04", "G06"),
     ),
     RuleSlot(
         rule_id="D5.1.R01",
@@ -423,6 +430,8 @@ _D51_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d51_r91,
         exit_kind="escalate",
         exit_value="G08",
+        next_nodes=("D5.2", "D5.3", "G08"),
+        link=Link.EITHER,
     ),
 )
 
@@ -439,6 +448,19 @@ _D51_DISPLAY_RULES: tuple[DisplayRule, ...] = (
 def d5_1(state: GuidelineState) -> NodeOutcome:
     """D5.1：分诊到 D5.2（壁结构病变）/ D5.3（形态与病因）/ G08（都不是）。"""
     outcome = evaluate_node("D5.1", state, _D51_SLOTS)
+
+    # ``D5.1.R02`` 的第二条去处是**有条件的**：规格动作列写「D5.3；感染疑似并行
+    # D4.1」，而本规则只判「囊状/假性/炎症」，不判感染。所以并行只在感染侧也有
+    # 证据时展开——否则每个囊状病变都会多跑一遍感染分诊，报告里凭空多出一条
+    # 「无感染证据」的结论，把「没查」写成了「查过没有」。
+    if outcome.verdicts.get("D5.1.R02") is True:
+        parallel = infection_typed(state) is True
+        outcome = replace(
+            outcome,
+            next_nodes=("D5.3", "D4.1") if parallel else ("D5.3",),
+            link=Link.PARALLEL if parallel else Link.EITHER,
+        )
+
     extra_entries, extra_verdicts = display_entries("D5.1", state, _D51_DISPLAY_RULES)
     return replace(
         outcome,
@@ -463,7 +485,7 @@ def _embolism(state: GuidelineState) -> object:
     return spec_token(state.node_field("D5.EMBOLISM"))
 
 
-def _pain(state: GuidelineState) -> object:
+def _recurrent_pain(state: GuidelineState) -> object:
     return spec_token(state.node_field("D5.PAIN_RECURRENT"))
 
 
@@ -500,7 +522,7 @@ def _d52_r02(state: GuidelineState) -> Verdict:
         eq(_bleed(state), "明确", "疑似"),
         eq(_embolism(state), "是", "疑似"),
         _malperfusion(state),
-        eq(_pain(state), "持续", "难治", "反复"),
+        eq(_recurrent_pain(state), "持续", "难治", "反复"),
         eq(_intimal(state), "明确", "疑似"),
         eq(token(state.case.cl.aaa_rupture), "明确", "疑似"),
     )
@@ -522,7 +544,7 @@ def _d52_unassessed(state: GuidelineState) -> list[str]:
         "D5.LESION_GROWTH": _growth(state),
         "D5.PERIAORTIC_BLEED": _bleed(state),
         "D5.EMBOLISM": _embolism(state),
-        "D5.PAIN_RECURRENT": _pain(state),
+        "D5.PAIN_RECURRENT": _recurrent_pain(state),
         "D5.INTIMAL_DISRUPTION": _intimal(state),
     }
     names: list[str] = []
@@ -559,7 +581,7 @@ def _d52_r01(state: GuidelineState) -> Verdict:
         eq(_bleed(state), "无"),
         eq(_embolism(state), "否"),
         not_(_malperfusion(state)),
-        eq(_pain(state), "已缓解", "无"),
+        eq(_recurrent_pain(state), "已缓解", "无"),
         eq(_intimal(state), "未见"),
         not_(eq(token(state.case.cl.aaa_rupture), "明确", "疑似")),
     )
@@ -586,7 +608,7 @@ def _recorded(state: GuidelineState, spec_id: str) -> Verdict:
     if value is None:
         return None
     if isinstance(value, str):
-        return None if is_uncertain(value) else True
+        return None if is_spec_uncertain(value) else True
     if isinstance(value, list | tuple):
         return True if value else None
     return True
@@ -715,7 +737,7 @@ def _true_diameter(state: GuidelineState) -> float | None:
     return float(value)
 
 
-def _below_repair_threshold(state: GuidelineState) -> Verdict:
+def _below_aortic_repair_threshold(state: GuidelineState) -> Verdict:
     """**真实瘤径**是否低于性别修复阈值 —— 三值。
 
     这里用的是 ``INF.AAA_TRUE_DIAM`` 而不是 ``cl.aaa_diam``：ESVS Rec 145 明写
@@ -764,7 +786,7 @@ def _d53_r09(state: GuidelineState) -> Verdict:
     return and_(
         _inflammatory(state),
         _infection_excluded(state),
-        _below_repair_threshold(state),
+        _below_aortic_repair_threshold(state),
         _inflammatory_symptoms(state),
         eq(_mantle(state), "明确存在", "可疑"),
     )
@@ -800,7 +822,7 @@ def _d53_unresolved_names(state: GuidelineState) -> list[str]:
         ("N.INFLAMMATORY_CTX", "炎症性 AAA 证据状态", state.case.n.inflammatory_ctx),
     ):
         raw = token(value)
-        if raw is None or is_uncertain(raw):
+        if raw is None or is_spec_uncertain(raw):
             names.append(f"{spec_id}（{label}）：{raw or '未记录'}")
     return names
 
@@ -921,6 +943,7 @@ _D53_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d53_r02,
         exit_kind="terminal",
         exit_value="假性动脉瘤专科修复评估：先查明病因与壁连续性（感染/瘘疑似并行 D4.1）",
+        next_nodes=("D4.1", "D4.3", "G03", "G05"),
     ),
     RuleSlot(
         rule_id="D5.3.R01",
@@ -948,6 +971,7 @@ _D53_SLOTS: tuple[RuleSlot, ...] = (
         judge=_d53_r91,
         exit_kind="next",
         exit_value="D1.1",
+        next_nodes=("D4.1", "D5.3", "D1.1"),
     ),
 )
 
