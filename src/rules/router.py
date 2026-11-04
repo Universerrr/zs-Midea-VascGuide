@@ -95,6 +95,18 @@ FALLBACK_VERIFY = "FALLBACK.VERIFY"
 MANUAL_URGENCY = "MANUAL.URGENCY"
 """人工越级标识：医生置位 ``urgency_flag``，跳过自动判定。"""
 
+GUARD_D3_LABEL = "GUARD.D3_LABEL"
+"""出口自洽性标识：**病种标签含 D3，但急诊路由没触发**。
+
+它不是规格里的规则，也不是「判不了」的兜底，而是对**两个判定产物**的一致性检查：
+``G08.R03`` 说「破裂/疑似破裂 → D3」，``G03`` 说「影像证据/报告/临床疑似 → G05」。
+规格 ``G08!32`` 要求「D3 危险优先」、``G08.R03`` 要求「疑似时保持 G05 优先」——
+两句话都以「出 D3 时急诊已经触发」为前提，但**没有任何一条规则把两者绑在一起**。
+
+不借 ``G03`` / ``G08.R03`` 的 id：这不是它们判的结论，而是「它们两个不可能同时为真」
+这件事本身。借了会让 ``RULESET.md`` 的出口列说谎。
+"""
+
 OUTCOME_PRIORITY: dict[RouteKind, int] = {
     RouteKind.REVIEW: 3,  # 人工复核压过一切模式
     RouteKind.MODE: 2,
@@ -2505,6 +2517,36 @@ def _finish_mode(
                 trace=trace,
             )
 
+    # ---- 出口自洽性：D3 标签与「非急诊模式」不可能同时为真 ----
+    # 为什么需要这一层：G03 的 21 条规则里**没有一条读 `CL.AAA_RUPTURE`**，它只认
+    # 影像证据（`C.EXTRAV`/`C.HEMATOMA`/`C.RUPTURE_REPORT`）与「临床疑似」。
+    # 抽取层若给了「破裂：明确」而影像明细缺项，P0 一条都不命中 → `G03.R15` 放行
+    # → `G04` → G07 指南模式；随后 `G08.R03` 才补上 D3 标签。结果是一份
+    # 「指南模式 · 破裂 AAA：EVAR 一线」的报告：模式是择期、标签是破裂。
+    #
+    # 这里**不替 G03 判急症**——那会造出规格里没有的第二处判据；只拒绝「按常规继续」：
+    # 降为人工复核，并把矛盾写进缺口。降级的不是危险等级，是「能不能自动往下走」。
+    if "D3" in x.labels and mode is not RouteMode.EMERGENCY:
+        trace.append(RuleTrace(GUARD_D3_LABEL, True, "人工复核"))
+        return _make(
+            x,
+            kind=RouteKind.REVIEW,
+            rule_id=GUARD_D3_LABEL,
+            reason=(
+                f"{GUARD_D3_LABEL} 病种标签含 D3（破裂／疑似破裂），"
+                f"但急诊路由未触发（当前判定为{mode.value}）："
+                "两者不可能同时为真，不得按常规流程继续，需人工确认破裂证据。"
+            ),
+            next_node="人工复核",
+            level="未触发",
+            gaps=[
+                *_collect_gaps(x, ("G08.R03",), trace),
+                "CL.AAA_RUPTURE 与影像证据不一致：已给出 D3 标签，但 G03 无急症触发",
+            ],
+            unknown_decisive=True,
+            trace=trace,
+        )
+
     return _make(
         x,
         kind=RouteKind.MODE,
@@ -2552,6 +2594,7 @@ __all__ = [
     "G04_BLOCKING",
     "G04_EXTRA",
     "G08_RULES",
+    "GUARD_D3_LABEL",
     "INFECTION_LABELS",
     "LABEL_BY_RULE",
     "MANUAL_URGENCY",

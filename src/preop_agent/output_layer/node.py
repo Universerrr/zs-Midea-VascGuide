@@ -329,7 +329,7 @@ def _build_evidence(case: VascCase, result: RouteResult) -> list[EvidenceItem]:
             )
             continue
         # 不设截断：证据链的价值就是完整可核对，「等共 N 项」会让复算断在半路。
-        # 当前 54 条规则最多读 7 个字段（G03.R10 的 NEWS2 各项），一条一行仍可读。
+        # 当前 66 条规则最多读 7 个字段（G03.R10 的 NEWS2 各项），一条一行仍可读。
         pairs = [f"{path} = {_render(_read_path(case, path))}" for path in spec.fields]
         detail = "；".join(pairs) if pairs else "（本规则不读模型字段）"
         items.append(

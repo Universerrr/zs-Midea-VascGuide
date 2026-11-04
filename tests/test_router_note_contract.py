@@ -28,12 +28,14 @@ from conftest import make_case
 from src.models.preop.case import VascCase
 from src.rules.router import RULES, RouteKind, RouteMode, RouteResult, _read_path, route
 
-ENGINE_RULE_IDS = frozenset({"MANUAL.URGENCY", "FALLBACK.VERIFY"})
-"""两个**不是 V3.6.2 规则**的标识，必须显式白名单：
+ENGINE_RULE_IDS = frozenset({"MANUAL.URGENCY", "FALLBACK.VERIFY", "GUARD.D3_LABEL"})
+"""三个**不是 V3.6.2 规则**的标识，必须显式白名单：
 
 - ``MANUAL.URGENCY``：医生置位 ``urgency_flag``，跳过自动判定；
 - ``FALLBACK.VERIFY``：没有任何规则能判定（资料不足）——兜底不是规则判的，
-  所以不借 ``G03.R15`` / ``G04.R14`` 的 id，否则 RULESET.md 的出口列会说谎。
+  所以不借 ``G03.R15`` / ``G04.R14`` 的 id，否则 RULESET.md 的出口列会说谎；
+- ``GUARD.D3_LABEL``：病种标签含 D3 但急诊路由没触发 —— 两个判定产物互相矛盾，
+  既不借 ``G08.R03``（它判的是「有破裂标签」）也不借 ``G03``（它判的是「有急症证据」）。
 """
 
 SCENARIOS = {

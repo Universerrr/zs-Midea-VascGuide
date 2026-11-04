@@ -29,6 +29,7 @@ from src.rules.router import (
     G04_BLOCKING,
     G04_EXTRA,
     G08_RULES,
+    GUARD_D3_LABEL,
     LABEL_BY_RULE,
     OUTCOME_PRIORITY,
     PENDING_RULES,
@@ -920,6 +921,74 @@ class TestG09Orchestration:
     def test_identity_conflict_by_field_flag_also_caught_early(self) -> None:
         result = route(make_case(q={"conflict": ["身份"]}))
         assert result.rule_id == "G03.R13"
+
+
+#: 破裂证据四项全部留空 —— 不是「明确未见」，是**没记录**。后者才是否认破裂。
+BLANK_RUPTURE_IMAGING = {
+    "extrav": None,
+    "hematoma": None,
+    "rupture_report": None,
+    "contain": None,
+}
+
+
+class TestExitConsistency:
+    """出口自洽性：D3 标签与「非急诊模式」不可能同时为真。
+
+    这组用例守的是一个**规格没有写、但两句规格话都默认成立**的不变量：
+
+    - ``G08!32``：「D1/D2/D3 互相冲突需复核，**D3 危险优先**」；
+    - ``G08.R03``：「疑似时**保持 G05 优先**」。
+
+    两句话都假定「出 D3 时急诊已经触发」。而 ``G03`` 的 21 条规则里**没有一条读**
+    ``CL.AAA_RUPTURE``（只认 ``C.EXTRAV``/``C.HEMATOMA``/``C.RUPTURE_REPORT``
+    与「临床疑似」）。于是「分类标签写了破裂、影像明细没填」的病例会一路走到
+    G07 指南模式，再由 ``G08.R03`` 补上 D3 —— 模式是择期、标签是破裂，
+    报告写成「指南模式 · 破裂 AAA：EVAR 一线」。
+
+    修法不是替 G03 判急症（那是规格外的第二处判据），而是拒绝按常规继续。
+    """
+
+    def _ruptured(self, rupture: str):
+        # ``diag_multi`` 必须显式清空：基线预填 ``["D1"]``，否则会先被
+        # G09.R03 判成「D1 与 D3 冲突」→ 人工复核，把这条路径盖住。
+        return route(
+            make_case(
+                cl={"aaa_rupture": rupture, "diag_multi": None},
+                c=BLANK_RUPTURE_IMAGING,
+            )
+        )
+
+    def test_confirmed_rupture_without_emergency_route_is_refused(self) -> None:
+        result = self._ruptured("明确")
+        assert (result.kind, result.rule_id) == (RouteKind.REVIEW, GUARD_D3_LABEL)
+        assert result.mode is None, "不能还挂着指南/复杂模式"
+        assert result.next_node == "人工复核"
+        assert result.class_output == ["D3"], "标签要保留，供复核者看到系统判了什么"
+        assert result.confidence_level == "低"
+        assert any("不一致" in gap for gap in result.evidence_gaps)
+        assert "D3" in result.reason and "急诊路由未触发" in result.reason
+
+    def test_suspected_rupture_takes_the_same_exit(self) -> None:
+        """疑似破裂同样不能落到择期路径 —— ``G08.R03`` 明写「疑似时保持 G05 优先」。"""
+        result = self._ruptured("疑似")
+        assert (result.kind, result.rule_id) == (RouteKind.REVIEW, GUARD_D3_LABEL)
+
+    def test_a_real_emergency_is_not_downgraded(self) -> None:
+        """有影像证据的破裂照常走 G05 —— 自洽性检查不得误伤真急诊。"""
+        result = route(
+            make_case(
+                cl={"aaa_rupture": "明确", "diag_multi": None},
+                c={"extrav": "明确", "extrav_contig": "明确连续"},
+            )
+        )
+        assert (result.kind, result.mode) == (RouteKind.MODE, RouteMode.EMERGENCY)
+        assert result.rule_id == "G03.R01"
+
+    def test_cases_without_d3_are_untouched(self) -> None:
+        """没有 D3 标签的病例一律不受影响（基线走指南、短颈走复杂）。"""
+        assert route(make_case()).rule_id == "G04.R14"
+        assert route(make_case(n={"neck_len": 8.0})).rule_id == "G04.R01"
 
 
 # ===========================================================================
