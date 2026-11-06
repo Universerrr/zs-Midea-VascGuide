@@ -311,6 +311,32 @@ class TestUnknownDoesNotShortCircuit:
         assert verdict_of("G03.R15", s={"pain_present": None}) is None
 
 
+class TestIfuVerificationDoesNotGateMode:
+    """G04.R08 只判「已核验且不适配」（规则标题即条件句）。
+
+    「未核验/未选择型号」的下游出口在术式选择层（D1.3.R08 / D2.3.R06 /
+    D7.3.R04），不在 G04。若在这里折成 UNKNOWN，等于要求「先挑器械才能判断
+    术式」——器械型号本是术式判断的产物，真实术前病例会一律停在资料核实。
+    """
+
+    def test_unverified_is_not_a_verdict(self) -> None:
+        assert verdict_of("G04.R08", n={"seal_ifu": "未核验"}) is False
+
+    def test_no_model_selected_is_not_a_verdict(self) -> None:
+        assert verdict_of("G04.R08", n={"seal_ifu": "未选择型号"}) is False
+
+    def test_fit_returns_false(self) -> None:
+        assert verdict_of("G04.R08", n={"seal_ifu": "符合"}) is False
+
+    def test_mismatch_returns_true(self) -> None:
+        assert verdict_of("G04.R08", n={"seal_ifu": "不符合"}) is True
+
+    def test_unevaluable_and_missing_stay_unknown(self) -> None:
+        """「核验过但结论不明」与「根本没记录」都不等于「不决定模式」。"""
+        assert verdict_of("G04.R08", n={"seal_ifu": "无法评价"}) is None
+        assert verdict_of("G04.R08", n={"seal_ifu": None}) is None
+
+
 # ===========================================================================
 # 三、54 条逐条命中
 # ===========================================================================

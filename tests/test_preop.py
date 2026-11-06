@@ -201,10 +201,15 @@ class TestVerify:
         result = _route(n={"cta_status": "缺失"})
         assert (result.kind, result.rule_id) == (RouteKind.VERIFY, "G04.R13")
 
-    def test_unverified_ifu_does_not_release_to_guideline(self) -> None:
-        """IFU 未核验 ≠ 符合 IFU：阻断型规则判不了就不许放行。"""
+    def test_unverified_ifu_does_not_block_mode(self) -> None:
+        """IFU 未核验不决定模式（G04.R08 标题即「已有核验的器械……」）。
+
+        适配结论留给 D1.3.R08 / D2.3.R06 / D7.3.R04 在选型阶段处理。
+        若在这里折成 UNKNOWN，等于要求「先挑器械才能判断术式」——循环依赖。
+        """
         result = _route(n={"seal_ifu": "未核验"})
-        assert result.kind is RouteKind.VERIFY
+        assert result.kind is RouteKind.MODE
+        assert result.rule_id == "G04.R14"
 
     def test_verify_carries_gaps(self) -> None:
         assert route(VascCase(case_id="EMPTY")).evidence_gaps
