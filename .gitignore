@@ -64,3 +64,11 @@ desktop.ini
 # ---- Local data / artifacts (按需保留目录结构) ----
 *.log
 .DS_Store
+
+# ---- 病例目录：只入库示例病例 ----
+# cases/ 下的真实病例（CASE-01~08、CASE-ZS-01~09）含患者信息，
+# 分析文档（GAP/GATE/ACTION-PLAN 等）与假设层均为本地工作产物，
+# 一律不入版本库；仅 emergency.json 与 example.json 两个示例入库。
+cases/*
+!cases/emergency.json
+!cases/example.json
